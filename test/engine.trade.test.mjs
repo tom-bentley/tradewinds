@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -18,19 +18,26 @@ import {
 } from "../src/engine/trade.js";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
-const INPUT = {
-  league: fixture("league.json"),
-  users: fixture("users.json"),
-  rosters: fixture("rosters.json"),
-  players: fixture("players.json"),
-  projections: fixture("projections.json"),
-  values: fixture("values.json"),
-  schedule: fixture("schedule.json"),
-  state: fixture("state.json"),
-};
-const RAW = fixture("values.json");
-const make = (settings, input = INPUT) => buildContext(input, settings);
-const ctx = make({});
+// Fixtures load lazily inside a before() hook, never at import time: the pipeline regenerates
+// projections.json and values_full.json while these tests run.
+let INPUT;
+let RAW;
+let ctx;
+const make = (settings, input) => buildContext(input || INPUT, settings);
+before(() => {
+  INPUT = {
+    league: fixture("league.json"),
+    users: fixture("users.json"),
+    rosters: fixture("rosters.json"),
+    players: fixture("players.json"),
+    projections: fixture("projections.json"),
+    values: fixture("values.json"),
+    schedule: fixture("schedule.json"),
+    state: fixture("state.json"),
+  };
+  RAW = fixture("values.json");
+  ctx = make({});
+});
 
 // fixture ids, verified against test/fixtures/players.json + rosters.json
 const BARKLEY = "4866"; // RB, roster 3, healthy, fc_redraft 7099

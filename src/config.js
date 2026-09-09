@@ -12,10 +12,12 @@ export const STORAGE_KEY = "tradewinds.settings.v1";
  * the user's saved settings over this object, so a partial patch never drops a nested key.
  */
 export const DEFAULTS = Object.freeze({
-  // Boyball 🏈 — 8-team half-PPR, 1QB, verified via api.sleeper.app 2026-09-09
-  leagueId: "1394476745138147328",
-  userId: "1394551386997272576", // tommyteez
-  username: "tommyteez",
+  // No league is baked in: Tradewinds works for ANY Sleeper league, so the id and user stay null
+  // until onboarding stores them (design.md section 10.4). null is what makes data.js raise
+  // SetupRequiredError and the UI show the league picker.
+  leagueId: null,
+  userId: null,
+  username: null,
   season: "2026",
 
   // --- Market value blend (R3 §a) -------------------------------------------------------
@@ -86,4 +88,25 @@ export const FLEX_ELIGIBLE = Object.freeze(["RB", "WR", "TE"]);
 // Injury statuses that zero a player's weekly projection until Sleeper clears them.
 export const OUT_STATUSES = Object.freeze(["Out", "IR", "PUP", "Sus", "DNR", "NA"]);
 
-export const LAST_SCORING_WEEK = 17; // week 18 never scores in this league (playoffs 15-17)
+/**
+ * @deprecated Season shape is derived per league in buildContext (playoff_week_start,
+ * playoff_teams, playoff_round_type) - read `ctx.lastWeek` instead. Kept as the fallback for
+ * leagues that run no playoffs at all, and exported for backwards compatibility.
+ */
+export const LAST_SCORING_WEEK = 17;
+
+/** Sleeper's season never runs past week 18. */
+export const MAX_WEEK = 18;
+
+/** Lineup slots the engine cannot score (no IDP projections): ignored in lineup math and
+ *  reported in `ctx.unsupported` so the UI can say so. */
+export const IDP_SLOTS = Object.freeze(["DL", "LB", "DB", "IDP_FLEX"]);
+
+/** A sample league for scripts and manual runs (8-team half-PPR, 1QB), verified via
+ *  api.sleeper.app 2026-09-09. Not a default: DEFAULTS ships empty so any league can load. */
+export const SAMPLE_LEAGUE = Object.freeze({
+  leagueId: "1394476745138147328",
+  userId: "1394551386997272576", // tommyteez
+  username: "tommyteez",
+  season: "2026",
+});

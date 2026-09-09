@@ -10,8 +10,13 @@ export {
   rosPoints,
   resolveMyRosterId,
   slotEligibility,
+  seasonShape,
+  resolveSlots,
+  projectionPoints,
+  scoringMultipliers,
   SLOT_ELIGIBILITY,
   BENCH_SLOTS,
+  QB_SLOTS,
 } from "./context.js";
 
 export {
@@ -26,8 +31,14 @@ export {
   rosBaselines,
   injuryDiscount,
   rosterPctScale,
+  tableFor,
+  tableRows,
+  tableCandidates,
+  roleKind,
   REFERENCE_SOURCE,
   CURVE_SOURCE,
+  ROLE_TABLES,
+  BC_TIER_VARIANTS,
 } from "./values.js";
 
 export {
@@ -51,6 +62,8 @@ export {
   edgeBand,
   edgePct,
   cachedSeasonLineup,
+  verdictLabel,
+  renderVerdictLabel,
   VERDICT_LABELS,
   EDGE_BANDS,
   LINEUP_OVERRIDE_PTS,
@@ -59,10 +72,21 @@ export {
   ACCEPT_DELTA,
 } from "./trade.js";
 
-export { findTrades, tradePool, positionalSurplus, MAX_CANDIDATES, DEFAULT_SHAPES } from "./finder.js";
+export {
+  findTrades,
+  findLeagueTrades,
+  tradePool,
+  positionalSurplus,
+  MAX_CANDIDATES,
+  DEFAULT_SHAPES,
+} from "./finder.js";
 
 export {
   explain,
+  sideNames,
+  defaultNames,
+  resolveNames,
+  voice,
   flagText,
   fmt0,
   fmt1,

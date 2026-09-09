@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -8,17 +8,22 @@ import { acceptanceTier, evaluateTrade } from "../src/engine/trade.js";
 import { DEFAULT_SHAPES, findTrades, positionalSurplus, tradePool } from "../src/engine/finder.js";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
-const INPUT = {
-  league: fixture("league.json"),
-  users: fixture("users.json"),
-  rosters: fixture("rosters.json"),
-  players: fixture("players.json"),
-  projections: fixture("projections.json"),
-  values: fixture("values.json"),
-  schedule: fixture("schedule.json"),
-  state: fixture("state.json"),
-};
+// Fixtures load lazily inside a before() hook, never at import time: the pipeline regenerates
+// projections.json and values_full.json while these tests run.
+let INPUT;
 const make = (settings) => buildContext(INPUT, settings);
+before(() => {
+  INPUT = {
+    league: fixture("league.json"),
+    users: fixture("users.json"),
+    rosters: fixture("rosters.json"),
+    players: fixture("players.json"),
+    projections: fixture("projections.json"),
+    values: fixture("values.json"),
+    schedule: fixture("schedule.json"),
+    state: fixture("state.json"),
+  };
+});
 
 /** The finder must stay inside a phone's patience budget: design target 1.5 s, CI slack 3 s. */
 const PERF_BUDGET_MS = 3000;

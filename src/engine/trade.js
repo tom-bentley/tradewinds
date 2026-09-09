@@ -6,7 +6,15 @@ import { TRADEABLE } from "../config.js";
 import { activePlayers, playerOf, rosPoints, rosterById, slotEligibility } from "./context.js";
 import { marketValue, sideValue, surplus } from "./values.js";
 import { backfill, backfillPositions, freeAgentPool, isBye, seasonLineup } from "./lineup.js";
-import { explain, flagText, FREE_ELSEWHERE_PCT, TREND_FLAG, UNSETTLED_SHARE } from "./explain.js";
+import {
+  explain,
+  flagText,
+  resolveNames,
+  voice,
+  FREE_ELSEWHERE_PCT,
+  TREND_FLAG,
+  UNSETTLED_SHARE,
+} from "./explain.js";
 
 /** Edge% band boundaries (R3 §e). */
 export const EDGE_BANDS = Object.freeze({ steal: 25, clearWin: 10, slightWin: 4, fair: -4, slightLoss: -10, clearLoss: -25 });
@@ -56,6 +64,60 @@ export const VERDICT_LABELS = Object.freeze({
   lineup_win: "Win — you get better now",
   paper_win: "Fair — you win on paper, lose on the field",
 });
+
+/**
+ * The verdict label in the caller's voice: second person for the user's own trades, both teams
+ * named for everybody else's (design.md §10.3).
+ * @param {string} code verdict code
+ * @param {object} [names] { a, aPoss, b, first }
+ * @returns {string}
+ */
+export function verdictLabel(code, names) {
+  const v = voice(names);
+  if (v.first) return VERDICT_LABELS[code] || VERDICT_LABELS.fair;
+  switch (code) {
+    case "steal":
+      return `Steal — ${v.a} should accept now`;
+    case "clear_loss":
+      return `Clear loss — ${v.a} should decline`;
+    case "fleeced":
+      return `Fleeced — ${v.a} should decline`;
+    case "lineup_win":
+      return `Win — ${v.a} gets better now`;
+    case "paper_win":
+      return `Fair — ${v.a} wins on paper, loses on the field`;
+    default:
+      return VERDICT_LABELS[code] || VERDICT_LABELS.fair;
+  }
+}
+
+/**
+ * Render the verdict label from its ingredients, in the caller's voice. The label is kept
+ * re-renderable (`verdict.labelParts`) because the finder scores trades before it knows whose
+ * screen they will appear on (design.md §10.3).
+ * @param {object} ctx
+ * @param {{kind:string, code?:string, side?:string, slot?:string, week?:number, drop?:string|null,
+ *          text?:string}} parts
+ * @param {object} [names]
+ * @returns {string}
+ */
+export function renderVerdictLabel(ctx, parts, names) {
+  const v = voice(names);
+  if (!parts) return VERDICT_LABELS.fair;
+  if (parts.kind === "short") {
+    const who = parts.side === "them" ? (v.first ? "them" : v.b) : v.first ? "you" : v.a;
+    return `Invalid — leaves ${who} short at ${parts.slot} in week ${parts.week}.`;
+  }
+  if (parts.kind === "needs_drop") {
+    const mineOver = parts.side !== "them";
+    const who = v.first ? (mineOver ? "Requires dropping" : "They must drop") : `${mineOver ? v.a : v.b} must drop`;
+    if (parts.drop) return `${who} ${playerOf(ctx, parts.drop).name}`;
+    if (v.first) return mineOver ? VERDICT_LABELS.needs_drop : "They need a drop";
+    return `${mineOver ? v.a : v.b} needs a drop`;
+  }
+  if (parts.kind === "problem") return `Invalid — ${parts.text}`;
+  return verdictLabel(parts.code, names);
+}
 
 /**
  * Edge% band for a surplus edge.
@@ -300,9 +362,12 @@ function buildFlags(ctx, me, them, give, get) {
 /**
  * Evaluate a proposed trade. Both sides are scored from their own perspective, so the rival's
  * acceptance model is the same engine, not a heuristic.
+ * "me" is side A, whoever that is: nothing here reads ctx.myRosterId except as the default side A,
+ * so a trade between two other teams evaluates identically (design.md §10.3).
  * @param {object} ctx
  * @param {{myRosterId:number, theirRosterId:number, give:string[], get:string[]}} proposal
- * @param {{withExplain?:boolean}} [opts] withExplain=false skips text building (finder hot path)
+ * @param {{withExplain?:boolean, names?:object}} [opts] withExplain=false skips text building
+ *   (finder hot path); names = { a, aPoss, b, first } sets the voice
  * @returns {object} TradeResult (design.md §4)
  */
 export function evaluateTrade(ctx, proposal, opts = {}) {
@@ -311,6 +376,8 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
   const theirRosterId = proposal.theirRosterId;
   const give = [...(proposal.give || [])];
   const get = [...(proposal.get || [])];
+  const names = resolveNames(ctx, opts.names, myRosterId, theirRosterId);
+  const v = voice(names);
 
   const mine = rosterById(ctx, myRosterId);
   const theirs = rosterById(ctx, theirRosterId);
@@ -319,11 +386,15 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
   if (!give.length && !get.length) problems.push("Nothing is being traded.");
   if (mine) {
     const own = new Set(activePlayers(mine));
-    for (const id of give) if (!own.has(id)) problems.push(`${playerOf(ctx, id).name} is not on your active roster.`);
+    for (const id of give) {
+      if (!own.has(id)) problems.push(`${playerOf(ctx, id).name} is not on ${v.aPossLower} active roster.`);
+    }
   }
   if (theirs) {
     const own = new Set(activePlayers(theirs));
-    for (const id of get) if (!own.has(id)) problems.push(`${playerOf(ctx, id).name} is not on their active roster.`);
+    for (const id of get) {
+      if (!own.has(id)) problems.push(`${playerOf(ctx, id).name} is not on ${v.bPossLower} active roster.`);
+    }
   }
   for (const id of [...give, ...get]) {
     if (!TRADEABLE.includes(playerOf(ctx, id).pos)) problems.push(`${playerOf(ctx, id).name} (K/DEF) cannot be traded.`);
@@ -343,30 +414,25 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
   const dpo = me.lineup.deltaPlayoffPerWeek;
   let code = edgeBand(edge);
   let override = null;
-  let label = VERDICT_LABELS[code];
+  let labelParts = { kind: "band", code };
 
   if (me.shortDetail || them.shortDetail) {
     code = "invalid";
-    label = `Invalid — leaves ${me.shortDetail ? "you" : "them"} short at ${
-      (me.shortDetail || them.shortDetail).slot
-    } in week ${(me.shortDetail || them.shortDetail).week}.`;
+    const detail = me.shortDetail || them.shortDetail;
+    labelParts = { kind: "short", side: me.shortDetail ? "me" : "them", slot: detail.slot, week: detail.week };
   } else if (me.rosterCount.after > me.rosterCount.max || them.rosterCount.after > them.rosterCount.max) {
     code = "needs_drop";
     const mineOver = me.rosterCount.after > me.rosterCount.max;
     const dropper = mineOver ? me : them;
-    const who = mineOver ? "Requires dropping" : "They must drop";
-    label = dropper.dropSuggestion
-      ? `${who} ${playerOf(ctx, dropper.dropSuggestion).name}`
-      : mineOver
-        ? VERDICT_LABELS.needs_drop
-        : "They need a drop";
+    labelParts = { kind: "needs_drop", side: mineOver ? "me" : "them", drop: dropper.dropSuggestion || null };
   } else if (edge >= EDGE_BANDS.slightLoss && edge <= EDGE_BANDS.slightWin && dpw >= LINEUP_OVERRIDE_PTS) {
     override = "lineup_win";
-    label = VERDICT_LABELS.lineup_win;
+    labelParts = { kind: "band", code: "lineup_win" };
   } else if (edge >= EDGE_BANDS.clearWin && dpw <= -LINEUP_OVERRIDE_PTS) {
     override = "paper_win";
-    label = VERDICT_LABELS.paper_win;
+    labelParts = { kind: "band", code: "paper_win" };
   }
+  const label = renderVerdictLabel(ctx, labelParts, names);
 
   const acceptance = acceptanceTier(ctx, them.edgePct, them.lineup.deltaPerWeek);
   const bestId = pickBest(ctx, give, get);
@@ -381,6 +447,7 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
     verdict: {
       code,
       label,
+      labelParts,
       edgePct: edge,
       deltaPerWeek: dpw,
       deltaPlayoffPerWeek: dpo,
@@ -394,7 +461,7 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
     best: bestId ? { id: bestId, side: get.includes(bestId) ? "me" : "them" } : { id: null, side: null },
   };
 
-  if (withExplain) finalizeExplanation(ctx, result);
+  if (withExplain) finalizeExplanation(ctx, result, names);
   return result;
 }
 
@@ -403,13 +470,19 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
  * unless the caller opted out for speed; the finder calls it on its final shortlist.
  * @param {object} ctx
  * @param {object} result TradeResult (mutated in place)
+ * @param {object} [names] voice { a, aPoss, b, first } — defaults to second person
  * @returns {object} the same result
  */
-export function finalizeExplanation(ctx, result) {
-  for (const flag of result.flags) {
-    if (!flag.text) flag.text = flagText(ctx, flag);
+export function finalizeExplanation(ctx, result, names) {
+  const resolved = resolveNames(ctx, names, result.myRosterId, result.theirRosterId);
+  // the finder scores with no voice in mind; the label is re-rendered for whoever is reading
+  if (result.verdict && result.verdict.labelParts) {
+    result.verdict.label = renderVerdictLabel(ctx, result.verdict.labelParts, resolved);
   }
-  const rendered = explain(ctx, result);
+  for (const flag of result.flags) {
+    if (!flag.text) flag.text = flagText(ctx, flag, resolved);
+  }
+  const rendered = explain(ctx, result, { names: resolved });
   result.reasons = rendered.lines;
   result.headline = rendered.headline;
   return result;
@@ -460,6 +533,7 @@ function invalidResult(ctx, proposal, problems) {
     verdict: {
       code: "invalid",
       label: `Invalid — ${problems[0]}`,
+      labelParts: { kind: "problem", text: problems[0] },
       edgePct: 0,
       deltaPerWeek: 0,
       deltaPlayoffPerWeek: 0,

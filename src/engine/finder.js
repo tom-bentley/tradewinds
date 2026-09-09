@@ -7,6 +7,7 @@ import { activePlayers, playerOf, rosterById } from "./context.js";
 import { marketValue, surplus } from "./values.js";
 import { slotDemand } from "./lineup.js";
 import { edgePct, evaluateTrade, finalizeExplanation } from "./trade.js";
+import { sideNames } from "./explain.js";
 
 /** Hard ceiling on enumerated candidates before the sweep bails out (R3 §f stage 1). */
 export const MAX_CANDIDATES = 50000;
@@ -213,9 +214,71 @@ export function findTrades(ctx, opts = {}) {
     if (cand.give.some((id) => usedGivers.has(id))) continue;
     perRivalCount.set(cand.theirRosterId, rivalCount + 1);
     for (const id of cand.give) usedGivers.add(id);
-    finalizeExplanation(ctx, cand.result);
+    // second person when the offers are the user's own, both teams named otherwise (§10.3)
+    finalizeExplanation(ctx, cand.result, opts.names || sideNames(ctx, myRosterId, cand.theirRosterId));
     cand.why = cand.result.reasons.map((r) => r.text);
     out.push(cand);
   }
   return out;
+}
+
+/**
+ * Unordered identity of a trade: the same two teams swapping the same two player sets, whichever
+ * side proposed it. Team A's "give" is team B's "get", so both runs must collapse to one key.
+ * @param {number} aRosterId
+ * @param {string[]} aSends
+ * @param {number} bRosterId
+ * @param {string[]} bSends
+ * @returns {string}
+ */
+function pairKey(aRosterId, aSends, bRosterId, bSends) {
+  const a = `${aRosterId}:${[...aSends].sort().join(",")}`;
+  const b = `${bRosterId}:${[...bSends].sort().join(",")}`;
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+/**
+ * Sweep the WHOLE league: the best offers available to every team, not just one (design.md §10.3).
+ * Used by the "Whole league" mode in Deals, and by anyone browsing a league they do not play in.
+ * @param {object} ctx
+ * @param {{perTeam?:number, maxResults?:number, shapes?:string[], perRival?:number,
+ *          onTeam?:function(number, number, number):void}} [opts]
+ *   onTeam(rosterId, index, total) is called BEFORE each team is swept so the UI can show
+ *   progress and yield to the event loop between teams.
+ * @returns {Array<object>} findTrades candidates, each tagged with `forRosterId`, deduped across
+ *   teams, best score first
+ */
+export function findLeagueTrades(ctx, opts = {}) {
+  const perTeam = opts.perTeam != null ? opts.perTeam : 3;
+  const maxResults = opts.maxResults != null ? opts.maxResults : 20;
+  const rosters = ctx.rosters || [];
+  const best = new Map();
+
+  rosters.forEach((roster, index) => {
+    if (typeof opts.onTeam === "function") opts.onTeam(roster.rosterId, index, rosters.length);
+    const deals = findTrades(ctx, {
+      myRosterId: roster.rosterId,
+      maxResults: perTeam,
+      shapes: opts.shapes,
+      perRival: opts.perRival,
+    });
+    for (const deal of deals) {
+      deal.forRosterId = roster.rosterId;
+      const key = pairKey(roster.rosterId, deal.give, deal.theirRosterId, deal.get);
+      const seen = best.get(key);
+      // the same swap can surface from both sides; keep whichever run scored it higher
+      if (!seen || deal.score > seen.score) best.set(key, deal);
+    }
+  });
+
+  return [...best.values()]
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        (pairKey(a.forRosterId, a.give, a.theirRosterId, a.get) <
+        pairKey(b.forRosterId, b.give, b.theirRosterId, b.get)
+          ? -1
+          : 1)
+    )
+    .slice(0, maxResults);
 }

@@ -3,7 +3,7 @@
 // will pay, this file) and lineup value (what it scores for me, lineup.js).
 
 import { TRADEABLE } from "../config.js";
-import { playerOf, rosPoints, rosteredIds } from "./context.js";
+import { playerOf, rosPoints, rosteredIds, slotEligibility } from "./context.js";
 
 /** The source every other source is scale-matched onto (R3 §a). */
 export const REFERENCE_SOURCE = "fc_redraft";
@@ -12,6 +12,118 @@ export const CURVE_SOURCE = "proj";
 /** Ranks deeper than this are excluded from the curve regression — the deep tail of the market
  *  is flat noise (values bottom out near 0) and drags the exponent badly (R3 §3). */
 export const CURVE_FIT_MAX_RANK = 120;
+/**
+ * The value tables each blend ROLE can resolve to (design.md §10.2). Settings weights are keyed by
+ * role (`fc_redraft`, `dp_dynasty`, …); which physical table a role reads depends on the league:
+ * 2QB/superflex leagues price quarterbacks completely differently, and Boris Chen publishes one
+ * tier list per PPR setting.
+ */
+export const ROLE_TABLES = Object.freeze({
+  fc_redraft: { kind: "redraft", twoQb: "fc_redraft_2qb" },
+  fc_dynasty: { kind: "dynasty", twoQb: "fc_dynasty_2qb" },
+  dp_dynasty: { kind: "dynasty", twoQb: "dp_dynasty_2qb" },
+  bc_tiers: { kind: "tiers", ppr: true },
+});
+
+/** Boris Chen tier tables, by the PPR value each was computed for. */
+export const BC_TIER_VARIANTS = Object.freeze([
+  [0, "bc_tiers_std"],
+  [0.5, "bc_tiers_half"],
+  [1, "bc_tiers_ppr"],
+]);
+
+/**
+ * Table names a role may resolve to, best fit first.
+ * @param {object} ctx
+ * @param {string} role e.g. "fc_redraft"
+ * @returns {string[]}
+ */
+export function tableCandidates(ctx, role) {
+  const spec = ROLE_TABLES[role];
+  if (!spec) return [role];
+  if (spec.twoQb) {
+    const numQbs = Number(ctx.league && ctx.league.numQbs) || 1;
+    // a superflex league that only shipped the 1QB table still gets values, just less exact
+    return numQbs >= 2 ? [spec.twoQb, role] : [role, spec.twoQb];
+  }
+  const ppr = Number(ctx.league && ctx.league.ppr) || 0;
+  const ordered = [...BC_TIER_VARIANTS].sort(
+    (a, b) => Math.abs(a[0] - ppr) - Math.abs(b[0] - ppr) || a[0] - b[0]
+  );
+  // nearest PPR variant, then the plain table (all a v1 pipeline emits), then the rest
+  return [ordered[0][1], role, ...ordered.slice(1).map(([, name]) => name)];
+}
+
+/**
+ * Resolve a blend role to the value table this league should actually read (design.md §10.2).
+ * @param {object} ctx
+ * @param {string} role
+ * @returns {string|null} table id present in ctx.values, or null when nothing covers the role
+ */
+export function tableFor(ctx, role) {
+  if (!ctx.memo.tableFor) ctx.memo.tableFor = new Map();
+  if (ctx.memo.tableFor.has(role)) return ctx.memo.tableFor.get(role);
+  let hit = null;
+  for (const name of tableCandidates(ctx, role)) {
+    const src = ctx.values && ctx.values[name];
+    if (src && src.values) {
+      hit = name;
+      break;
+    }
+  }
+  ctx.memo.tableFor.set(role, hit);
+  return hit;
+}
+
+/**
+ * Rows of the table a role resolves to.
+ * @param {object} ctx
+ * @param {string} role
+ * @returns {object|null}
+ */
+export function tableRows(ctx, role) {
+  const id = tableFor(ctx, role);
+  return id ? ctx.values[id].values : null;
+}
+
+/**
+ * Kind ("redraft" / "dynasty" / "tiers") of the table a role resolves to. Falls back to the role
+ * declaration so a variant table that forgot to publish `kind` still blends.
+ * @param {object} ctx
+ * @param {string} role
+ * @returns {string|null}
+ */
+export function roleKind(ctx, role) {
+  const id = tableFor(ctx, role);
+  if (!id) return null;
+  const declared = ctx.values[id] && ctx.values[id].kind;
+  return declared || (ROLE_TABLES[role] ? ROLE_TABLES[role].kind : null);
+}
+
+/**
+ * Table ids to read display metadata from, in preference order: the table each known role
+ * resolves to, then any table that is not a variant of a known role. Variants this league did NOT
+ * resolve to are skipped, so a 1QB league never shows a 2QB tier.
+ * @param {object} ctx
+ * @returns {string[]}
+ */
+function metaOrder(ctx) {
+  if (ctx.memo.metaOrder) return ctx.memo.metaOrder;
+  const roles = [REFERENCE_SOURCE, ...Object.keys(ROLE_TABLES).filter((r) => r !== REFERENCE_SOURCE)];
+  const aliases = new Set();
+  const order = [];
+  for (const role of roles) {
+    for (const name of tableCandidates(ctx, role)) aliases.add(name);
+    const id = tableFor(ctx, role);
+    if (id && !order.includes(id)) order.push(id);
+  }
+  for (const id of Object.keys(ctx.values || {})) {
+    if (!aliases.has(id) && !order.includes(id)) order.push(id);
+  }
+  ctx.memo.metaOrder = order;
+  return order;
+}
+
 /** Injury labels Sleeper spells differently from our discount table. */
 const INJURY_ALIASES = Object.freeze({
   Suspended: "Sus",
@@ -58,9 +170,13 @@ export function rosBaselines(ctx) {
   const teams = ctx.league.numTeams || 1;
   const dedicated = {};
   let flexSlots = 0;
+  // any multi-position slot is a flex slot: FLEX, WRRB_FLEX, REC_FLEX, SUPER_FLEX
   for (const slot of ctx.slots) {
-    if (slot === "FLEX") flexSlots += 1;
-    else if (TRADEABLE.includes(slot)) dedicated[slot] = (dedicated[slot] || 0) + 1;
+    const elig = slotEligibility(slot);
+    if (elig.length > 1) flexSlots += 1;
+    else if (elig.length === 1 && TRADEABLE.includes(elig[0])) {
+      dedicated[elig[0]] = (dedicated[elig[0]] || 0) + 1;
+    }
   }
 
   const flexPool = [];
@@ -121,7 +237,7 @@ export function rosRanks(ctx) {
 export function curveFit(ctx) {
   if (ctx.memo.curveFit) return ctx.memo.curveFit;
   const ranks = rosRanks(ctx);
-  const ref = sourceValues(ctx, REFERENCE_SOURCE);
+  const ref = tableRows(ctx, REFERENCE_SOURCE);
   const xs = [];
   const ys = [];
   for (const [id, rank] of ranks) {
@@ -185,14 +301,13 @@ function sourceValues(ctx, sourceId) {
 function presentSources(ctx, kind) {
   const weights = kind === "dynasty" ? ctx.settings.dynastyWeights : ctx.settings.weights;
   const out = [];
-  for (const id of Object.keys(weights || {})) {
-    if (!(weights[id] > 0)) continue;
-    if (id === CURVE_SOURCE) {
-      if (kind === "redraft") out.push(id);
+  for (const role of Object.keys(weights || {})) {
+    if (!(weights[role] > 0)) continue;
+    if (role === CURVE_SOURCE) {
+      if (kind === "redraft") out.push(role);
       continue;
     }
-    const src = ctx.values && ctx.values[id];
-    if (src && src.values && src.kind === kind) out.push(id);
+    if (roleKind(ctx, role) === kind) out.push(role);
   }
   return out;
 }
@@ -204,10 +319,12 @@ function presentSources(ctx, kind) {
  */
 export function scaleFactors(ctx) {
   if (ctx.memo.scaleFactors) return ctx.memo.scaleFactors;
-  const ref = sourceValues(ctx, REFERENCE_SOURCE);
+  const refId = tableFor(ctx, REFERENCE_SOURCE);
+  const ref = refId ? ctx.values[refId].values : null;
   const factors = { [REFERENCE_SOURCE]: 1, [CURVE_SOURCE]: 1 };
+  if (refId) factors[refId] = 1;
   for (const [id, src] of Object.entries(ctx.values || {})) {
-    if (id === REFERENCE_SOURCE) continue;
+    if (id === refId) continue;
     if (!src || !src.values || (src.kind !== "redraft" && src.kind !== "dynasty")) continue;
     if (!ref) {
       factors[id] = 1;
@@ -343,14 +460,26 @@ export function marketValue(ctx, id) {
   }
 
   const factors = scaleFactors(ctx);
-  const matched = {};
+  const scaled = {};
   for (const [sid, src] of Object.entries(ctx.values || {})) {
     if (!src || !src.values) continue;
     const row = src.values[id];
     const v = Number(row && row.v);
     if (!(v > 0)) continue;
     out.sourcesRaw[sid] = v;
-    matched[sid] = v * (factors[sid] || 1);
+    scaled[sid] = v * (factors[sid] || 1);
+  }
+  // blend weights are keyed by ROLE; each role reads the table this league resolves to (§10.2)
+  const matched = {};
+  const roles = new Set([
+    ...Object.keys(ROLE_TABLES),
+    ...Object.keys(ctx.settings.weights || {}),
+    ...Object.keys(ctx.settings.dynastyWeights || {}),
+  ]);
+  for (const role of roles) {
+    if (role === CURVE_SOURCE) continue;
+    const tid = tableFor(ctx, role);
+    if (tid && scaled[tid] != null) matched[role] = scaled[tid];
   }
   out.projV = curveValue(ctx, id);
   if (out.projV != null) matched[CURVE_SOURCE] = out.projV;
@@ -373,8 +502,8 @@ export function marketValue(ctx, id) {
   else if (realWeight > 0) out.fallback = "blend";
   else out.fallback = "curve";
 
-  // display metadata: prefer the reference source, then any other priced source
-  const order = [REFERENCE_SOURCE, ...Object.keys(ctx.values || {}).filter((s) => s !== REFERENCE_SOURCE)];
+  // display metadata: prefer the resolved reference table, then the others this league reads
+  const order = metaOrder(ctx);
   const meta = {};
   for (const sid of order) {
     const row = (ctx.values[sid] && ctx.values[sid].values && ctx.values[sid].values[id]) || null;

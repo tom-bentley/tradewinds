@@ -2,7 +2,7 @@
 // dp_dynasty (with `ecr`), bc_tiers (kind "tiers", sparse `r`, no `v`), signed `sd`, and roster
 // share already on a 0-100 scale. The engine must handle all of it, plus value ids that the
 // player table does not know and players that no source prices.
-import test from "node:test";
+import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -20,54 +20,74 @@ import { bestLineup, seasonLineup } from "../src/engine/lineup.js";
 import { evaluateTrade } from "../src/engine/trade.js";
 import { findTrades } from "../src/engine/finder.js";
 import { MAX_MEANINGFUL_TIER } from "../src/engine/explain.js";
+import { tableFor } from "../src/engine/values.js";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
-const FULL = fixture("values_full.json");
-const INPUT = {
-  league: fixture("league.json"),
-  users: fixture("users.json"),
-  rosters: fixture("rosters.json"),
-  players: fixture("players.json"),
-  projections: fixture("projections.json"),
-  values: FULL,
-  schedule: fixture("schedule.json"),
-  state: fixture("state.json"),
-};
+// Fixtures load lazily inside a before() hook, never at import time: the pipeline regenerates
+// projections.json and values_full.json while these tests run.
+let FULL;
+let INPUT;
+let ctx;
+/** the table each blend role resolves to for THIS league (1QB, half-PPR) */
+let T;
 const make = (settings) => buildContext(INPUT, settings || {});
-const ctx = make();
+before(() => {
+  FULL = fixture("values_full.json");
+  INPUT = {
+    league: fixture("league.json"),
+    users: fixture("users.json"),
+    rosters: fixture("rosters.json"),
+    players: fixture("players.json"),
+    projections: fixture("projections.json"),
+    values: FULL,
+    schedule: fixture("schedule.json"),
+    state: fixture("state.json"),
+  };
+  ctx = make();
+  T = {
+    redraft: tableFor(ctx, "fc_redraft"),
+    dynasty: tableFor(ctx, "fc_dynasty"),
+    dp: tableFor(ctx, "dp_dynasty"),
+    tiers: tableFor(ctx, "bc_tiers"),
+  };
+});
 
-test("the full source table carries the four live sources", () => {
-  assert.deepEqual(Object.keys(ctx.values).sort(), ["bc_tiers", "dp_dynasty", "fc_dynasty", "fc_redraft"]);
-  assert.equal(ctx.values.bc_tiers.kind, "tiers");
-  assert.equal(ctx.values.dp_dynasty.kind, "dynasty");
-  assert.ok(Object.values(ctx.values.dp_dynasty.values).some((r) => r.ecr != null));
-  assert.ok(Object.values(ctx.values.bc_tiers.values).every((r) => r.v == null), "bc_tiers prices nothing");
-  const bcRanks = Object.values(ctx.values.bc_tiers.values).filter((r) => r.r != null).length;
-  assert.ok(bcRanks > 0 && bcRanks < Object.keys(ctx.values.bc_tiers.values).length, "bc_tiers `r` is sparse");
+test("the full source table carries every live source, in this league's variant", () => {
+  // the pipeline ships plain tables or per-shape variants (fc_redraft_2qb, bc_tiers_half, …);
+  // either way every role must resolve to exactly one table (design.md §10.2)
+  for (const [role, id] of Object.entries(T)) assert.ok(id, `${role} resolves to a table`);
+  assert.equal(new Set(Object.values(T)).size, 4, "four distinct tables");
+  const tiers = ctx.values[T.tiers];
+  assert.equal(tiers.kind, "tiers");
+  assert.equal(ctx.values[T.dp].kind, "dynasty");
+  assert.ok(Object.values(ctx.values[T.dp].values).some((r) => r.ecr != null));
+  assert.ok(Object.values(tiers.values).every((r) => r.v == null), "the tier table prices nothing");
+  const bcRanks = Object.values(tiers.values).filter((r) => r.r != null).length;
+  assert.ok(bcRanks > 0 && bcRanks < Object.keys(tiers.values).length, "tier `r` is sparse");
 });
 
 test("a tiers-only source is scale-matched into nothing and never priced into the blend", () => {
   const factors = scaleFactors(ctx);
-  assert.equal(factors.fc_redraft, 1);
-  assert.equal(factors.bc_tiers, undefined, "a source with no `v` gets no scale factor");
-  assert.ok(factors.dp_dynasty > 0 && Number.isFinite(factors.dp_dynasty));
-  assert.ok(factors.fc_dynasty > 0 && Number.isFinite(factors.fc_dynasty));
+  assert.equal(factors[T.redraft], 1);
+  assert.equal(factors[T.tiers], undefined, "a source with no `v` gets no scale factor");
+  assert.ok(factors[T.dp] > 0 && Number.isFinite(factors[T.dp]));
+  assert.ok(factors[T.dynasty] > 0 && Number.isFinite(factors[T.dynasty]));
 
   // every priced player's blend draws only from sources that actually publish a value
-  for (const id of Object.keys(FULL.sources.bc_tiers.values).slice(0, 40)) {
+  for (const id of Object.keys(FULL.sources[T.tiers].values).slice(0, 40)) {
     const mv = marketValue(ctx, id);
     assert.equal(mv.sources.bc_tiers, undefined);
-    assert.equal(mv.sourcesRaw.bc_tiers, undefined);
+    assert.equal(mv.sourcesRaw[T.tiers], undefined);
   }
 });
 
 test("dp_dynasty joins the dynasty blend and moves the keeper tilt", () => {
   const twoSource = buildContext(
-    { ...INPUT, values: { sources: { fc_redraft: FULL.sources.fc_redraft, fc_dynasty: FULL.sources.fc_dynasty } } },
+    { ...INPUT, values: { sources: { fc_redraft: FULL.sources[T.redraft], fc_dynasty: FULL.sources[T.dynasty] } } },
     {}
   );
-  const shared = Object.keys(FULL.sources.dp_dynasty.values).filter(
-    (id) => FULL.sources.fc_dynasty.values[id] && ctx.players.has(id) && marketValue(ctx, id).m != null
+  const shared = Object.keys(FULL.sources[T.dp].values).filter(
+    (id) => FULL.sources[T.dynasty].values[id] && ctx.players.has(id) && marketValue(ctx, id).m != null
   );
   assert.ok(shared.length > 50, "the two dynasty tables overlap heavily");
   let moved = 0;

@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -15,18 +15,25 @@ import {
 } from "../src/engine/lineup.js";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
-const INPUT = {
-  league: fixture("league.json"),
-  users: fixture("users.json"),
-  rosters: fixture("rosters.json"),
-  players: fixture("players.json"),
-  projections: fixture("projections.json"),
-  values: fixture("values.json"),
-  schedule: fixture("schedule.json"),
-  state: fixture("state.json"),
-};
-const ctx = buildContext(INPUT, {});
-const MINE = activePlayers(rosterById(ctx, 3));
+// Fixtures load lazily inside a before() hook, never at import time: the pipeline regenerates
+// projections.json and values_full.json while these tests run.
+let INPUT;
+let ctx;
+let MINE;
+before(() => {
+  INPUT = {
+    league: fixture("league.json"),
+    users: fixture("users.json"),
+    rosters: fixture("rosters.json"),
+    players: fixture("players.json"),
+    projections: fixture("projections.json"),
+    values: fixture("values.json"),
+    schedule: fixture("schedule.json"),
+    state: fixture("state.json"),
+  };
+  ctx = buildContext(INPUT, {});
+  MINE = activePlayers(rosterById(ctx, 3));
+});
 
 const HIGGINS = "6801"; // WR CIN, bye week 6, Questionable
 const BOWERS = "11604"; // TE LV, bye week 13

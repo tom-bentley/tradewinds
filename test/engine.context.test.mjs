@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -18,18 +18,25 @@ import {
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
 
-export const INPUT = {
-  league: fixture("league.json"),
-  users: fixture("users.json"),
-  rosters: fixture("rosters.json"),
-  players: fixture("players.json"),
-  projections: fixture("projections.json"),
-  values: fixture("values.json"),
-  schedule: fixture("schedule.json"),
-  state: fixture("state.json"),
-};
-
-const ctx = buildContext(INPUT, {});
+// Fixtures load lazily inside a before() hook, never at import time: the pipeline regenerates
+// projections.json and values_full.json while these tests run.
+/** tommyteez — settings.userId is empty by default now, so every ctx names its user. */
+const TOMMY = "1394551386997272576";
+let INPUT;
+let ctx;
+before(() => {
+  INPUT = {
+    league: fixture("league.json"),
+    users: fixture("users.json"),
+    rosters: fixture("rosters.json"),
+    players: fixture("players.json"),
+    projections: fixture("projections.json"),
+    values: fixture("values.json"),
+    schedule: fixture("schedule.json"),
+    state: fixture("state.json"),
+  };
+  ctx = buildContext(INPUT, { userId: TOMMY });
+});
 
 test("buildContext returns the documented ctx shape", () => {
   assert.equal(ctx.league.id, "1394476745138147328");
@@ -60,7 +67,7 @@ test("buildContext returns the documented ctx shape", () => {
   assert.deepEqual(ctx.memo, {}, "memo starts empty");
 });
 
-test("myRosterId resolves to Tom's roster 3", () => {
+test("myRosterId resolves to the configured user's roster", () => {
   assert.equal(ctx.myRosterId, 3);
   const mine = rosterById(ctx, 3);
   assert.equal(mine.ownerId, "1394551386997272576");
@@ -70,10 +77,16 @@ test("myRosterId resolves to Tom's roster 3", () => {
   assert.equal(mine.starters.length, 11);
 });
 
-test("myRosterId falls back to the first roster for an unknown user", () => {
+test("myRosterId is null for a user who is not in this league (viewer mode)", () => {
   const other = buildContext(INPUT, { userId: "nobody" });
-  assert.equal(other.myRosterId, 1);
+  assert.equal(other.myRosterId, null, "no roster is 'mine' when I do not play in this league");
+  const noUser = buildContext(INPUT, {});
+  assert.equal(noUser.myRosterId, null, "settings.userId is empty until onboarding sets it");
   assert.equal(resolveMyRosterId([], "x"), null);
+  assert.equal(resolveMyRosterId(ctx.rosters, null), null);
+  // a co-owner counts as the owner
+  const coOwned = ctx.rosters.map((r) => (r.rosterId === 5 ? { ...r, coOwners: ["co-1"] } : r));
+  assert.equal(resolveMyRosterId(coOwned, "co-1"), 5);
 });
 
 test("active count is players minus reserve and taxi", () => {

@@ -1,23 +1,27 @@
 #!/usr/bin/env node
 // scripts/sanity.mjs — eyeball check on the engine against the real committed data.
 //
-//   node scripts/sanity.mjs
+//   node scripts/sanity.mjs [leagueId]
 //
 // Reads the pipeline output in data/*.json and pulls league/users/rosters/state live from
-// api.sleeper.app (cache-busted). Anything unreachable falls back to the 2026-09-09 snapshots in
-// test/fixtures/, so the script always prints — offline runs are just a little staler.
+// api.sleeper.app (cache-busted) for the league id given on the command line — Boyball by default.
+// Anything unreachable falls back to the 2026-09-09 snapshots in test/fixtures/, so the script
+// always prints — offline runs are just a little staler. Any other league id runs in viewer mode
+// (no roster is "mine"), which is exactly what the app does for a league you only browse.
 // Not a test: it prints, it never asserts. `node --test "test/*.test.mjs"` is the gate.
 
 import { readFileSync } from "node:fs";
 
-import { DEFAULTS, SLEEPER } from "../src/config.js";
+import { SAMPLE_LEAGUE, SLEEPER } from "../src/config.js";
 import { buildContext } from "../src/engine/context.js";
-import { curveFit, waiverReplacement } from "../src/engine/values.js";
+import { curveFit, tableFor, waiverReplacement } from "../src/engine/values.js";
 import { seasonLineup } from "../src/engine/lineup.js";
 import { evaluateTrade } from "../src/engine/trade.js";
-import { findTrades } from "../src/engine/finder.js";
+import { sideNames } from "../src/engine/explain.js";
+import { findLeagueTrades, findTrades, tradePool } from "../src/engine/finder.js";
 
-const LEAGUE_ID = process.env.TRADEWINDS_LEAGUE_ID || DEFAULTS.leagueId;
+const LEAGUE_ID = process.argv[2] || SAMPLE_LEAGUE.leagueId;
+const USER_ID = LEAGUE_ID === SAMPLE_LEAGUE.leagueId ? SAMPLE_LEAGUE.userId : null;
 const FETCH_TIMEOUT_MS = 8000;
 
 const readJson = (relative) => JSON.parse(readFileSync(new URL(relative, import.meta.url), "utf8"));
@@ -65,31 +69,49 @@ const ctx = buildContext(
     values: pipeline("values.json"),
     schedule: pipeline("schedule.json"),
   },
-  {}
+  { leagueId: LEAGUE_ID, userId: USER_ID }
 );
 
 const nm = (id) => (ctx.players.get(id) || { name: id }).name;
-const team = (rosterId) => (ctx.rosters.find((r) => r.rosterId === rosterId) || {}).teamName;
+const team = (rosterId) => {
+  const r = ctx.rosters.find((x) => x.rosterId === rosterId);
+  return r ? r.displayName : `roster ${rosterId}`;
+};
 const out = (line = "") => process.stdout.write(`${line}\n`);
+const byName = (name) => (ctx.rosters.find((r) => r.displayName === name) || {}).rosterId;
 
+const sideA = ctx.myRosterId != null ? ctx.myRosterId : ctx.rosters[0].rosterId;
 const fit = curveFit(ctx);
 const W = waiverReplacement(ctx);
+
 out(
-  `ctx: week ${ctx.week}, weeksLeft ${ctx.weeksLeft.length}, myRosterId ${ctx.myRosterId} (${team(ctx.myRosterId)}), ` +
-    `maxRoster ${ctx.league.maxRoster}, deadline wk ${ctx.league.tradeDeadlineWeek}`
+  `ctx: ${ctx.league.name} — week ${ctx.week} of ${ctx.lastWeek}, weeksLeft ${ctx.weeksLeft.length}, ` +
+    `playoffs ${ctx.playoffWeeks.length ? `${ctx.playoffWeeks[0]}-${ctx.playoffWeeks[ctx.playoffWeeks.length - 1]}` : "none"}`
+);
+out(
+  `     ${ctx.league.numTeams} teams · ${ctx.league.numQbs}QB · PPR ${ctx.league.ppr} · maxRoster ${ctx.league.maxRoster} · ` +
+    `deadline wk ${ctx.league.tradeDeadlineWeek || "none"} · veto ${ctx.league.vetoVotesNeeded || "commissioner"} · ` +
+    `myRosterId ${ctx.myRosterId === null ? "null (viewer mode)" : `${ctx.myRosterId} (${team(ctx.myRosterId)})`}`
+);
+out(`     slots ${ctx.slots.join(" ")}${ctx.unsupported.length ? ` · unsupported: ${ctx.unsupported.join(", ")}` : ""}`);
+out(
+  `     tables ${["fc_redraft", "fc_dynasty", "dp_dynasty", "bc_tiers"]
+    .map((role) => `${role}→${tableFor(ctx, role) || "—"}`)
+    .join(" · ")}`
 );
 out(`sources: ${notes.join(" · ")}`);
 out(`curveFit: A=${fit.A.toFixed(1)} k=${fit.k.toFixed(4)} (n=${fit.n})`);
 out(
-  `W[pos]: QB ${W.QB.toFixed(0)} (${nm(W.best.QB.id)}) · RB ${W.RB.toFixed(0)} (${nm(W.best.RB.id)}) · ` +
-    `WR ${W.WR.toFixed(0)} (${nm(W.best.WR.id)}) · TE ${W.TE.toFixed(0)} (${nm(W.best.TE.id)}) · FLEX ${W.FLEX.toFixed(0)}`
+  `W[pos]: ${["QB", "RB", "WR", "TE"]
+    .map((pos) => `${pos} ${W[pos].toFixed(0)}${W.best[pos] ? ` (${nm(W.best[pos].id)})` : ""}`)
+    .join(" · ")} · FLEX ${W.FLEX.toFixed(0)}`
 );
-const base = seasonLineup(ctx, ctx.rosters.find((r) => r.rosterId === ctx.myRosterId).players);
-out(`my baseline lineup: ${base.avgPerWeek.toFixed(1)} pts/wk weighted, ${base.playoffAvg.toFixed(1)} in wk15-17`);
+const base = seasonLineup(ctx, ctx.rosters.find((r) => r.rosterId === sideA).players);
+out(`${team(sideA)} baseline lineup: ${base.avgPerWeek.toFixed(1)} pts/wk weighted, ${base.playoffAvg.toFixed(1)} in the playoffs`);
 
 out("\n=== findTrades (top 5) ===");
 const started = process.hrtime.bigint();
-const deals = findTrades(ctx, { maxResults: 10, perRival: 2 });
+const deals = findTrades(ctx, { myRosterId: sideA, maxResults: 10, perRival: 2 });
 const elapsed = Number(process.hrtime.bigint() - started) / 1e6;
 out(`${deals.length} results in ${elapsed.toFixed(0)} ms\n`);
 deals.slice(0, 5).forEach((d, i) => {
@@ -107,7 +129,7 @@ out("=== evaluateTrade sample ===");
 const sample = deals[0];
 if (sample) {
   const r = evaluateTrade(ctx, {
-    myRosterId: ctx.myRosterId,
+    myRosterId: sideA,
     theirRosterId: sample.theirRosterId,
     give: sample.give,
     get: sample.get,
@@ -136,3 +158,42 @@ if (sample) {
 } else {
   out("no proposals survived the acceptance gate — nothing to sample");
 }
+
+// A trade between two teams that are NOT me: every line must read in the third person.
+out("\n=== third-party verdict (nobody is 'you') ===");
+const others = ctx.rosters.filter((r) => r.rosterId !== ctx.myRosterId).map((r) => r.rosterId);
+const thirdA = byName("hobbezilla") ?? others[0];
+const thirdB = byName("speckledorf") ?? others.find((id) => id !== thirdA);
+if (thirdA != null && thirdB != null) {
+  const give = tradePool(ctx, thirdA).slice(0, 2);
+  const get = tradePool(ctx, thirdB).slice(0, 1);
+  const names = sideNames(ctx, thirdA, thirdB);
+  const third = evaluateTrade(ctx, { myRosterId: thirdA, theirRosterId: thirdB, give, get }, { names });
+  out(`${team(thirdA)} sends ${give.map(nm).join(" + ")}  ⇄  ${team(thirdB)} sends ${get.map(nm).join(" + ")}`);
+  out(`names: ${JSON.stringify(names)}`);
+  out(`verdict: ${third.verdict.code} — ${third.verdict.label}`);
+  third.reasons.forEach((l) => out(`  [${l.kind}] ${l.text}`));
+} else {
+  out("not enough teams for a third-party sample");
+}
+
+out("\n=== findLeagueTrades (whole league, top 5) ===");
+const swept = process.hrtime.bigint();
+const leagueDeals = findLeagueTrades(ctx, {
+  perTeam: 3,
+  maxResults: 20,
+  // the UI shows this as "3 of 8 teams…"; here it only clutters a piped log
+  onTeam: (rosterId, index, total) => {
+    if (process.stdout.isTTY) process.stdout.write(`\r  sweeping ${index + 1} of ${total} (${team(rosterId)})…      `);
+  },
+});
+const sweepMs = Number(process.hrtime.bigint() - swept) / 1e6;
+if (process.stdout.isTTY) process.stdout.write("\r                                             \r");
+out(`${leagueDeals.length} deals across the league in ${sweepMs.toFixed(0)} ms\n`);
+leagueDeals.slice(0, 5).forEach((d, i) => {
+  out(`${i + 1}. for ${team(d.forRosterId)} with ${team(d.theirRosterId)} — [${d.shape}] score ${d.score.toFixed(2)} · ${d.acceptance}`);
+  out(`   GIVE ${d.give.map(nm).join(" + ")}  →  GET ${d.get.map(nm).join(" + ")}`);
+  out(`   ${d.why[0]}`);
+  const rival = d.result.reasons.find((line) => line.kind === "rival");
+  if (rival) out(`   ${rival.text}`);
+});
