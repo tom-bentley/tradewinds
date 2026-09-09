@@ -7,6 +7,10 @@ export const APP_NAME = "Tradewinds";
 export const APP_VERSION = "0.1.0";
 export const STORAGE_KEY = "tradewinds.settings.v1";
 
+/**
+ * Engine + app defaults. Shape matches design.md §4 `ctx.settings`; `buildContext` deep-merges
+ * the user's saved settings over this object, so a partial patch never drops a nested key.
+ */
 export const DEFAULTS = Object.freeze({
   // Boyball 🏈 — 8-team half-PPR, 1QB, verified via api.sleeper.app 2026-09-09
   leagueId: "1394476745138147328",
@@ -14,22 +18,42 @@ export const DEFAULTS = Object.freeze({
   username: "tommyteez",
   season: "2026",
 
-  // Consensus weights (renormalized over the sources present for a player). Redraft-heavy:
-  // this is a 1-keeper league, so dynasty value is shown as "keeper value", not blended.
-  weights: {
-    fc_redraft: 0.5,
-    ktc_redraft: 0.3,
-    proj: 0.2, // projection-implied value (ROS VORP mapped onto the consensus curve)
-  },
-  keeperWeight: 0.1, // how much dynasty value nudges the verdict (0 = ignore)
-  playoffWeight: 1.5, // weeks 15-17 count this much more in lineup deltas
-  riskAversion: 1.0, // >1 penalizes injured/volatile players harder
-  finder: {
-    shapes: ["1-1", "2-1", "1-2", "2-2"],
-    maxPerRival: 5,
-    rivalTolerance: 0.04, // rival may lose up to 4% adjusted value and still "plausibly accept"
-    minMyGainPts: 1.0, // pts/week in my starting lineup
-  },
+  // --- Market value blend (R3 §a) -------------------------------------------------------
+  // Weights over REDRAFT-kind sources, renormalized over the sources that actually price a
+  // given player. `proj` is the synthetic curve source A·exp(-k·rank) fitted each run.
+  // KTC is excluded from v1 (no CORS-friendly, license-clean feed), so its 0.25 is folded
+  // into FantasyCalc, the only source measured on real redraft-shaped trades.
+  weights: Object.freeze({ fc_redraft: 0.8, proj: 0.2 }),
+  // Weights over DYNASTY-kind sources (used for the keeper tilt only).
+  dynastyWeights: Object.freeze({ fc_dynasty: 0.7, dp_dynasty: 0.3 }),
+  keeperTilt: 0.15, // φ — how much dynasty value nudges market value (1 keeper of 17 spots)
+  rho: 1.0, // ρ — how much of the waiver replacement value is subtracted from each player
+  playoffWeight: 2.0, // ω — weeks 15-17 count this much more in lineup deltas
+
+  // Market-axis injury haircut (R3 §d). The lineup axis already handles absences via wk[].
+  injuryDiscount: Object.freeze({
+    Questionable: 0.03,
+    Doubtful: 0.1,
+    Out: 0.15,
+    IR: 0.35,
+    PUP: 0.4,
+    NA: 0.4,
+    Sus: 0.25,
+    DNR: 0.4,
+  }),
+
+  // --- Trade finder (R3 §f) --------------------------------------------------------------
+  finder: Object.freeze({
+    shapes: Object.freeze(["1-1", "2-1", "1-2", "2-2"]), // "<#I give>-<#I get>"
+    maxResults: 10,
+    perRival: 2,
+    maxCandidates: 50000,
+    minMyEdgePct: -10, // stage 2: reject offers that are already a clear loss for me
+    rivalSurplusTolerance: 0.03, // stage 2: rival may lose 3% of what they send
+    rivalMinEdgePct: -2, // stage 5 acceptance gate
+    rivalMinDeltaPerWeek: 0.75, // stage 5 acceptance gate
+    valueWeight: 0.05, // κ_v in FinderScore = ΔL_pw + κ_v · Edge%
+  }),
 });
 
 export const SLEEPER = Object.freeze({
