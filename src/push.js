@@ -322,9 +322,9 @@ async function readyRegistration(d, fallbackMs = SW_READY_TIMEOUT_MS) {
     return await Promise.race([
       Promise.resolve(d.serviceWorker.ready),
       new Promise((resolve_) => {
+        // Never unref this timer: it is bounded and always cleared in `finally`; an unref'd
+        // timer let Node 22's test runner drain the loop before the 1 ms test timeout fired.
         timer = setTimeout(() => resolve_(null), timeoutMs);
-        // A pending timer must never be the reason a process (or a test run) stays alive.
-        if (typeof timer?.unref === "function") timer.unref();
       }),
     ]);
   } catch {
