@@ -5,6 +5,7 @@ import { icon, toast, avatar, THEMES, currentTheme, setTheme } from "./component
 import { escapeHtml, relTime, clockTime, fmtNum, numQbsOf, pprOf } from "./format.js";
 import { APP_NAME, APP_VERSION } from "../config.js";
 import { MOCK } from "./services.js";
+import { alertsCard, refreshStatus, alertsClick, alertsInput } from "./alerts.js";
 
 export const title = "Settings";
 
@@ -27,6 +28,10 @@ export function mount(el, e) {
   el.innerHTML = render();
   el.addEventListener("click", onClick);
   el.addEventListener("input", onInput);
+  el.addEventListener("change", onChange);
+  // Whether alerts are actually live is a question only the service worker can answer, so the
+  // card paints a skeleton first and fills in when the probe returns.
+  refreshStatus(env);
   return { destroy() { if (saveTimer) clearTimeout(saveTimer); } };
 }
 
@@ -60,6 +65,13 @@ function render() {
           <button type="button" class="btn btn-ghost" data-act="switch-league">Switch league</button>
         </div>
       </div>
+    </section>
+
+    <section class="sec">
+      <div class="sec-head"><h2>Alerts</h2><span class="sec-note">iOS Home Screen app</span></div>
+      <div id="st-alerts-body">${alertsCard()}</div>
+      <p class="note">Tradewinds has no server: a scheduled GitHub Action sends the pushes, and it
+        learns about this device from a pairing code you paste once.</p>
     </section>
 
     <section class="sec">
@@ -116,7 +128,12 @@ function render() {
 
 /* ---------------------------------------------------------------- events */
 
+function onChange(e) {
+  alertsInput(e, env);
+}
+
 function onInput(e) {
+  if (e.target.closest("[data-pref]")) return; // alerts prefs commit on change, not per keystroke
   const r = e.target.closest("input[data-dial]");
   if (!r) return;
   const key = r.dataset.dial;
@@ -143,6 +160,8 @@ function onClick(e) {
   const t = e.target.closest("[data-act]");
   if (!t) return;
   const act = t.dataset.act;
+
+  if (alertsClick(e, env)) return;
 
   if (act === "switch-league") {
     // Forget the league AND the user: onboarding is the one place a league is chosen now.

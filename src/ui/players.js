@@ -90,11 +90,18 @@ function paint() {
 
 /* ---------------------------------------------------------------- sheet */
 
-function playerSheet(id) {
+/**
+ * The value card for one player. Exported because the Deals tab's free-agent rows open the
+ * same sheet; `e` lets a caller pass its own env when Players has never been mounted.
+ * @param {string} id
+ * @param {object} [e] view env (defaults to the one Players was mounted with)
+ */
+export function openPlayerSheet(id, e = env) {
+  const svc = (e || env).svc;
   const ctx = store.ctx;
   const p = ctx.players.get(id);
   if (!p) return;
-  const mv = env.svc.marketValue(ctx, id);
+  const mv = svc.marketValue(ctx, id);
   const owner = ctx.rosterOf.get(id);
   const or = owner ? ctx.rosters.find((r) => r.rosterId === owner) : null;
   const bye = ctx.byes?.[p.team];
@@ -152,5 +159,5 @@ function onInput(e) {
 
 function onClick(e) {
   const t = e.target.closest("[data-act]");
-  if (t && t.dataset.act === "player") playerSheet(t.dataset.id);
+  if (t && t.dataset.act === "player") openPlayerSheet(t.dataset.id);
 }

@@ -807,4 +807,40 @@ export const api = {
   marketValue, waiverReplacement, sideValue, surplus,
   bestLineup, seasonLineup, backfill,
   evaluateTrade, findTrades, findLeagueTrades, explain, sideNames,
+  // §11.4 — demo mode is an iOS Safari tab, so alerts are "not installed" here on purpose.
+  alertsSupported, alertsStatus, enableAlerts, disableAlerts, updatePrefs, pairingCode,
 };
+
+/* ============================================================ push.js (§11.4, mock)
+   Demo mode answers as an iOS Safari TAB — the one alerts case the UI has to EXPLAIN rather
+   than merely disable ("Add to Home Screen first"), and the one case that cannot be reproduced
+   on a desktop browser. Everything else in the v1.2 seam (findFreeAgents, waiverStatus,
+   gradeTransaction, getTransactionsWithNew, markTradesSeen) is filled for mock and live alike
+   by `decorate()` in services.js, so both modes run the same code path. */
+
+export function alertsSupported() {
+  return { ok: false, reason: "not-installed" };
+}
+
+export async function alertsStatus() {
+  return { supported: false, reason: "not-installed", permission: "default", subscribed: false, pairing: null };
+}
+
+export async function enableAlerts() {
+  const err = new Error("Alerts only work from the Home Screen app. In Safari tap Share → Add to Home Screen, then open Tradewinds from the icon.");
+  err.name = "PushError";
+  err.reason = "not-installed";
+  throw err;
+}
+
+export async function disableAlerts() {
+  return { ok: true };
+}
+
+export function updatePrefs() {
+  return null;
+}
+
+export function pairingCode(pairing) {
+  return pairing ? JSON.stringify(pairing) : "";
+}

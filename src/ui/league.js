@@ -4,7 +4,7 @@ import { store, setIn } from "./store.js";
 import {
   avatar, teamName, skeleton, empty, openSheet, positionGroups, verdictWord, injuryTag, signTone,
 } from "./components.js";
-import { escapeHtml, fmtValue, fmtFull, fmtNum, fmtPct, relTime, clip } from "./format.js";
+import { escapeHtml, fmtValue, fmtFull, fmtNum, fmtPct, fmtPts, relTime, clip } from "./format.js";
 import { prefill } from "./analyze.js";
 
 export const title = "League";
@@ -97,17 +97,32 @@ function safe(fn) { try { return fn(); } catch (e) { console.warn("[league]", e)
 /* ---------------------------------------------------------------- transactions */
 
 async function loadTxns() {
-  const ctx = store.ctx;
-  if (store.league.txns) { paintTxns(); return; }
-  setIn("league", { txnStatus: "running" });
+  if (store.league.txns) { paintTxns(); markSeen(); return; }
   try {
-    const txns = await Promise.resolve(env.svc.getTransactions(ctx, { rounds: ctx.week }));
-    setIn("league", { txns: txns || [], txnStatus: "done" });
+    await env.transactions();
   } catch (err) {
-    console.error("[league] getTransactions failed", err);
-    setIn("league", { txns: [], txnStatus: "error" });
+    console.error("[league] transactions failed", err);
   }
   paintTxns();
+  markSeen();
+}
+
+/**
+ * Showing the League tab IS reading the trades, so the unread dot and any pending toast are
+ * retired here — `markTradesSeen` writes the same ledger the next `getTransactionsWithNew`
+ * diffs against, so a trade is announced exactly once per device.
+ */
+function markSeen() {
+  const ctx = store.ctx;
+  const ids = (store.league.newTradeIds || []).map(String);
+  const leagueId = String(ctx?.league?.id ?? "");
+  if (!ids.length || !leagueId) return;
+  try {
+    Promise.resolve(env.svc.markTradesSeen(leagueId, ids)).catch((e) => console.warn("[league] markTradesSeen", e));
+  } catch (e) {
+    console.warn("[league] markTradesSeen", e);
+  }
+  env.clearTradeDot();
 }
 
 function paintTxns() {
@@ -140,39 +155,67 @@ function paintTxns() {
   }
 }
 
+/**
+ * A completed trade belongs to two other managers as often as not, so it carries a verdict for
+ * BOTH sides (design §11.5) rather than one written from an arbitrary "my" seat.
+ * `gradeTransaction` (§11.2) does the grading; older builds fall back to `evaluateTrade`.
+ */
+function gradeOf(t) {
+  const ctx = store.ctx;
+  try {
+    const g = env.svc.gradeTransaction(ctx, t);
+    if (g && g.a != null) return g;
+  } catch (e) { console.warn("[league] gradeTransaction failed", e); }
+  const ids = [...new Set(t.rosterIds || [])].sort((a, b) => a - b);
+  const [a, b] = ids;
+  const to = (rid) => Object.entries(t.adds || {}).filter(([, r]) => r === rid).map(([id]) => id);
+  return { a, b, get: to(a), give: to(b), result: null };
+}
+
+/** `gradeTransaction` writes its own neutral `why` lines; older results carry `reasons`. */
+function whyLine(g) {
+  if (Array.isArray(g.why) && g.why.length) return typeof g.why[0] === "string" ? g.why[0] : g.why[0].text || "";
+  return g.result?.reasons?.[0]?.text || "";
+}
+
 function tradeCard(t) {
   const ctx = store.ctx;
-  const ids = [...new Set(t.rosterIds)].sort((a, b) => a - b);
-  const [lo, hi] = ids;
+  const g = gradeOf(t);
+  const { a: lo, b: hi } = g;
+  const loGet = g.get || [];
+  const hiGet = g.give || [];
   const loR = ctx.rosters.find((r) => r.rosterId === lo);
   const hiR = ctx.rosters.find((r) => r.rosterId === hi);
-  const gets = (rid) => Object.entries(t.adds || {}).filter(([, r]) => r === rid).map(([id]) => id);
-  const loGet = gets(lo), hiGet = gets(hi);
+  const res = g.result || null;
 
-  // A completed trade belongs to two other managers as often as not, so it is graded and
-  // written from roster `lo`'s side with both teams named (design §10.3 `sideNames`).
-  const sn = env.svc.sideNames(ctx, lo, hi);
-  let res = null;
-  try {
-    res = env.svc.evaluateTrade(ctx, { myRosterId: lo, theirRosterId: hi, give: hiGet, get: loGet }, { names: sn });
-  } catch (e) { console.warn("[league] grade failed", e); }
+  const edgeA = g.edgeA ?? res?.me?.edgePct ?? null;
+  const edgeB = g.edgeB ?? res?.them?.edgePct ?? null;
+  const codeA = g.codeA ?? res?.verdict?.code ?? null;
+  const codeB = g.codeB ?? null;
+  const labelA = g.labelA ?? res?.verdict?.label ?? null;
+  const labelB = g.labelB ?? null;
 
   const nm = (id) => escapeHtml(clip(ctx.players.get(id)?.name || id, 20));
-  const tone = res?.verdict?.code || "fair";
-  return `<article class="tcard" data-tone="${escapeHtml(tone)}">
+  const side = (code, label) => (code || label
+    ? verdictWord({ code, label })
+    : '<span class="verdict-word" data-tone="even">Ungraded</span>');
+  const delta = (v) => (typeof v === "number" ? `<span class="tside-d num" data-tone="${signTone(v)}">${fmtPts(v)} pts/wk</span>` : "");
+
+  return `<article class="tcard" data-tone="${escapeHtml(codeA || "fair")}">
     <header class="tcard-h">
       <span class="tcard-when">${escapeHtml(relTime(t.created))}</span>
-      ${res ? verdictWord(res.verdict) : '<span class="verdict-word" data-tone="even">Ungraded</span>'}
     </header>
     <div class="tcard-sides">
       <div class="tside"><p class="tside-n">${escapeHtml(clip(loR?.displayName || "", 14))}
-        <span class="tside-e num" data-tone="${signTone(res?.me?.edgePct, 0.5)}">${res ? fmtPct(res.me.edgePct) : "—"}</span></p>
+        <span class="tside-e num" data-tone="${signTone(edgeA, 0.5)}">${edgeA != null ? fmtPct(edgeA) : "—"}</span></p>
+        <p class="tside-v">${side(codeA, labelA)}${delta(g.deltaA)}</p>
         <p class="tside-p">${loGet.map(nm).join("<br>") || '<span class="dim">nothing</span>'}</p></div>
       <div class="tside"><p class="tside-n">${escapeHtml(clip(hiR?.displayName || "", 14))}
-        <span class="tside-e num" data-tone="${signTone(res?.them?.edgePct, 0.5)}">${res ? fmtPct(res.them.edgePct) : "—"}</span></p>
+        <span class="tside-e num" data-tone="${signTone(edgeB, 0.5)}">${edgeB != null ? fmtPct(edgeB) : "—"}</span></p>
+        <p class="tside-v">${side(codeB, labelB)}${delta(g.deltaB)}</p>
         <p class="tside-p">${hiGet.map(nm).join("<br>") || '<span class="dim">nothing</span>'}</p></div>
     </div>
-    ${res ? `<p class="tcard-why">${escapeHtml(res.reasons?.[0]?.text || "")}</p>` : ""}
+    ${whyLine(g) ? `<p class="tcard-why">${escapeHtml(whyLine(g))}</p>` : ""}
     <div class="tcard-acts">
       <button type="button" class="btn btn-ghost btn-sm" data-act="reopen"
         data-a="${lo}" data-b="${hi}"

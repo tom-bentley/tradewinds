@@ -210,3 +210,68 @@ export function possessive(name) {
   if (!s) return "Their";
   return /s$/i.test(s) ? s + "'" : s + "'s";
 }
+
+/* ---------------------------------------------------------------- waivers */
+
+/**
+ * When a waiver claim clears, in the shortest form that is still unambiguous on a chip:
+ * "Wed 3 AM" · "today 3 AM" when it is the same calendar day. Bad input -> "".
+ * @param {string|number|null} iso
+ * @param {number} [now]
+ */
+export function fmtClears(iso, now = Date.now()) {
+  const t = toMs(iso);
+  if (t === null) return "";
+  const d = new Date(t);
+  const h = d.getHours();
+  const m = d.getMinutes();
+  const ap = h < 12 ? "AM" : "PM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  const clock = m ? `${h12}:${String(m).padStart(2, "0")} ${ap}` : `${h12} ${ap}`;
+  const nd = new Date(now);
+  const sameDay = d.getFullYear() === nd.getFullYear() && d.getMonth() === nd.getMonth() && d.getDate() === nd.getDate();
+  if (sameDay) return `today ${clock}`;
+  return `${d.toLocaleDateString("en-US", { weekday: "short" })} ${clock}`;
+}
+
+/** "12–18" from `{ value, aggressive }`, or "" when the league is not FAAB. */
+export function fmtBid(bid) {
+  if (!bid) return "";
+  const v = Number(bid.value);
+  const a = Number(bid.aggressive);
+  if (!Number.isFinite(v) || v <= 0) return "";
+  if (!Number.isFinite(a) || a <= v) return String(Math.round(v));
+  return `${Math.round(v)}–${Math.round(a)}`;
+}
+
+/**
+ * The free-agent status chip's text (design §11.5). Teal "instant" or amber "waivers", with the
+ * clear time and the suggested FAAB range when the league has them.
+ * @param {{status?: string, clearsAt?: string|number|null, suggestedBid?: object|null}} row
+ * @param {number} [now]
+ * @returns {string}
+ */
+export function waiverChipText(row = {}, now = Date.now()) {
+  if (row.status !== "waivers") return "Free agent · instant";
+  const bits = ["Waivers"];
+  const clears = fmtClears(row.clearsAt, now);
+  if (clears) bits.push("clears " + clears);
+  const bid = fmtBid(row.suggestedBid);
+  if (bid) bits.push("bid " + bid);
+  return bits.join(" · ");
+}
+
+/**
+ * The Settings → Alerts status line: "Off" · "On · paired 9/9" · "Permission denied".
+ * @param {{permission?: string, subscribed?: boolean, pairing?: object|null}|null} status
+ * @returns {string}
+ */
+export function alertsStatusText(status) {
+  if (!status) return "Checking…";
+  if (status.permission === "denied") return "Permission denied";
+  if (!status.subscribed || !status.pairing) return "Off";
+  const t = toMs(status.pairing.createdAt);
+  if (t === null) return "On";
+  const d = new Date(t);
+  return `On · paired ${d.getMonth() + 1}/${d.getDate()}`;
+}

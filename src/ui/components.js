@@ -37,6 +37,18 @@ export function avatar(roster, size = 34) {
     onerror="this.style.display='none'"></span>`;
 }
 
+/**
+ * Player headshot with an initials plate behind it — Sleeper 404s a lot of thumbs, and a
+ * broken image on a free-agent card reads as a broken app. DEF falls back to the team logo.
+ */
+export function playerThumb(ctx, id, size = 44) {
+  const p = (ctx.players && ctx.players.get(id)) || {};
+  const src = p.pos === "DEF" ? SLEEPER.teamLogo(p.team || id) : SLEEPER.playerThumb(id);
+  const ini = escapeHtml(initials(p.name || id));
+  return `<span class="thumb thumb-sm" style="width:${size}px;height:${size}px" aria-hidden="true"><i>${ini}</i><img
+    src="${escapeHtml(src)}" alt="" loading="lazy" onerror="this.style.display='none'"></span>`;
+}
+
 export function teamName(roster) {
   return escapeHtml(roster?.teamName || roster?.displayName || `Roster ${roster?.rosterId ?? "?"}`);
 }

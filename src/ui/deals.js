@@ -1,4 +1,6 @@
-// Tradewinds — Deals tab. Ranked offer tickets for one team, or for the whole league.
+// Tradewinds — Deals tab. Two panes behind one segmented control (design §11.5):
+//   Trades      — ranked offer tickets for one team, or for the whole league
+//   Free agents — the wire, graded on the same lineup axis (src/ui/freeagents.js)
 //
 // v1.1 (design §10.5): the offers are computed FOR a chosen roster — mine by default, the first
 // team in viewer mode, or anyone via the picker — plus a "Whole league" scan. The engine call is
@@ -9,10 +11,12 @@ import { store, setIn } from "./store.js";
 import { avatar, playerChip, icon, skeleton, empty, signTone, openTeamSheet, teamChip } from "./components.js";
 import { escapeHtml, fmtPct, fmtPts, clip, acceptPhrase } from "./format.js";
 import { prefill } from "./analyze.js";
+import { faStart, faPaint, faFilters, faClick, faChange, faAbort } from "./freeagents.js";
 
 export const title = "Deals";
 
 const LEAGUE = "league"; // sentinel value for the "Whole league" row in the picker
+const FA = "fa"; // store.deals.tab value for the Free agents pane
 const PER_TEAM = 3;
 const LEAGUE_MAX = 20;
 
@@ -26,10 +30,15 @@ export function mount(el, e) {
   el.addEventListener("click", onClick);
   el.addEventListener("change", onChange);
 
-  if (store.deals.status === "idle") start();
+  if (isFa()) {
+    if (store.deals.fa.status === "idle") faStart(env);
+    else faPaint(env);
+  } else if (store.deals.status === "idle") start();
   else paintList();
-  return { destroy() { scan += 1; } };
+  return { destroy() { scan += 1; faAbort(); } };
 }
+
+const isFa = () => store.deals.tab === FA;
 
 /** Never assume a "me" exists: viewer mode targets the first roster in the league. */
 function ensureTarget() {
@@ -39,7 +48,8 @@ function ensureTarget() {
   if (!has(d.forRosterId)) {
     d.forRosterId = has(ctx.myRosterId) ? ctx.myRosterId : ctx.rosters[0]?.rosterId ?? null;
   }
-  if (d.scope !== LEAGUE) d.scope = "team";
+  // "Whole league" is a Trades-only scope: a wire read is always for exactly one roster.
+  if (d.scope !== LEAGUE || isFa()) d.scope = "team";
 }
 
 const targetRoster = () => store.ctx.rosters.find((r) => r.rosterId === store.deals.forRosterId) || null;
@@ -52,6 +62,7 @@ function idle(fn) {
 /* ---------------------------------------------------------------- compute */
 
 function start() {
+  if (isFa()) { faStart(env); return; }
   scan += 1;
   setIn("deals", { status: "running", results: [], error: null, progress: null });
   paintList();
@@ -149,21 +160,26 @@ function leagueScan(token) {
 /* ---------------------------------------------------------------- render */
 
 function shell() {
+  const fa = isFa();
   return `<div class="deals">
+    <div class="seg seg-source" role="tablist" aria-label="Where the deals come from">
+      <button type="button" role="tab" data-act="mode" data-v="trades" class="${fa ? "" : "is-on"}" aria-selected="${!fa}">Trades</button>
+      <button type="button" role="tab" data-act="mode" data-v="fa" class="${fa ? "is-on" : ""}" aria-selected="${fa}">Free agents</button>
+    </div>
     <div class="deals-head">
       <div class="deals-for">
-        <span class="view-h">Best offers for</span>
+        <span class="view-h">${fa ? "Wire moves for" : "Best offers for"}</span>
         ${pickerChip()}
       </div>
-      <button type="button" class="icon-btn" data-act="recompute" aria-label="Recompute offers">${icon("refresh")}</button>
+      <button type="button" class="icon-btn" data-act="recompute" aria-label="${fa ? "Search the wire again" : "Recompute offers"}">${icon("refresh")}</button>
     </div>
-    <div class="filters" id="dl-filters">${filters()}</div>
-    <div id="dl-list"></div>
+    <div class="filters" id="dl-filters">${fa ? faFilters() : filters()}</div>
+    <div id="dl-list"${fa ? ' aria-live="polite" aria-busy="false"' : ""}></div>
   </div>`;
 }
 
 function pickerChip() {
-  if (store.deals.scope === LEAGUE) {
+  if (store.deals.scope === LEAGUE && !isFa()) {
     return `<button type="button" class="tchip" data-act="pick-team"><span class="tchip-n">Whole league</span><span class="tchip-c" aria-hidden="true">▾</span></button>`;
   }
   return teamChip(targetRoster(), { act: "pick-team" });
@@ -310,6 +326,7 @@ function card(r, i) {
 /* ---------------------------------------------------------------- events */
 
 function onChange(e) {
+  if (isFa()) { faChange(e, env); return; }
   const sel = e.target.closest("select[data-f]");
   if (!sel) return;
   store.deals.filters = { ...store.deals.filters, [sel.dataset.f]: sel.value };
@@ -321,24 +338,44 @@ function onClick(e) {
   if (!t) return;
   const act = t.dataset.act;
 
+  if (act === "mode") {
+    const next = t.dataset.v === FA ? FA : "trades";
+    if (store.deals.tab === next) return;
+    scan += 1;
+    faAbort();
+    store.deals.tab = next;
+    // The whole-league scan has no meaning on the wire; drop back to the picked team.
+    if (next === FA && store.deals.scope === LEAGUE) store.deals.scope = "team";
+    env.rerender();
+    return;
+  }
+
+  if (isFa() && faClick(e, env)) return;
+
   if (act === "pick-team") {
+    const fa = isFa();
     openTeamSheet({
-      title: "Best offers for",
+      title: fa ? "Wire moves for" : "Best offers for",
       ctx: store.ctx,
       current: store.deals.scope === LEAGUE ? LEAGUE : store.deals.forRosterId,
-      extras: [{ value: LEAGUE, label: "Whole league", sub: `every team · up to ${PER_TEAM} offers each` }],
-      note: "The whole-league scan runs one team at a time and takes a few seconds.",
+      // A wire read is always for one roster, so the whole-league row only exists under Trades.
+      extras: fa ? [] : [{ value: LEAGUE, label: "Whole league", sub: `every team · up to ${PER_TEAM} offers each` }],
+      note: fa
+        ? "Free agents are graded against this team's lineup — the best drop comes from its bench."
+        : "The whole-league scan runs one team at a time and takes a few seconds.",
       onPick: (value) => {
         const league = value === LEAGUE;
         if (!league && value === store.deals.forRosterId && store.deals.scope === "team") return;
         if (league && store.deals.scope === LEAGUE) return;
         scan += 1; // abandon any in-flight league scan
+        faAbort();
         store.deals.scope = league ? LEAGUE : "team";
         if (!league) store.deals.forRosterId = value;
         store.deals.filters = { rival: "", pos: "", shape: "" };
         store.deals.status = "idle";
         store.deals.results = [];
         store.deals.progress = null;
+        store.deals.fa = { ...store.deals.fa, status: "idle", results: [], error: null };
         env.rerender();
       },
     });

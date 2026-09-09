@@ -632,3 +632,119 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
   .verdict-word { font-size: 26px; }
   .rival { width: 56px; }
 }
+
+/* ================================================================== v1.2 — free agents */
+
+/* The Trades|Free agents switch sits above the team picker: it changes what the whole tab is
+   about, so it reads before anything it filters. */
+.seg-source { margin: 12px 0 4px; }
+
+#tabs a { position: relative; }
+.tab-dot {
+  position: absolute; top: 7px; left: 50%; margin-left: 9px;
+  width: 8px; height: 8px; border-radius: 50%; background: var(--theirs);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+.fa-list { display: grid; gap: 10px; }
+.fa {
+  --accent: var(--mine);
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--accent); border-radius: var(--r-card); overflow: hidden;
+}
+/* Amber is caution everywhere else in the app, and a waiver claim is exactly that: not yours
+   yet, and it costs something. Teal stays the instant, free add. */
+.fa[data-status="waivers"] { --accent: var(--theirs); }
+
+.fa-hit {
+  display: grid; grid-template-columns: 18px 44px 1fr; gap: 9px; align-items: start;
+  width: 100%; padding: 11px 10px 12px; background: none; border: 0; text-align: left; cursor: pointer;
+}
+.fa-hit:active { background: var(--surface2); }
+.fa-rank { font-size: 14px; font-weight: 700; color: var(--accent); padding-top: 12px; }
+.fa-body { min-width: 0; display: block; }
+.fa-h { display: flex; align-items: baseline; gap: 8px; }
+.fa-name { font-size: 15px; font-weight: 700; letter-spacing: -.012em; min-width: 0; }
+.fa-val { margin-left: auto; flex: none; font-weight: 650; color: var(--ink-2); }
+.fa-meta { display: block; margin-top: 1px; font-size: 14px; color: var(--ink-2); }
+.fa-trend { margin-left: 6px; color: var(--theirs); font-weight: 650; }
+
+.fa-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.schip {
+  display: inline-flex; align-items: center; padding: 3px 9px; border-radius: var(--r-pill);
+  border: 1px solid var(--line); background: var(--surface2); font-size: 14px; font-weight: 600;
+  color: var(--ink-2);
+}
+.schip-free { border-color: rgba(45, 212, 191, .42); background: var(--mine-soft); color: var(--mine); }
+.schip-wv { border-color: rgba(245, 158, 11, .4); background: var(--theirs-soft); color: var(--theirs); }
+.schip-drop, .schip-open { color: var(--ink-2); }
+
+.thumb-sm { border-radius: 10px; font-size: 15px; }
+
+/* ================================================================== v1.2 — alerts */
+
+.alerts { display: grid; gap: 10px; }
+.al-top { display: flex; align-items: center; gap: 8px; }
+.al-status { font-size: 16px; font-weight: 700; letter-spacing: -.012em; }
+.al-top .dot { margin-right: 0; }
+.al-prefs { display: grid; gap: 2px; border-top: 1px solid var(--line-soft); padding-top: 6px; }
+.al-acts { margin-top: 2px; }
+.al-acts .btn { width: 100%; text-decoration: none; }
+
+.swrow, .nrow {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  min-height: 44px; padding: 5px 0; cursor: pointer;
+}
+.swrow-t { display: grid; min-width: 0; }
+.swrow-l { font-size: 15px; font-weight: 600; }
+.swrow-h { font-size: 14px; color: var(--ink-3); }
+
+/* A real checkbox, restyled — it keeps the native label/focus/announcement behaviour. */
+.sw {
+  flex: none; appearance: none; width: 46px; height: 28px; border-radius: var(--r-pill);
+  background: var(--raised); border: 1px solid var(--line); position: relative; cursor: pointer;
+  transition: background .15s ease;
+}
+.sw::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 22px; height: 22px;
+  border-radius: 50%; background: var(--ink-2); transition: transform .15s ease, background .15s ease;
+}
+.sw:checked { background: var(--mine); border-color: var(--mine); }
+.sw:checked::after { transform: translateX(18px); background: #062723; }
+
+.nrow-in { display: flex; align-items: baseline; gap: 6px; flex: none; }
+.nin {
+  width: 74px; min-height: 44px; padding: 0 10px; text-align: right;
+  background: var(--surface2); border: 1px solid var(--line); border-radius: var(--r-row); color: var(--ink);
+}
+.nrow-u { font-size: 14px; color: var(--ink-3); }
+
+/* ---- pairing sheet ---- */
+
+.pair { display: grid; gap: 12px; }
+.pair-lead { font-size: 15px; color: var(--ink-2); }
+.pair-code { display: grid; gap: 8px; }
+.codeblock {
+  max-height: 168px; overflow: auto; margin: 0; padding: 10px 11px;
+  background: var(--surface2); border: 1px solid var(--line); border-radius: var(--r-row);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px;
+  line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2);
+  -webkit-overflow-scrolling: touch;
+}
+.pair-code .btn { justify-self: start; }
+.steps { display: grid; gap: 9px; counter-reset: step; padding-left: 0; }
+.steps li {
+  position: relative; padding-left: 30px; font-size: 15px; color: var(--ink-2); counter-increment: step;
+}
+.steps li::before {
+  content: counter(step); position: absolute; left: 0; top: 1px;
+  display: grid; place-items: center; width: 21px; height: 21px; border-radius: 50%;
+  background: var(--mine-soft); color: var(--mine); font-size: 13px; font-weight: 700;
+}
+.pair .btn { text-decoration: none; }
+
+/* ---- graded trade card: both sides carry a verdict ---- */
+
+.tside-v { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 2px 0 4px; }
+.tside-v .verdict-word { font-size: 15px; }
+.tside-d { font-size: 14px; color: var(--ink-3); }

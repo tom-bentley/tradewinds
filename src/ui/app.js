@@ -1,9 +1,9 @@
 // Tradewinds — boot, hash routing, header chrome, service-worker update flow.
 
-import { store, set, subscribe } from "./store.js";
+import { store, set, setIn, subscribe } from "./store.js";
 import { services, MOCK, ServicesError, isSetupRequired, stripDeepLink } from "./services.js";
 import { toast, closeTopSheet, closeAllSheets, syncThemeColor } from "./components.js";
-import { escapeHtml, clockTime, relTime } from "./format.js";
+import { escapeHtml, clockTime, relTime, clip } from "./format.js";
 import { APP_NAME } from "../config.js";
 
 import * as deals from "./deals.js";
@@ -67,6 +67,8 @@ async function boot() {
       renderView(true);
     }
     syncThemeColor();
+    // New-trade awareness runs after first paint: it is a background read, never a boot gate.
+    setTimeout(() => transactions(), 0);
   } catch (err) {
     // data.js signals "no league configured" with SetupRequiredError, not a crash screen.
     if (isSetupRequired(err)) { showSetup(); return; }
@@ -127,18 +129,23 @@ async function reload({ hard = false } = {}) {
   if (!svc) return;
   const s = svc.loadSettings();
   store.settings = s;
+  txnsPending = null;
   if (hard) {
-    store.deals = { status: "idle", results: [], filters: { rival: "", pos: "", shape: "" }, error: null };
-    store.league = { txns: null, txnStatus: "idle" };
+    store.deals = {
+      ...store.deals, status: "idle", results: [], filters: { rival: "", pos: "", shape: "" }, error: null,
+      fa: { status: "idle", results: [], pos: "", error: null, ms: null },
+    };
+    store.league = { txns: null, txnStatus: "idle", newTradeIds: [] };
     store.analyze = { theirRosterId: null, give: [], get: [], q: "", result: null, expanded: false, error: null };
   } else {
-    store.deals = { ...store.deals, status: "idle", results: [] };
+    store.deals = { ...store.deals, status: "idle", results: [], fa: { ...store.deals.fa, status: "idle", results: [] } };
   }
   try {
     const out = await svc.loadAll({ settings: s });
     set({ ctx: out.ctx, freshness: out.freshness || {}, errors: out.errors || [] }, "reload");
     store.lastLiveAt = Date.now();
     renderView(true);
+    transactions();
   } catch (err) {
     toast("Could not reload: " + (err.message || err), { tone: "warn", timeout: 6000 });
   }
@@ -152,11 +159,13 @@ async function refresh({ silent = false } = {}) {
   btn && btn.classList.add("is-spin");
   try {
     const out = await svc.refreshLive(store.settings);
-    store.deals = { ...store.deals, status: "idle", results: [] };
-    store.league = { txns: null, txnStatus: "idle" };
+    txnsPending = null;
+    store.deals = { ...store.deals, status: "idle", results: [], fa: { ...store.deals.fa, status: "idle", results: [] } };
+    store.league = { ...store.league, txns: null, txnStatus: "idle" };
     set({ ctx: out.ctx, freshness: out.freshness || {}, errors: out.errors || [] }, "refresh");
     store.lastLiveAt = Date.now();
     renderView(true);
+    transactions();
     if (!silent) toast("Data refreshed.");
   } catch (err) {
     console.error("[app] refresh failed", err);
@@ -187,6 +196,76 @@ function installForegroundRefresh() {
   window.addEventListener("online", maybeRefreshOnForeground);
 }
 
+/* ======================================================== transactions + new trades
+   One fetch per load, shared by the League tab (completed-trade grades and the recent-moves
+   list) and by Deals → Free agents (waiver windows). Memoized so mounting both tabs costs one
+   round-trip; `refresh` and `reload` drop the memo so the next reader re-pulls. */
+
+let txnsPending = null;
+
+function transactions({ force = false } = {}) {
+  if (force) txnsPending = null;
+  if (!txnsPending) txnsPending = loadTransactions();
+  return txnsPending;
+}
+
+async function loadTransactions() {
+  const ctx = store.ctx;
+  if (!ctx || !svc || !svc.getTransactionsWithNew) return { txns: [], newTradeIds: [] };
+  // The engine never reads the clock, so "now" is supplied here for the waiver windows.
+  // `attachTransactions` (data.js) does both jobs — hang the feed on the ctx AND stamp ctx.now —
+  // so prefer it and fall back to the plain fetch in demo mode.
+  if (!Number.isFinite(ctx.now)) ctx.now = Date.now();
+  setIn("league", { txnStatus: "running" });
+  try {
+    const fetcher = svc.attachTransactions || svc.getTransactionsWithNew;
+    const out = await fetcher(ctx, { rounds: ctx.week });
+    const txns = out.txns || [];
+    ctx.transactions = txns;
+    setIn("league", { txns, txnStatus: "done", newTradeIds: out.newTradeIds || [] });
+    announceNewTrades(out.newTradeIds || [], txns);
+    return { txns, newTradeIds: out.newTradeIds || [] };
+  } catch (err) {
+    console.error("[app] transactions failed", err);
+    if (!Array.isArray(ctx.transactions)) ctx.transactions = [];
+    setIn("league", { txns: [], txnStatus: "error", newTradeIds: [] });
+    return { txns: [], newTradeIds: [] };
+  }
+}
+
+/** A dot on the League tab plus one toast per new completed trade (design §11.5). */
+function announceNewTrades(ids, txns) {
+  paintTradeDot();
+  if (!ids.length) return;
+  const ctx = store.ctx;
+  const nameOf = (rid) => {
+    const r = ctx.rosters.find((x) => x.rosterId === rid);
+    return clip((r && (r.teamName || r.displayName)) || `Roster ${rid}`, 14);
+  };
+  for (const id of ids.slice(0, 3)) {
+    const t = txns.find((x) => String(x.id) === String(id));
+    if (!t) continue;
+    const sides = [...new Set(t.rosterIds || [])].map(nameOf);
+    toast(`New trade: ${sides.join(" ⇄ ") || "in your league"}`, {
+      action: "View",
+      timeout: 9000,
+      onAction: () => go("league"),
+    });
+  }
+}
+
+/** The League tab's unread dot. Hidden as soon as the League view marks the trades seen. */
+function paintTradeDot() {
+  const tab = document.querySelector('#tabs a[data-tab="league"]');
+  if (!tab) return;
+  const on = (store.league.newTradeIds || []).length > 0;
+  tab.classList.toggle("has-dot", on);
+  const dot = tab.querySelector(".tab-dot");
+  if (dot) dot.hidden = !on;
+  if (on) tab.setAttribute("aria-description", "new trade");
+  else tab.removeAttribute("aria-description");
+}
+
 /* ================================================================== router */
 
 function tabFromHash() {
@@ -194,7 +273,27 @@ function tabFromHash() {
   return TABS.includes(h) ? h : "deals";
 }
 
+/**
+ * `notificationclick` in sw.js focuses this page and posts `{ type: "open-url", url }`.
+ * The url is the full Pages URL with a hash; only the hash matters to the router, and an
+ * unknown one is ignored rather than blanking the view.
+ */
+function installSwMessages() {
+  if (!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    const d = e.data;
+    if (!d || d.type !== "open-url" || !d.url) return;
+    let hash = "";
+    try { hash = new URL(d.url, location.href).hash; } catch { hash = String(d.url).includes("#") ? "#" + String(d.url).split("#")[1] : ""; }
+    const tab = hash.replace(/^#/, "");
+    if (!TABS.includes(tab)) return;
+    closeAllSheets();
+    go(tab);
+  });
+}
+
 function startRouter() {
+  installSwMessages();
   window.addEventListener("hashchange", () => renderView());
   $("tabs").addEventListener("click", (e) => {
     const a = e.target.closest("a[data-tab]");
@@ -215,8 +314,17 @@ function go(tab) {
 const env = {
   get svc() { return svc; },
   go, refresh, reload, boot,
+  transactions,
+  clearTradeDot,
   rerender: () => renderView(true),
 };
+
+/** The League view calls this once it has marked the new trades seen. */
+function clearTradeDot() {
+  if (!(store.league.newTradeIds || []).length) return;
+  setIn("league", { newTradeIds: [] });
+  paintTradeDot();
+}
 
 function renderView(force = false) {
   const name = tabFromHash();
