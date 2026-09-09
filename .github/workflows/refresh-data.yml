@@ -1,0 +1,65 @@
+name: Refresh data
+
+# Regenerates data/*.json (players, projections, schedule, values, meta) from public sources and
+# commits the result when anything changed. Runs every 6 hours, offset from :00 to dodge GitHub's
+# peak-load scheduling delays. Manual runs: `gh workflow run refresh-data.yml`.
+#
+# Notes (see specs/003 research R2):
+# - GITHUB_TOKEN needs contents:write to push.
+# - A push made with GITHUB_TOKEN may not trigger the classic Pages rebuild, so we request a
+#   build explicitly through the REST API afterwards.
+# - Regular bot commits keep the repository "active", which keeps this schedule from being
+#   auto-disabled after 60 days of inactivity.
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pages: write
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run pipeline
+        run: node pipeline/refresh.mjs
+        env:
+          TRADEWINDS_LEAGUE_ID: "1394476745138147328"
+
+      - name: Run tests
+        run: node --test test/
+
+      - name: Commit and push if changed
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.json
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No data changes."
+          else
+            git commit -m "chore(data): refresh $(date -u +'%Y-%m-%d %H:%MZ')"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Request Pages rebuild
+        if: steps.commit.outputs.changed == 'true'
+        run: gh api "repos/${{ github.repository }}/pages/builds" -X POST
+        env:
+          GH_TOKEN: ${{ github.token }}
