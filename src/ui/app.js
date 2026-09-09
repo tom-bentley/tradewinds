@@ -1,7 +1,7 @@
 // Tradewinds — boot, hash routing, header chrome, service-worker update flow.
 
 import { store, set, subscribe } from "./store.js";
-import { services, MOCK, ServicesError } from "./services.js";
+import { services, MOCK, ServicesError, isSetupRequired, stripDeepLink } from "./services.js";
 import { toast, closeTopSheet, closeAllSheets, syncThemeColor } from "./components.js";
 import { escapeHtml, clockTime, relTime } from "./format.js";
 import { APP_NAME } from "../config.js";
@@ -11,12 +11,14 @@ import * as analyze from "./analyze.js";
 import * as league from "./league.js";
 import * as players from "./players.js";
 import * as settings from "./settings.js";
+import * as setup from "./setup.js";
 
 const VIEWS = { deals, analyze, league, players, settings };
 const TABS = Object.keys(VIEWS);
 
 let svc = null;
 let active = null; // { name, instance }
+let routerStarted = false;
 const scrollTop = new Map();
 
 const $ = (id) => document.getElementById(id);
@@ -26,11 +28,20 @@ const $ = (id) => document.getElementById(id);
 boot();
 
 async function boot() {
+  set({ status: "booting", bootStep: "", bootPct: 0 }, "boot");
+  screen("app");
   paintBoot();
   try {
     svc = await services();
     set({ mode: svc.mode }, "mode");
-    const s = svc.loadSettings();
+
+    // A shared link (`?league=…&user=…`) configures the app before anything is loaded, then the
+    // query is dropped so a reload or a bookmark keeps the saved league instead of re-applying.
+    let s = await applyDeepLink();
+
+    // No league yet — first run, or "Switch league" in Settings. Onboarding is the front door.
+    if (!s.leagueId) { showSetup(); return; }
+
     set({ settings: s, bootStep: "Loading league data", bootPct: 4 }, "boot");
     paintBoot();
     const out = await svc.loadAll({
@@ -47,15 +58,68 @@ async function boot() {
     });
     set({ ctx: out.ctx, freshness: out.freshness || {}, errors: out.errors || [], status: "ready" }, "ready");
     store.lastLiveAt = Date.now();
-    startRouter();
-    installForegroundRefresh();
+    if (!routerStarted) {
+      routerStarted = true;
+      startRouter();
+      installForegroundRefresh();
+      registerSW();
+    } else {
+      renderView(true);
+    }
     syncThemeColor();
-    registerSW();
   } catch (err) {
+    // data.js signals "no league configured" with SetupRequiredError, not a crash screen.
+    if (isSetupRequired(err)) { showSetup(); return; }
     console.error("[app] boot failed", err);
     set({ status: "error", error: err }, "error");
     paintError(err);
   }
+}
+
+/** Apply `?league=&user=` if present, then strip it. Returns the settings to boot with. */
+async function applyDeepLink() {
+  try {
+    // Cheap sync parse first, so a normal boot never awaits a network round-trip.
+    const seen = svc.readDeepLink ? svc.readDeepLink() : null;
+    if (seen && seen.leagueId) {
+      // applyDeepLink resolves `user=<username>` to a user id; it does not persist anything.
+      const patch = svc.applyDeepLink ? await svc.applyDeepLink() : seen;
+      if (patch && patch.leagueId) {
+        // Spread over explicit nulls: a link with no user must clear the PREVIOUS league's user
+        // rather than inherit it, otherwise the wrong roster comes back as "me".
+        const next = svc.saveSettings({ userId: null, username: null, ...patch });
+        (svc.clearDeepLink || stripDeepLink)();
+        store.setup = { ...store.setup, status: "idle", leagues: null, error: null };
+        if (next && next.leagueId) return next;
+      }
+    }
+  } catch (err) {
+    console.warn("[app] deep link ignored", err);
+  }
+  return svc.loadSettings();
+}
+
+/* ---------------------------------------------------------------- onboarding */
+
+function screen(name) {
+  const app = document.getElementById("app");
+  if (app) app.dataset.screen = name;
+}
+
+function showSetup() {
+  set({ status: "setup", ctx: null, freshness: null, errors: [] }, "setup");
+  store.setup = { ...store.setup, season: store.setup.season || (svc ? svc.loadSettings().season : null) };
+  screen("setup");
+  paintHeader();
+  const host = $("view");
+  const el = document.createElement("section");
+  el.className = "view view-setup";
+  host.replaceChildren(el);
+  if (active) {
+    try { active.instance && active.instance.destroy && active.instance.destroy(); } catch { /* ignore */ }
+  }
+  active = { name: "setup", instance: setup.mount(el, env) };
+  syncThemeColor();
 }
 
 /** Re-run loadAll with the current settings (after a dial or league change). */
@@ -148,7 +212,11 @@ function go(tab) {
   else location.hash = "#" + tab;
 }
 
-const env = { get svc() { return svc; }, go, refresh, reload, rerender: () => renderView(true) };
+const env = {
+  get svc() { return svc; },
+  go, refresh, reload, boot,
+  rerender: () => renderView(true),
+};
 
 function renderView(force = false) {
   const name = tabFromHash();
@@ -199,7 +267,19 @@ function chip(label, value, mod = "") {
 function paintHeader() {
   const f = store.freshness || {};
   const ctx = store.ctx;
+
+  // The league name lives beside the wordmark: with no baked-in league it is the only thing on
+  // screen that says WHICH league every number belongs to.
+  const lg = $("hdr-league");
+  if (lg) lg.textContent = ctx?.league?.name ? "· " + ctx.league.name : "";
+
   const rail = $("hdr-fresh");
+  if (store.status === "setup") {
+    rail.innerHTML = "";
+    const b = $("banner");
+    if (b) b.hidden = true;
+    return;
+  }
   const parts = [];
   if (f.offline) parts.push(chip("offline", "last good data", "is-bad"));
   parts.push(chip("rosters", f.live ? (f.offline ? relTime(f.live) : clockTime(f.live)) : "—", f.offline ? "" : "is-live"));

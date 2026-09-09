@@ -109,10 +109,10 @@ export function verdictTone(code) {
 
 export function verdictWord(v) {
   const code = v?.code || "fair";
-  // Long engine labels ("Requires dropping X", "Invalid — X is not …") carry their detail in the
-  // flag chips and headline; the big word stays short so the panel never wraps three lines.
-  const SHORT = { needs_drop: "Needs a drop", invalid: "Invalid" };
-  const label = SHORT[code] || v?.label || VERDICT_LABEL[code] || "Fair";
+  // Long engine labels ("Clear loss — decline", "Win — you get better now") carry their detail in
+  // the headline sentence and flag chips. The big word stays short so the panel never wraps three
+  // lines — and so a third-party trade's headline never leaks a second-person label.
+  const label = VERDICT_LABEL[code] || v?.label || "Fair";
   return `<span class="verdict-word" data-tone="${verdictTone(code)}">${escapeHtml(label)}</span>`;
 }
 
@@ -120,7 +120,9 @@ export function verdictWord(v) {
  * Opposed value bars. Both sides share one scale; the winning bar carries a parity hairline
  * at the losing side's length, so the surplus edge reads as a notch rather than only a number.
  */
-export function valueBars(me) {
+export function valueBars(me, names = null) {
+  const gives = names && !names.first ? `${names.a} gives` : "You give";
+  const gets = names && !names.first ? `${names.a} gets` : "You get";
   const gs = num(me?.valueGive?.surplus), ns = num(me?.valueGet?.surplus);
   const gr = num(me?.valueGive?.raw), nr = num(me?.valueGet?.raw);
   const max = Math.max(gs, ns, 1);
@@ -128,9 +130,9 @@ export function valueBars(me) {
   const markGive = gs > ns ? `<i class="bar-mark" style="left:${np}%"></i>` : "";
   const markGet = ns > gs ? `<i class="bar-mark" style="left:${gp}%"></i>` : "";
   return `<div class="bars">
-    <div class="bar-line"><span class="bar-lab"><i class="dot theirs"></i>You give</span><span class="bar-num num">${fmtFull(gs)}</span></div>
+    <div class="bar-line"><span class="bar-lab"><i class="dot theirs"></i>${escapeHtml(gives)}</span><span class="bar-num num">${fmtFull(gs)}</span></div>
     <div class="bar-track"><div class="bar-fill f-theirs" style="width:${gp}%"></div>${markGive}</div>
-    <div class="bar-line"><span class="bar-lab"><i class="dot mine"></i>You get</span><span class="bar-num num">${fmtFull(ns)}</span></div>
+    <div class="bar-line"><span class="bar-lab"><i class="dot mine"></i>${escapeHtml(gets)}</span><span class="bar-num num">${fmtFull(ns)}</span></div>
     <div class="bar-track"><div class="bar-fill f-mine" style="width:${np}%"></div>${markGet}</div>
     <p class="bar-raw">raw <span class="num">${fmtFull(gr)}</span> against <span class="num">${fmtFull(nr)}</span></p>
   </div>`;
@@ -138,16 +140,19 @@ export function valueBars(me) {
 
 function num(v) { return typeof v === "number" && Number.isFinite(v) ? v : 0; }
 
-export function bestBadge(ctx, best, mv) {
+export function bestBadge(ctx, best, mv, names = null) {
   if (!best || !best.id) return "";
   const p = ctx.players.get(best.id);
   if (!p) return "";
   const side = best.side === "me" ? "mine" : "theirs";
-  const who = best.side === "me" ? "you get him" : "they get him";
+  const third = names && !names.first;
+  const who = best.side === "me"
+    ? (third ? `${names.a} gets him` : "you get him")
+    : (third || (names && names.b) ? `${names.b} gets him` : "they get him");
   const tier = mv && mv.tier ? ` · tier ${mv.tier}` : "";
   return `<p class="best best-${side}">${icon("star", "ic-star")}<strong>${escapeHtml(p.name)}</strong>
     <span class="dim">${escapeHtml(posRankLabel(p.pos, mv && mv.posRank))}${escapeHtml(tier)}</span>
-    is the best player in the deal — ${who}.</p>`;
+    is the best player in the deal — ${escapeHtml(who)}.</p>`;
 }
 
 /** Short labels for info-level flags: the panel shows the signal, Details carries the sentence. */
@@ -357,3 +362,58 @@ matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
   if (currentTheme() === "system") syncThemeColor();
 });
 syncThemeColor();
+
+/* ------------------------------------------------------------------ team picker */
+
+/**
+ * A sheet that picks one team (or one of the `extras`, e.g. "Whole league").
+ * Used by Analyze for side A and by Deals for the "best offers for" target, so the two pickers
+ * stay one component and one set of 44 px rows.
+ *
+ * @param {object}   o
+ * @param {string}   o.title      sheet title
+ * @param {object}   o.ctx        engine context
+ * @param {*}        o.current    currently selected value (roster id, or an extra's value)
+ * @param {Array}    [o.extras]   [{ value, label, sub }] rows shown above the teams
+ * @param {number[]} [o.exclude]  roster ids to leave out
+ * @param {string}   [o.note]     footnote under the list
+ * @param {(value:*)=>void} o.onPick called with the roster id (number) or an extra's value
+ */
+export function openTeamSheet({ title, ctx, current, extras = [], exclude = [], note = "", onPick }) {
+  const rows = ctx.rosters.filter((r) => !exclude.includes(r.rosterId));
+  const body = `<ul class="tpick">
+    ${extras.map((x) => `<li><button type="button" class="tpick-row tpick-extra${x.value === current ? " is-on" : ""}"
+      data-pick="${escapeHtml(String(x.value))}" data-kind="extra" aria-pressed="${x.value === current}">
+      <span class="tpick-txt"><span class="tpick-n">${escapeHtml(x.label)}</span>
+      ${x.sub ? `<span class="tpick-u">${escapeHtml(x.sub)}</span>` : ""}</span>
+      ${x.value === current ? '<span class="tag tag-ok">on</span>' : ""}</button></li>`).join("")}
+    ${rows.map((r) => `<li><button type="button" class="tpick-row${r.rosterId === current ? " is-on" : ""}"
+      data-pick="${r.rosterId}" data-kind="team" aria-pressed="${r.rosterId === current}">
+      ${avatar(r, 32)}
+      <span class="tpick-txt"><span class="tpick-n">${teamName(r)}</span>
+        <span class="tpick-u">${escapeHtml(r.displayName)} · ${r.wins}–${r.losses}${
+          r.rosterId === ctx.myRosterId ? " · your team" : ""}</span></span>
+      ${r.rosterId === current ? '<span class="tag tag-ok">on</span>' : ""}</button></li>`).join("")}
+  </ul>${note ? `<p class="note">${escapeHtml(note)}</p>` : ""}`;
+
+  openSheet({
+    title,
+    body,
+    onMount(el, close) {
+      el.addEventListener("click", (e) => {
+        const b = e.target.closest("[data-pick]");
+        if (!b) return;
+        close();
+        onPick(b.dataset.kind === "team" ? Number(b.dataset.pick) : b.dataset.pick);
+      });
+    },
+  });
+}
+
+/** The tappable "[team ▾]" chip that opens `openTeamSheet`. */
+export function teamChip(roster, { act, label = "", cls = "" } = {}) {
+  const name = roster ? teamName(roster) : escapeHtml(label || "Pick a team");
+  return `<button type="button" class="tchip ${cls}" data-act="${escapeHtml(act)}">
+    ${roster ? avatar(roster, 24) : ""}<span class="tchip-n">${name}</span>
+    <span class="tchip-c" aria-hidden="true">▾</span></button>`;
+}

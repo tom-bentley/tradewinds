@@ -2,7 +2,7 @@
 
 import { store, setIn } from "./store.js";
 import { icon, toast, avatar, THEMES, currentTheme, setTheme } from "./components.js";
-import { escapeHtml, relTime, clockTime, fmtNum } from "./format.js";
+import { escapeHtml, relTime, clockTime, fmtNum, numQbsOf, pprOf } from "./format.js";
 import { APP_NAME, APP_VERSION } from "../config.js";
 import { MOCK } from "./services.js";
 
@@ -27,29 +27,38 @@ export function mount(el, e) {
   el.innerHTML = render();
   el.addEventListener("click", onClick);
   el.addEventListener("input", onInput);
-  el.addEventListener("submit", onSubmit);
   return { destroy() { if (saveTimer) clearTimeout(saveTimer); } };
 }
 
 function render() {
   const ctx = store.ctx;
   const s = store.settings || ctx.settings;
-  const st = store.settingsTab;
-  const me = ctx.rosters.find((r) => r.rosterId === ctx.myRosterId);
+  const me = ctx.myRosterId != null ? ctx.rosters.find((r) => r.rosterId === ctx.myRosterId) : null;
+  // The three shape numbers the engine actually priced this league with — the value table it
+  // picked (1QB vs 2QB) and the tier table (PPR) both hang off them, so they are worth showing.
+  const numQbs = ctx.league.numQbs ?? numQbsOf(ctx.league.rosterPositions);
+  const ppr = ctx.league.ppr ?? pprOf(ctx.league.scoring);
+  const unsupported = ctx.unsupported || [];
 
   return `<div class="settings">
     <section class="sec">
       <div class="sec-head"><h2>League</h2></div>
       <div class="card">
-        <div class="lg-now">${avatar(me, 36)}<div><p class="lg-n">${escapeHtml(ctx.league.name)}</p>
-          <p class="lg-m">${escapeHtml(me?.teamName || "")} · ${escapeHtml(s.username || "")} · ${ctx.league.numTeams} teams · ${escapeHtml(ctx.season)}</p></div></div>
-        <form class="lookup" id="st-lookup">
-          <label class="fld"><span>Sleeper username</span>
-            <input type="text" name="username" value="${escapeHtml(st.username || s.username || "")}" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="tommyteez"></label>
-          <button type="submit" class="btn">${st.lookup === "running" ? "Looking…" : "Find leagues"}</button>
-        </form>
-        ${st.lookupError ? `<p class="note note-warn">${escapeHtml(st.lookupError)}</p>` : ""}
-        ${st.leagues ? leagueList(st.leagues, s) : ""}
+        <div class="lg-now">${me ? avatar(me, 36) : ""}<div><p class="lg-n">${escapeHtml(ctx.league.name)}</p>
+          <p class="lg-m">${me
+            ? `${escapeHtml(me.teamName || "")} · ${escapeHtml(s.username || me.displayName || "")}`
+            : "Viewer mode — no team of yours in this league"}</p></div></div>
+        <table class="mini lg-shape"><tbody>
+          <tr><th scope="row">Teams</th><td class="num">${ctx.league.numTeams}</td></tr>
+          <tr><th scope="row">Quarterbacks</th><td class="num">${numQbs >= 2 ? "2QB / superflex" : "1QB"}</td></tr>
+          <tr><th scope="row">Reception points</th><td class="num">${ppr}</td></tr>
+          <tr><th scope="row">Season</th><td class="num">${escapeHtml(String(ctx.season))}</td></tr>
+          <tr><th scope="row">League id</th><td class="num dim">${escapeHtml(String(ctx.league.id ?? s.leagueId ?? ""))}</td></tr>
+        </tbody></table>
+        ${unsupported.length ? `<p class="note note-warn">${escapeHtml(unsupported.join(" and "))} are ignored in lineup math — Tradewinds scores offence only, so an IDP league's starter totals are the offensive half of the lineup.</p>` : ""}
+        <div class="btn-col lg-acts">
+          <button type="button" class="btn btn-ghost" data-act="switch-league">Switch league</button>
+        </div>
       </div>
     </section>
 
@@ -105,13 +114,6 @@ function render() {
   </div>`;
 }
 
-function leagueList(leagues, s) {
-  if (!leagues.length) return `<p class="note">That user is not in any league this season.</p>`;
-  return `<ul class="lglist">${leagues.map((l) => `<li><button type="button" class="lgrow${l.league_id === s.leagueId ? " is-on" : ""}" data-act="pick-league" data-id="${escapeHtml(l.league_id)}" data-name="${escapeHtml(l.name)}">
-    <span class="lgrow-n">${escapeHtml(l.name)}</span><span class="lgrow-m dim">${l.total_rosters ?? "?"} teams · ${escapeHtml(String(l.season || ""))}</span>
-    ${l.league_id === s.leagueId ? '<span class="tag tag-ok">current</span>' : ""}</button></li>`).join("")}</ul>`;
-}
-
 /* ---------------------------------------------------------------- events */
 
 function onInput(e) {
@@ -137,40 +139,16 @@ function applyDials() {
   env.reload();
 }
 
-async function onSubmit(e) {
-  const form = e.target.closest("#st-lookup");
-  if (!form) return;
-  e.preventDefault();
-  const username = new FormData(form).get("username").toString().trim();
-  if (!username) return;
-  if (!env.svc.lookupUser || !env.svc.listLeagues) {
-    setIn("settingsTab", { lookupError: "League lookup is not available in this build." });
-    env.rerender();
-    return;
-  }
-  setIn("settingsTab", { username, lookup: "running", lookupError: null, leagues: null });
-  env.rerender();
-  try {
-    const user = await env.svc.lookupUser(username);
-    const uid = user.user_id || user.userId;
-    const leagues = await env.svc.listLeagues(uid, store.settings.season);
-    setIn("settingsTab", { lookup: "done", leagues, userId: uid, username });
-  } catch (err) {
-    setIn("settingsTab", { lookup: "error", lookupError: String(err && err.message ? err.message : err), leagues: null });
-  }
-  env.rerender();
-}
-
 function onClick(e) {
   const t = e.target.closest("[data-act]");
   if (!t) return;
   const act = t.dataset.act;
 
-  if (act === "pick-league") {
-    const st = store.settingsTab;
-    env.svc.saveSettings({ leagueId: t.dataset.id, userId: st.userId || store.settings.userId, username: st.username || store.settings.username });
-    toast(`Switched to ${t.dataset.name}.`);
-    env.reload({ hard: true });
+  if (act === "switch-league") {
+    // Forget the league AND the user: onboarding is the one place a league is chosen now.
+    env.svc.saveSettings({ leagueId: null, userId: null, username: null });
+    setIn("setup", { status: "idle", leagues: null, error: null, userId: null, byId: false, leagueId: "" });
+    env.boot();
     return;
   }
   if (act === "theme") { setTheme(t.dataset.v); env.rerender(); return; }

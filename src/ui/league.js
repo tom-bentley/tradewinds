@@ -5,6 +5,7 @@ import {
   avatar, teamName, skeleton, empty, openSheet, positionGroups, verdictWord, injuryTag, signTone,
 } from "./components.js";
 import { escapeHtml, fmtValue, fmtFull, fmtNum, fmtPct, relTime, clip } from "./format.js";
+import { prefill } from "./analyze.js";
 
 export const title = "League";
 
@@ -148,9 +149,12 @@ function tradeCard(t) {
   const gets = (rid) => Object.entries(t.adds || {}).filter(([, r]) => r === rid).map(([id]) => id);
   const loGet = gets(lo), hiGet = gets(hi);
 
+  // A completed trade belongs to two other managers as often as not, so it is graded and
+  // written from roster `lo`'s side with both teams named (design §10.3 `sideNames`).
+  const sn = env.svc.sideNames(ctx, lo, hi);
   let res = null;
   try {
-    res = env.svc.evaluateTrade(ctx, { myRosterId: lo, theirRosterId: hi, give: hiGet, get: loGet });
+    res = env.svc.evaluateTrade(ctx, { myRosterId: lo, theirRosterId: hi, give: hiGet, get: loGet }, { names: sn });
   } catch (e) { console.warn("[league] grade failed", e); }
 
   const nm = (id) => escapeHtml(clip(ctx.players.get(id)?.name || id, 20));
@@ -169,6 +173,11 @@ function tradeCard(t) {
         <p class="tside-p">${hiGet.map(nm).join("<br>") || '<span class="dim">nothing</span>'}</p></div>
     </div>
     ${res ? `<p class="tcard-why">${escapeHtml(res.reasons?.[0]?.text || "")}</p>` : ""}
+    <div class="tcard-acts">
+      <button type="button" class="btn btn-ghost btn-sm" data-act="reopen"
+        data-a="${lo}" data-b="${hi}"
+        data-give="${escapeHtml(hiGet.join(","))}" data-get="${escapeHtml(loGet.join(","))}">Re-open in Analyze</button>
+    </div>
   </article>`;
 }
 
@@ -195,5 +204,15 @@ function trending() {
 function onClick(e) {
   const t = e.target.closest("[data-act]");
   if (!t) return;
-  if (t.dataset.act === "roster") rosterSheet(Number(t.dataset.id));
+  if (t.dataset.act === "roster") { rosterSheet(Number(t.dataset.id)); return; }
+  if (t.dataset.act === "reopen") {
+    const ids = (v) => (v ? v.split(",").filter(Boolean) : []);
+    prefill({
+      aRosterId: Number(t.dataset.a),
+      theirRosterId: Number(t.dataset.b),
+      give: ids(t.dataset.give),
+      get: ids(t.dataset.get),
+    });
+    env.go("analyze");
+  }
 }

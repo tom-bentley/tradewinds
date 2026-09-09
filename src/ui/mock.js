@@ -20,10 +20,11 @@ const TRADEABLE = new Set(["QB", "RB", "WR", "TE"]);
 function normalizeSettings(raw = {}) {
   const w = raw.weights || {};
   return {
-    leagueId: raw.leagueId || DEFAULTS.leagueId,
-    userId: raw.userId || DEFAULTS.userId,
-    username: raw.username || DEFAULTS.username,
-    season: raw.season || DEFAULTS.season,
+    // v1.1: no baked-in league. `null` here is what sends the app to onboarding.
+    leagueId: raw.leagueId || null,
+    userId: raw.userId || null,
+    username: raw.username || null,
+    season: raw.season || DEFAULTS.season || String(new Date().getFullYear()),
     weights: { fc_redraft: num(w.fc_redraft, 0.8), proj: num(w.proj, 0.2) },
     dynastyWeights: { fc_dynasty: 0.7, dp_dynasty: 0.3 },
     keeperTilt: num(raw.keeperTilt ?? raw.keeperWeight, 0.15),
@@ -43,7 +44,8 @@ function num(v, d) { return typeof v === "number" && Number.isFinite(v) ? v : d;
 export function loadSettings() {
   let stored = {};
   try { stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch { /* ignore */ }
-  return normalizeSettings({ ...DEFAULTS, ...stored });
+  const { leagueId, userId, username, ...defaults } = DEFAULTS;
+  return normalizeSettings({ ...defaults, ...stored });
 }
 
 export function saveSettings(patch) {
@@ -55,6 +57,52 @@ export function saveSettings(patch) {
 export function clearCache() {
   try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
   return Promise.resolve(true);
+}
+
+/** Mirrors data.js §10.4 — thrown when there is no league to load. */
+export class SetupRequiredError extends Error {
+  constructor(message = "No Sleeper league is configured yet.") {
+    super(message);
+    this.name = "SetupRequiredError";
+    this.code = "SETUP_REQUIRED";
+  }
+}
+
+/** `?league=<id>&user=<username|id>` -> settings patch, or null. */
+export function readDeepLink(search = location.search) {
+  const q = new URLSearchParams(search);
+  const leagueId = (q.get("league") || "").trim();
+  if (!leagueId) return null;
+  const user = (q.get("user") || "").trim();
+  const patch = { leagueId };
+  if (!user) { patch.userId = null; patch.username = null; }
+  else if (/^[0-9]{6,}$/.test(user)) patch.userId = user;
+  else patch.username = user;
+  return patch;
+}
+
+/**
+ * Resolve a deep link to a settings patch — same contract as data.js: it turns a username into
+ * a user id and returns the patch. Saving and clearing the query belong to the caller.
+ */
+export async function applyDeepLink({ search } = {}) {
+  const patch = readDeepLink(search);
+  if (!patch || !patch.username) return patch;
+  await fetchFixtures();
+  const u = (raw?.users || []).find((x) => x.display_name.toLowerCase() === patch.username.toLowerCase());
+  return u ? { leagueId: patch.leagueId, userId: u.user_id, username: u.display_name } : patch;
+}
+
+/** The full league object, as Sleeper's /league/<id> returns it (onboarding reads its shape). */
+export async function getLeague() {
+  await fetchFixtures();
+  return raw?.league || null;
+}
+
+/** Sleeper's idea of the current season. The fixture state file is the mock's answer. */
+export async function getCurrentSeason() {
+  await fetchFixtures();
+  return String(raw?.state?.league_season || raw?.state?.season || DEFAULTS.season);
 }
 
 /* ============================================================ loading */
@@ -82,15 +130,42 @@ async function fetchFixtures(onProgress) {
   return out;
 }
 
+/**
+ * projections.json v2 ships raw stat lines; points are league-exact only once the league's own
+ * scoring_settings are applied (design §10.1). v1 numeric vectors still pass straight through.
+ */
+function projectionPoints(projections, scoring) {
+  const keys = projections.keys || [];
+  const rate = keys.map((k) => Number(scoring[k]) || 0);
+  const out = new Map();
+  for (const [id, weeks] of Object.entries(projections.players || {})) {
+    const pts = new Array(18).fill(0);
+    for (let w = 0; w < weeks.length && w < 18; w += 1) {
+      const entry = weeks[w];
+      if (typeof entry === "number") { pts[w] = entry; continue; }
+      if (!Array.isArray(entry)) continue;
+      let t = 0;
+      for (let i = 0; i + 1 < entry.length; i += 2) t += entry[i + 1] * (rate[entry[i]] || 0);
+      pts[w] = t;
+    }
+    out.set(id, pts);
+  }
+  return out;
+}
+
+const IDP_SLOTS = new Set(["DL", "LB", "DB", "IDP_FLEX"]);
+const FLEXES = new Set(["FLEX", "WRRB_FLEX", "REC_FLEX", "SUPER_FLEX"]);
+
 function buildContext(input, settings) {
   const { league, users, rosters, players, projections, values, schedule, state } = input;
   const userById = new Map(users.map((u) => [u.user_id, u]));
   const rosterPositions = league.roster_positions || [];
-  const slots = rosterPositions.filter((p) => p !== "BN" && p !== "IR");
+  const unsupported = rosterPositions.some((p) => IDP_SLOTS.has(p)) ? ["IDP slots"] : [];
+  const slots = rosterPositions.filter((p) => p !== "BN" && p !== "IR" && p !== "TAXI" && !IDP_SLOTS.has(p));
   const week = Math.max(1, Number(state.week) || 1);
 
   const pMap = new Map(Object.entries(players.players));
-  const projMap = new Map(Object.entries(projections.players));
+  const projMap = projectionPoints(projections, league.scoring_settings || {});
 
   const normRosters = rosters.map((r) => {
     const u = userById.get(r.owner_id) || {};
@@ -115,7 +190,9 @@ function buildContext(input, settings) {
   const rosterOf = new Map();
   for (const r of normRosters) for (const id of r.players) rosterOf.set(id, r.rosterId);
 
-  const mine = normRosters.find((r) => r.ownerId === settings.userId) || normRosters[0];
+  // Viewer mode: a league can be browsed with no user at all — myRosterId is then null and
+  // nothing downstream may assume "me" exists.
+  const mine = settings.userId ? normRosters.find((r) => r.ownerId === settings.userId) : null;
 
   const weeksLeft = [];
   for (let w = week; w <= LAST_SCORING_WEEK; w += 1) weeksLeft.push(w);
@@ -133,6 +210,8 @@ function buildContext(input, settings) {
       tradeReviewDays: league.settings?.trade_review_days ?? 1,
       scoring: league.scoring_settings || {},
       playoffWeekStart: league.settings?.playoff_week_start ?? 15,
+      numQbs: Math.max(1, rosterPositions.filter((p) => p === "QB" || p === "SUPER_FLEX").length),
+      ppr: Number(league.scoring_settings?.rec) || 0,
     },
     season: state.season,
     week,
@@ -141,13 +220,14 @@ function buildContext(input, settings) {
     playoffWeeks: [15, 16, 17],
     slots,
     flexEligible: new Set(["RB", "WR", "TE"]),
+    unsupported,
     players: pMap,
     proj: projMap,
     values: values.sources,
     byes: schedule.byes || {},
     rosters: normRosters,
     rosterOf,
-    myRosterId: mine.rosterId,
+    myRosterId: mine ? mine.rosterId : null,
     settings,
     trending: (input.trending || []).slice(0, 12).map((t) => ({ id: t.player_id, count: t.count })),
     meta: { pipeline: input.meta?.generated_at || null, players: players.generated_at, values: values.generated_at },
@@ -157,6 +237,7 @@ function buildContext(input, settings) {
 
 export async function loadAll({ settings, onProgress } = {}) {
   const s = normalizeSettings(settings || loadSettings());
+  if (!s.leagueId) throw new SetupRequiredError("No Sleeper league is configured yet.");
   onProgress && onProgress({ step: "Loading cached values", pct: 8 });
   const input = await fetchFixtures(onProgress);
   onProgress && onProgress({ step: "Reading live rosters", pct: 82 });
@@ -313,8 +394,8 @@ export function bestLineup(ctx, ids, week) {
   const used = new Set();
   const filled = [];
   const short = [];
-  const dedicated = ctx.slots.filter((s) => s !== "FLEX");
-  const flexes = ctx.slots.filter((s) => s === "FLEX");
+  const dedicated = ctx.slots.filter((s) => !FLEXES.has(s));
+  const flexes = ctx.slots.filter((s) => FLEXES.has(s));
 
   for (const slot of dedicated) {
     const pick = pool.find((x) => !used.has(x.id) && x.pos === slot);
@@ -322,7 +403,10 @@ export function bestLineup(ctx, ids, week) {
     else { filled.push({ slot, id: null, pts: 0 }); short.push(slot); }
   }
   for (const slot of flexes) {
-    const pick = pool.find((x) => !used.has(x.id) && ctx.flexEligible.has(x.pos));
+    const eligible = slot === "SUPER_FLEX"
+      ? (pos) => pos === "QB" || ctx.flexEligible.has(pos)
+      : (pos) => ctx.flexEligible.has(pos);
+    const pick = pool.find((x) => !used.has(x.id) && eligible(x.pos));
     if (pick) { used.add(pick.id); filled.push({ slot, id: pick.id, pts: pick.pts }); }
     else { filled.push({ slot, id: null, pts: 0 }); short.push(slot); }
   }
@@ -430,10 +514,11 @@ function sideFor(ctx, roster, give, get) {
   };
 }
 
-export function evaluateTrade(ctx, { myRosterId, theirRosterId, give, get }) {
+export function evaluateTrade(ctx, { myRosterId, theirRosterId, give, get }, opts = {}) {
   const mine = ctx.rosters.find((r) => r.rosterId === myRosterId);
   const theirs = ctx.rosters.find((r) => r.rosterId === theirRosterId);
   if (!mine || !theirs) throw new Error("Unknown roster");
+  const names = opts.names || sideNames(ctx, myRosterId, theirRosterId);
 
   const me = sideFor(ctx, mine, give, get);
   const them = sideFor(ctx, theirs, get, give);
@@ -446,7 +531,7 @@ export function evaluateTrade(ctx, { myRosterId, theirRosterId, give, get }) {
     flags.push({ type: "deadline", severity: "block", text: `Trade deadline passed after week ${ctx.league.tradeDeadlineWeek}.` });
   }
   if (me.lineup.after.shortWeeks.length && !me.lineup.before.shortWeeks.length) {
-    code = "invalid"; label = `Invalid — leaves you short in week ${me.lineup.after.shortWeeks[0]}`;
+    code = "invalid"; label = `Invalid — leaves ${names.first ? "you" : names.a} short in week ${me.lineup.after.shortWeeks[0]}`;
     flags.push({ type: "short", severity: "block", text: `No legal lineup in week ${me.lineup.after.shortWeeks[0]}.` });
   } else if (me.rosterCount.after > me.rosterCount.max) {
     code = "needs_drop";
@@ -454,9 +539,9 @@ export function evaluateTrade(ctx, { myRosterId, theirRosterId, give, get }) {
     label = "Requires a drop";
     flags.push({ type: "roster_size", severity: "block", text: `Roster would hold ${me.rosterCount.after} of ${me.rosterCount.max}. Cheapest drop: ${dp ? dp.name : "—"}.` });
   } else if (me.edgePct >= -10 && me.edgePct <= 4 && me.lineup.deltaPerWeek >= 1.5) {
-    code = "clear_win"; label = "Win — you get better now"; override = "lineup_win";
+    code = "clear_win"; label = `Win — ${names.first ? "you get" : names.a + " gets"} better now`; override = "lineup_win";
   } else if (me.edgePct >= 10 && me.lineup.deltaPerWeek <= -1.5) {
-    code = "fair"; label = "Fair — you win on paper, lose on the field"; override = "paper_win";
+    code = "fair"; label = "Fair — a paper win that loses on the field"; override = "paper_win";
   }
 
   const veto = Math.abs(me.edgePct) >= 40;
@@ -497,7 +582,7 @@ export function evaluateTrade(ctx, { myRosterId, theirRosterId, give, get }) {
     },
     flags, reasons: [], best,
   };
-  result.reasons = explain(ctx, result).lines;
+  result.reasons = explain(ctx, result, { names }).lines;
   return result;
 }
 
@@ -577,31 +662,74 @@ export function findTrades(ctx, { myRosterId, perRival, maxResults } = {}) {
   return out.slice(0, limit);
 }
 
+/**
+ * Side labels for every string the engine renders (design §10.3). Second person only when
+ * side A is the signed-in manager; otherwise both sides are named teams.
+ */
+export function sideNames(ctx, aRosterId, bRosterId) {
+  const label = (id) => {
+    const r = ctx.rosters.find((x) => x.rosterId === id);
+    return (r && (r.teamName || r.displayName)) || `Roster ${id}`;
+  };
+  const mine = ctx.myRosterId != null && aRosterId === ctx.myRosterId;
+  const a = mine ? "You" : label(aRosterId);
+  return { a, aPoss: mine ? "Your" : /s$/i.test(a) ? a + "'" : a + "'s", b: label(bRosterId), first: mine };
+}
+
+/**
+ * Whole-league scan: findTrades for every roster, deduped on the unordered (pair, players)
+ * key so a deal is not listed twice from both ends. `onTeam` fires between teams.
+ */
+export function findLeagueTrades(ctx, { perTeam = 3, maxResults = 20, onTeam } = {}) {
+  const out = [];
+  const seen = new Set();
+  const teams = ctx.rosters;
+  teams.forEach((roster, i) => {
+    if (onTeam) onTeam(roster.rosterId, i, teams.length);
+    let rows = [];
+    try { rows = findTrades(ctx, { myRosterId: roster.rosterId, maxResults: perTeam }); } catch { rows = []; }
+    for (const row of rows.slice(0, perTeam)) {
+      const pair = [roster.rosterId, row.theirRosterId].sort((a, b) => a - b).join(":");
+      const key = `${pair}|${[...row.give].sort().join(",")}|${[...row.get].sort().join(",")}`;
+      const mirror = `${pair}|${[...row.get].sort().join(",")}|${[...row.give].sort().join(",")}`;
+      if (seen.has(key) || seen.has(mirror)) continue;
+      seen.add(key);
+      out.push({ ...row, forRosterId: roster.rosterId });
+    }
+  });
+  out.sort((a, b) => b.score - a.score);
+  return out.slice(0, maxResults);
+}
+
 /* ============================================================ explain.js */
 
-export function explain(ctx, result) {
+export function explain(ctx, result, opts = {}) {
   const v = result.verdict;
   const lines = [];
+  const nm = opts.names || sideNames(ctx, result.myRosterId, result.theirRosterId);
+  const A = nm.first ? "you" : nm.a;
+  const Ac = nm.first ? "You" : nm.a;
+  const Apo = nm.first ? "Your" : nm.aPoss;
+  const vb = (second, third) => (nm.first ? second : third);
   const name = (id) => ctx.players.get(id)?.name || id;
   const win = v.edgePct >= 0;
-  const headline = `${v.label}: you ${win ? "win" : "lose"} by ${Math.abs(v.edgePct).toFixed(0)}% and ${v.deltaPerWeek >= 0 ? "gain" : "lose"} ${Math.abs(v.deltaPerWeek).toFixed(1)} pts/week.`;
+  const headline = `${v.label}: ${A} ${win ? vb("win", "wins") : vb("lose", "loses")} by ${Math.abs(v.edgePct).toFixed(0)}% and ${v.deltaPerWeek >= 0 ? vb("gain", "gains") : vb("lose", "loses")} ${Math.abs(v.deltaPerWeek).toFixed(1)} pts/week.`;
 
   if (result.best) {
     const mv = marketValue(ctx, result.best.id);
-    lines.push({ kind: "best", text: `${name(result.best.id)} (${ctx.players.get(result.best.id)?.pos}${mv.posRank ?? ""}${mv.tier ? `, tier ${mv.tier}` : ""}) is the best player in the deal — ${result.best.side === "me" ? "you" : "they"} get him.` });
+    lines.push({ kind: "best", text: `${name(result.best.id)} (${ctx.players.get(result.best.id)?.pos}${mv.posRank ?? ""}${mv.tier ? `, tier ${mv.tier}` : ""}) is the best player in the deal — ${result.best.side === "me" ? A : nm.b} ${result.best.side === "me" ? vb("get", "gets") : "gets"} him.` });
   }
   if (result.give.length !== result.get.length) {
     const W = waiverReplacement(ctx);
     const freed = Math.abs(result.give.length - result.get.length);
     const pos = ctx.players.get(result.get[0])?.pos || "RB";
     const fa = W.best[pos];
-    lines.push({ kind: "consol", text: `You send ${result.give.length} and get ${result.get.length}; the ${freed} freed spot${freed > 1 ? "s are" : " is"} worth about ${Math.round(W[pos] || 0)} here, where the best free ${pos} is ${fa ? name(fa.id) : "unclaimed"}.` });
+    lines.push({ kind: "consol", text: `${Ac} ${vb("send", "sends")} ${result.give.length} and ${vb("get", "gets")} ${result.get.length}; the ${freed} freed spot${freed > 1 ? "s are" : " is"} worth about ${Math.round(W[pos] || 0)} here, where the best free ${pos} is ${fa ? name(fa.id) : "unclaimed"}.` });
   }
-  lines.push({ kind: "lineup", text: `Your starters ${v.deltaPerWeek >= 0 ? "gain" : "lose"} ${Math.abs(v.deltaPerWeek).toFixed(1)} pts/week, ${Math.abs(v.deltaPlayoffPerWeek).toFixed(1)} in the weeks 15–17 playoffs.` });
+  lines.push({ kind: "lineup", text: `${Apo} starters ${v.deltaPerWeek >= 0 ? "gain" : "lose"} ${Math.abs(v.deltaPerWeek).toFixed(1)} pts/week, ${Math.abs(v.deltaPlayoffPerWeek).toFixed(1)} in the weeks 15–17 playoffs.` });
 
-  const rival = ctx.rosters.find((r) => r.rosterId === result.theirRosterId);
   const te = result.them.edgePct;
-  lines.push({ kind: "rival", text: `${rival?.teamName || "They"} ${te >= 0 ? "gain" : "lose"} ${Math.abs(te).toFixed(0)}% — likely to ${v.acceptLikely ? "accept" : "decline"}.` });
+  lines.push({ kind: "rival", text: `${nm.b} ${te >= 0 ? "gains" : "loses"} ${Math.abs(te).toFixed(0)}% — likely to ${v.acceptLikely ? "accept" : "decline"}.` });
 
   for (const f of result.flags) if (f.severity !== "info") lines.push({ kind: "risk", text: f.text });
 
@@ -651,6 +779,7 @@ export function getTransactions(ctx) {
 
 export async function lookupUser(username) {
   await sleep(200);
+  await fetchFixtures();
   const u = (raw?.users || []).find((x) => x.display_name.toLowerCase() === String(username).toLowerCase());
   if (!u) throw new Error(`No Sleeper user named "${username}".`);
   return { user_id: u.user_id, username: u.display_name, display_name: u.display_name, avatar: u.avatar };
@@ -658,15 +787,24 @@ export async function lookupUser(username) {
 
 export async function listLeagues(userId, season) {
   await sleep(200);
+  await fetchFixtures();
   const l = raw?.league;
-  return l ? [{ league_id: l.league_id, name: l.name, season: season || l.season, total_rosters: l.total_rosters, avatar: l.avatar, status: l.status }] : [];
+  if (!l) return [];
+  // Sleeper's /user/<id>/leagues payload carries the full league object; the onboarding rows
+  // read roster_positions and scoring_settings straight off it.
+  return [{
+    league_id: l.league_id, name: l.name, season: season || l.season,
+    total_rosters: l.total_rosters, avatar: l.avatar, status: l.status,
+    roster_positions: l.roster_positions, scoring_settings: l.scoring_settings, settings: l.settings,
+  }];
 }
 
 /* ============================================================ export surface */
 
 export const api = {
   loadSettings, saveSettings, loadAll, refreshLive, getTransactions, lookupUser, listLeagues, clearCache,
+  readDeepLink, applyDeepLink, SetupRequiredError, getLeague, getCurrentSeason,
   marketValue, waiverReplacement, sideValue, surplus,
   bestLineup, seasonLineup, backfill,
-  evaluateTrade, findTrades, explain,
+  evaluateTrade, findTrades, findLeagueTrades, explain, sideNames,
 };

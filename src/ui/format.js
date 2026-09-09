@@ -94,6 +94,9 @@ export function initials(name) {
   const s = String(name ?? "").trim();
   if (!s) return "?";
   const words = s.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  // "?" and emoji-only team names split to nothing — viewer mode renders an empty avatar rather
+  // than throwing on words[0].
+  if (!words.length) return "?";
   if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase();
   return words[0].slice(0, 2).toUpperCase();
 }
@@ -133,12 +136,77 @@ export function byDesc(get) {
 /**
  * Map the engine's rival-acceptance tier to a phrase + CSS tone class.
  * Falls back to the boolean `acceptLikely` for older result objects.
+ *
+ * The long form always names the side being asked to accept: with no `names` it keeps the
+ * second-person wording, with `names` from `sideNames()` it says "speckledorf would likely
+ * accept" — the acceptance line is the one place a third-party trade must never say "they".
  * @param {{acceptance?: string, acceptLikely?: boolean}} verdict
+ * @param {{b?: string}} [names] side names from the engine's `sideNames(ctx, aId, bId)`
  * @returns {{tier: string, short: string, long: string, cls: string}}
  */
-export function acceptPhrase(verdict = {}) {
+export function acceptPhrase(verdict = {}, names = null) {
   const tier = verdict.acceptance || (verdict.acceptLikely ? "likely" : "unlikely");
-  if (tier === "likely") return { tier, short: "likely accepts", long: "They'd likely accept", cls: "yes" };
-  if (tier === "possible") return { tier, short: "might accept", long: "They might accept", cls: "maybe" };
-  return { tier, short: "unlikely to accept", long: "They'd likely decline", cls: "no" };
+  const b = names && names.b ? String(names.b) : null;
+  const long = (withName, plain) => (b ? `${b} ${withName}` : plain);
+  if (tier === "likely") {
+    return { tier, short: "likely accepts", long: long("would likely accept", "They'd likely accept"), cls: "yes" };
+  }
+  if (tier === "possible") {
+    return { tier, short: "might accept", long: long("might accept", "They might accept"), cls: "maybe" };
+  }
+  return { tier, short: "unlikely to accept", long: long("would likely decline", "They'd likely decline"), cls: "no" };
+}
+
+/* ---------------------------------------------------------------- league shape */
+
+/** numQbs = QB slots + SUPER_FLEX slots (design §10.2). Unknown input reads as 1QB. */
+export function numQbsOf(rosterPositions) {
+  const list = Array.isArray(rosterPositions) ? rosterPositions : [];
+  let n = 0;
+  for (const slot of list) {
+    const s = String(slot ?? "").toUpperCase();
+    if (s === "QB" || s === "SUPER_FLEX" || s === "SUPERFLEX") n += 1;
+  }
+  return n >= 2 ? n : 1;
+}
+
+/** "1QB" / "2QB" — anything above two QB slots still reads as 2QB (superflex market). */
+export function qbLabel(rosterPositions) {
+  return numQbsOf(rosterPositions) >= 2 ? "2QB" : "1QB";
+}
+
+/** Reception points snapped to the three markets FantasyCalc and Boris Chen publish. */
+export function pprOf(scoringSettings) {
+  const rec = Number(scoringSettings?.rec);
+  if (!Number.isFinite(rec) || rec <= 0.25) return 0;
+  if (rec < 0.75) return 0.5;
+  return 1;
+}
+
+/** "PPR 0" / "PPR 0.5" / "PPR 1" */
+export function pprLabel(scoringSettings) {
+  return "PPR " + pprOf(scoringSettings);
+}
+
+/**
+ * One-line shape of a Sleeper league, for the onboarding rows and Settings.
+ * Accepts a raw Sleeper league object or the engine's `ctx.league`.
+ * @returns {string} e.g. "8 teams · 1QB · PPR 0.5"
+ */
+export function leagueShape(league) {
+  const rp = league?.roster_positions || league?.rosterPositions;
+  const sc = league?.scoring_settings || league?.scoring;
+  const teams = league?.total_rosters ?? league?.numTeams ?? league?.settings?.num_teams;
+  const bits = [];
+  if (Number.isFinite(Number(teams))) bits.push(`${Number(teams)} teams`);
+  bits.push(qbLabel(rp));
+  bits.push(pprLabel(sc));
+  return bits.join(" · ");
+}
+
+/** "hobbezilla" -> "hobbezilla's" · "Travis" -> "Travis's" · "Bucs" -> "Bucs'" */
+export function possessive(name) {
+  const s = String(name ?? "").trim();
+  if (!s) return "Their";
+  return /s$/i.test(s) ? s + "'" : s + "'s";
 }

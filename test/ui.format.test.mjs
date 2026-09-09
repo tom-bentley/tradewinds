@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import {
   DASH, MINUS, fmtValue, fmtFull, fmtPct, fmtPts, fmtNum, fmtRosterPct,
   relTime, clockTime, toMs, initials, escapeHtml, posRankLabel, clip, byDesc,
+  numQbsOf, qbLabel, pprOf, pprLabel, leagueShape, possessive, acceptPhrase,
 } from "../src/ui/format.js";
 
 test("fmtValue abbreviates thousands and survives junk", () => {
@@ -106,4 +107,65 @@ test("byDesc sorts descending and pushes unknowns last", () => {
   const rows = [{ v: 3 }, { v: null }, { v: 10 }, { v: 7 }];
   rows.sort(byDesc((r) => r.v));
   assert.deepEqual(rows.map((r) => r.v), [10, 7, 3, null]);
+});
+
+/* ---------------------------------------------------------------- v1.1: any league */
+
+test("numQbsOf counts QB and SUPER_FLEX slots", () => {
+  assert.equal(numQbsOf(["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "BN"]), 1);
+  assert.equal(numQbsOf(["QB", "SUPER_FLEX", "RB", "WR"]), 2);
+  assert.equal(numQbsOf(["QB", "QB", "RB"]), 2);
+  assert.equal(numQbsOf([]), 1, "an unknown shape prices as 1QB");
+  assert.equal(numQbsOf(undefined), 1);
+});
+
+test("qbLabel is the onboarding row's 1QB/2QB badge", () => {
+  assert.equal(qbLabel(["QB", "RB", "WR", "FLEX"]), "1QB");
+  assert.equal(qbLabel(["QB", "SUPER_FLEX", "RB"]), "2QB");
+  assert.equal(qbLabel(null), "1QB");
+});
+
+test("pprOf snaps reception scoring to 0 / 0.5 / 1", () => {
+  assert.equal(pprOf({ rec: 0 }), 0);
+  assert.equal(pprOf({ rec: 0.5 }), 0.5);
+  assert.equal(pprOf({ rec: 1 }), 1);
+  assert.equal(pprOf({ rec: 0.4 }), 0.5, "0.4 PPR leagues price off the half-PPR table");
+  assert.equal(pprOf({ rec: 0.8 }), 1);
+  assert.equal(pprOf({}), 0, "no rec key is standard scoring");
+  assert.equal(pprOf(undefined), 0);
+  assert.equal(pprLabel({ rec: 0.5 }), "PPR 0.5");
+});
+
+test("leagueShape reads a raw Sleeper league or a built ctx.league", () => {
+  assert.equal(
+    leagueShape({ total_rosters: 8, roster_positions: ["QB", "RB", "WR", "FLEX"], scoring_settings: { rec: 0.5 } }),
+    "8 teams · 1QB · PPR 0.5"
+  );
+  assert.equal(
+    leagueShape({ numTeams: 12, rosterPositions: ["QB", "SUPER_FLEX", "RB"], scoring: { rec: 1 } }),
+    "12 teams · 2QB · PPR 1"
+  );
+  assert.equal(leagueShape({}), "1QB · PPR 0", "an unknown league still renders");
+});
+
+test("possessive handles the s-ending team names Sleeper is full of", () => {
+  assert.equal(possessive("hobbezilla"), "hobbezilla's");
+  assert.equal(possessive("Okraneers"), "Okraneers'");
+  assert.equal(possessive(""), "Their");
+});
+
+test("initials never throws on a punctuation-only team name", () => {
+  assert.equal(initials("?"), "?");
+  assert.equal(initials("🏈"), "?");
+  assert.equal(initials("  --  "), "?");
+});
+
+test("acceptPhrase names side B when side names are supplied", () => {
+  const names = { a: "hobbezilla", aPoss: "hobbezilla's", b: "speckledorf", first: false };
+  assert.equal(acceptPhrase({ acceptance: "likely" }).long, "They'd likely accept");
+  assert.equal(acceptPhrase({ acceptance: "likely" }, names).long, "speckledorf would likely accept");
+  assert.equal(acceptPhrase({ acceptance: "possible" }, names).long, "speckledorf might accept");
+  assert.equal(acceptPhrase({ acceptance: "unlikely" }, names).long, "speckledorf would likely decline");
+  assert.equal(acceptPhrase({ acceptance: "likely" }, names).short, "likely accepts", "the short form is already name-prefixed by the caller");
+  assert.equal(acceptPhrase({ acceptLikely: false }, names).cls, "no");
 });
