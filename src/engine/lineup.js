@@ -316,9 +316,12 @@ export function backfill(ctx, ids, targetCount, exclude) {
       choice = null;
       let bestVorp = -Infinity;
       for (const pos of POSITIONS) {
+        // K and DEF have no replacement baseline (they are never valued), and a spare one is
+        // never the best use of an open spot — the deficit branch above covers a genuine hole.
+        if (baseline[pos] == null) continue;
         const cand = nextAt(pos);
         if (!cand) continue;
-        const vorp = rosPoints(ctx, cand) - (baseline[pos] || 0);
+        const vorp = rosPoints(ctx, cand) - baseline[pos];
         if (vorp > bestVorp) {
           bestVorp = vorp;
           choice = { id: cand, pos };

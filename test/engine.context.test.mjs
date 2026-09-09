@@ -141,6 +141,10 @@ test("DEFAULTS carries the design §4 settings shape", () => {
   assert.equal(DEFAULTS.injuryDiscount.Out, 0.15);
   assert.equal(DEFAULTS.injuryDiscount.IR, 0.35);
   assert.deepEqual(DEFAULTS.finder.shapes, ["1-1", "2-1", "1-2", "2-2"]);
+  assert.equal(DEFAULTS.finder.acceptLikelyMaxLineupLoss, 1.5);
+  assert.equal(DEFAULTS.finder.acceptPossibleMaxLineupLoss, 6);
+  assert.equal(DEFAULTS.finder.acceptPossibleMinEdge, -6);
+  assert.equal(DEFAULTS.finder.likelyBonus, 0.5);
 });
 
 test("slot eligibility is dedicated-subset-of-FLEX", () => {

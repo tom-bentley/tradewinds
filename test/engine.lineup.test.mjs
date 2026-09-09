@@ -154,6 +154,26 @@ test("backfill never exceeds the roster cap and is a no-op when full", () => {
   assert.equal(backfill(ctx, MINE, MINE.length).added.length, 0);
 });
 
+test("backfill never signs a spare K or DEF for a freed spot", () => {
+  // K and DEF out-score every flex body in raw points, so an unguarded fallback signs a kicker.
+  // Free two WR spots on a roster that still has its K and DEF, so no position is truly short.
+  const spare = MINE.filter((id) => ctx.players.get(id).pos === "WR").slice(-2);
+  const short = MINE.filter((id) => !spare.includes(id));
+  assert.equal(short.length, MINE.length - 2);
+  assert.ok(short.some((id) => ctx.players.get(id).pos === "K"));
+  assert.ok(short.some((id) => ctx.players.get(id).pos === "DEF"));
+  const filled = backfill(ctx, short, MINE.length);
+  assert.equal(filled.added.length, 2);
+  for (const add of filled.added) {
+    assert.ok(!["K", "DEF"].includes(add.pos), `signed a spare ${add.pos}`);
+    assert.ok(["QB", "RB", "WR", "TE"].includes(add.pos));
+  }
+  // ...unless the roster genuinely has none
+  const noKicker = MINE.filter((id) => ctx.players.get(id).pos !== "K");
+  const repaired = backfill(ctx, noKicker, noKicker.length + 1);
+  assert.equal(repaired.added[0].pos, "K", "an empty K slot is a real shortfall");
+});
+
 test("backfill prefers a position the roster is actually short at", () => {
   const noQb = MINE.filter((id) => ctx.players.get(id).pos !== "QB");
   const filled = backfill(ctx, noQb, noQb.length + 1);

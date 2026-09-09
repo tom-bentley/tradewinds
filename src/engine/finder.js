@@ -93,6 +93,7 @@ export function findTrades(ctx, opts = {}) {
   const minMyEdge = cfg.minMyEdgePct != null ? cfg.minMyEdgePct : -10;
   const rivalTol = cfg.rivalSurplusTolerance != null ? cfg.rivalSurplusTolerance : 0.03;
   const kappa = cfg.valueWeight != null ? cfg.valueWeight : 0.05;
+  const likelyBonus = cfg.likelyBonus != null ? cfg.likelyBonus : 0.5;
 
   const myPool = tradePool(ctx, myRosterId);
   if (!myPool.length) return [];
@@ -172,11 +173,15 @@ export function findTrades(ctx, opts = {}) {
           );
           if (result.verdict.code === "invalid") continue;
 
-          // stage 5 — rival acceptance model
-          if (!result.verdict.acceptLikely) continue;
+          // stage 5 — rival acceptance model: keep "likely" and "possible", drop "unlikely"
+          if (result.verdict.acceptance === "unlikely") continue;
 
-          // stage 6 — score: lineup first, value second
-          const score = result.verdict.deltaPerWeek + kappa * result.verdict.edgePct;
+          // stage 6 — score: lineup first, value second, with a nudge for offers they will
+          // actually want rather than merely tolerate
+          const score =
+            result.verdict.deltaPerWeek +
+            kappa * result.verdict.edgePct +
+            (result.verdict.acceptance === "likely" ? likelyBonus : 0);
           scored.push({
             theirRosterId: rival.rosterId,
             give: [...give],
@@ -187,6 +192,7 @@ export function findTrades(ctx, opts = {}) {
             myDeltaPerWeek: result.verdict.deltaPerWeek,
             theirEdgePct: result.them.edgePct,
             theirDeltaPerWeek: result.them.lineup.deltaPerWeek,
+            acceptance: result.verdict.acceptance,
             why: [],
             result,
           });

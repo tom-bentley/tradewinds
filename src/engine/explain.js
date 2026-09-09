@@ -9,8 +9,32 @@ import { marketValue, waiverReplacement } from "./values.js";
 export const TREND_FLAG = 400;
 /** Below this roster share a player is "probably free in most leagues" (R3 §d). */
 export const FREE_ELSEWHERE_PCT = 50;
-/** Σ price std-dev above this share of a side's value means "prices unsettled" (R3 §d). */
+/** Σ |price std-dev| above this share of a side's surplus means "prices unsettled" (R3 §d). */
 export const UNSETTLED_SHARE = 0.05;
+/** FantasyCalc's `maybeTier` is an OVERALL tier running 1..42 over 199 players — only the top of
+ *  it separates anybody (tiers 1-12 hold 1-2 players each). Deeper numbers are noise, so they are
+ *  never shown. */
+export const MAX_MEANINGFUL_TIER = 12;
+
+/**
+ * The tier to display for a player, or null when the number is too deep to mean anything.
+ * @param {number|null} tier raw tier from marketValue()
+ * @returns {number|null}
+ */
+export function displayTier(tier) {
+  return tier != null && tier <= MAX_MEANINGFUL_TIER ? tier : null;
+}
+
+/**
+ * How to phrase a rival's acceptance tier.
+ * @param {"likely"|"possible"|"unlikely"} acceptance
+ * @returns {string}
+ */
+export function acceptancePhrase(acceptance) {
+  if (acceptance === "likely") return "likely to accept";
+  if (acceptance === "possible") return "might accept";
+  return "unlikely to accept";
+}
 
 /**
  * Format a number to one decimal.
@@ -60,7 +84,8 @@ function badge(ctx, id) {
   const mv = marketValue(ctx, id);
   const p = playerOf(ctx, id);
   const posRank = mv.posRank != null ? `${p.pos}${mv.posRank}` : p.pos || "?";
-  return mv.tier != null ? `${posRank}, tier ${mv.tier}` : posRank;
+  const tier = displayTier(mv.tier);
+  return tier != null ? `${posRank}, tier ${tier}` : posRank;
 }
 
 /**
@@ -136,8 +161,12 @@ export function explain(ctx, result) {
     const consolidating = n > m; // I send more bodies than I get back
     const detail = consolidating ? me.backfillDetail || [] : them.backfillDetail || [];
     const freed = Math.abs(n - m);
-    const pos = detail.length ? detail[0].pos : "FLEX";
     const w = waiverReplacement(ctx);
+    // name the spot by what actually filled it; with no backfill on record, price it as a FLEX
+    let pos = detail.length ? detail[0].pos : null;
+    if (pos == null || w.best[pos] == null) {
+      pos = ["RB", "WR", "TE"].reduce((best, p) => (w[p] > w[best] ? p : best), "RB");
+    }
     const bestFa = w.best[pos] || null;
     lines.push({
       kind: "consol",
@@ -175,14 +204,16 @@ export function explain(ctx, result) {
     lines.push({ kind: "risk", text: flag.text || flagText(ctx, flag) });
   }
 
-  // RIVAL
+  // RIVAL — both of the numbers they will look at, then the call
   const rival = rosterById(ctx, result.theirRosterId);
   const theirEdge = Number(them.edgePct) || 0;
+  const theirDpw = Number(them.lineup && them.lineup.deltaPerWeek) || 0;
   lines.push({
     kind: "rival",
-    text: `${(rival && rival.teamName) || "They"} ${theirEdge >= 0 ? "gains" : "loses"} ${fmt1(
-      Math.abs(theirEdge)
-    )}% — likely to ${v.acceptLikely ? "accept" : "decline"}.`,
+    text:
+      `${(rival && rival.teamName) || "They"} ${theirEdge >= 0 ? "gains" : "loses"} ${fmt1(Math.abs(theirEdge))}% ` +
+      `and ${theirDpw >= 0 ? "gains" : "loses"} ${fmt1(Math.abs(theirDpw))} pts/week — ` +
+      `${acceptancePhrase(v.acceptance)}.`,
   });
 
   // VETO

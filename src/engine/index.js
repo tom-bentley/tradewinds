@@ -25,6 +25,7 @@ export {
   rosRanks,
   rosBaselines,
   injuryDiscount,
+  rosterPctScale,
   REFERENCE_SOURCE,
   CURVE_SOURCE,
 } from "./values.js";
@@ -46,6 +47,7 @@ export {
   evaluateTrade,
   finalizeExplanation,
   cheapestDroppable,
+  acceptanceTier,
   edgeBand,
   edgePct,
   cachedSeasonLineup,
@@ -59,4 +61,14 @@ export {
 
 export { findTrades, tradePool, positionalSurplus, MAX_CANDIDATES, DEFAULT_SHAPES } from "./finder.js";
 
-export { explain, flagText, fmt0, fmt1, nameOf, namesOf } from "./explain.js";
+export {
+  explain,
+  flagText,
+  fmt0,
+  fmt1,
+  nameOf,
+  namesOf,
+  displayTier,
+  acceptancePhrase,
+  MAX_MEANINGFUL_TIER,
+} from "./explain.js";

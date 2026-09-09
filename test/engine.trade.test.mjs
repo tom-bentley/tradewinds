@@ -8,6 +8,7 @@ import {
   ACCEPT_DELTA,
   ACCEPT_EDGE,
   EDGE_BANDS,
+  acceptanceTier,
   LINEUP_OVERRIDE_PTS,
   VETO_EDGE,
   cheapestDroppable,
@@ -84,7 +85,7 @@ test("evaluateTrade returns the documented TradeResult shape", () => {
     assert.equal(typeof side.lineup.deltaPlayoffPerWeek, "number");
     assert.deepEqual(Object.keys(side.rosterCount).sort(), ["after", "before", "max"]);
   }
-  for (const k of ["code", "label", "edgePct", "deltaPerWeek", "deltaPlayoffPerWeek", "override", "veto", "acceptLikely"]) {
+  for (const k of ["code", "label", "edgePct", "deltaPerWeek", "deltaPlayoffPerWeek", "override", "veto", "acceptance", "acceptLikely"]) {
     assert.ok(k in r.verdict, `verdict is missing ${k}`);
   }
   assert.ok(Array.isArray(r.flags) && Array.isArray(r.reasons));
@@ -203,21 +204,59 @@ test("the consolidation credit is exactly one waiver slot", () => {
   assert.ok(r.reasons.some((l) => l.kind === "consol"), "the explanation must name the freed spot");
 });
 
-test("acceptLikely follows the rival acceptance rule", () => {
+test("acceptanceTier grades the rival's own two numbers", () => {
+  const t = (edge, dpw) => acceptanceTier(ctx, edge, dpw);
+  // fair value AND a lineup they can live with
+  assert.equal(t(0, 0), "likely");
+  assert.equal(t(ACCEPT_EDGE, -1.5), "likely");
+  assert.equal(t(50, 5), "likely");
+  // fair value but the lineup takes a real hit
+  assert.equal(t(0, -1.6), "possible");
+  assert.equal(t(0, -6), "possible");
+  assert.equal(t(0, -6.1), "unlikely", "nobody signs off on losing 6+ pts/week");
+  // a value loss they will only wear for a genuine lineup upgrade
+  assert.equal(t(-5, ACCEPT_DELTA), "possible");
+  assert.equal(t(-6, 0.75), "possible");
+  assert.equal(t(-6.1, 5), "unlikely");
+  assert.equal(t(-5, 0.74), "unlikely");
+  assert.equal(t(-2.1, 0), "unlikely");
+
+  // the boolean stays available for the UI
+  for (const [edge, dpw] of [[0, 0], [0, -3], [-20, -20]]) {
+    const tier = t(edge, dpw);
+    assert.equal(tier !== "unlikely", tier === "likely" || tier === "possible");
+  }
+});
+
+test("evaluateTrade grades acceptance from the rival's perspective", () => {
   const mine = activePlayers(rosterById(ctx, 3)).filter((id) => marketValue(ctx, id).m != null).slice(0, 6);
   const theirs = activePlayers(rosterById(ctx, 6)).filter((id) => marketValue(ctx, id).m != null).slice(0, 6);
-  let accepts = 0;
-  let declines = 0;
+  const seen = new Set();
   for (const give of mine) {
     for (const get of theirs) {
-      const r = evaluateTrade(ctx, { myRosterId: 3, theirRosterId: 6, give: [give], get: [get] }, { withExplain: false });
-      const expected = r.them.edgePct >= ACCEPT_EDGE || r.them.lineup.deltaPerWeek >= ACCEPT_DELTA;
-      assert.equal(r.verdict.acceptLikely, expected);
-      if (expected) accepts += 1;
-      else declines += 1;
+      const r = evaluateTrade(ctx, { myRosterId: 3, theirRosterId: 6, give: [give], get: [get] });
+      const expected = acceptanceTier(ctx, r.them.edgePct, r.them.lineup.deltaPerWeek);
+      assert.equal(r.verdict.acceptance, expected);
+      assert.equal(r.verdict.acceptLikely, expected !== "unlikely");
+      const rivalLine = r.reasons.find((l) => l.kind === "rival");
+      assert.ok(rivalLine, "the rival line must always render");
+      assert.match(rivalLine.text, /pts\/week/, "it must quote their lineup delta, not just Edge%");
+      assert.match(
+        rivalLine.text,
+        expected === "likely" ? /likely to accept\.$/ : expected === "possible" ? /might accept\.$/ : /unlikely to accept\.$/
+      );
+      seen.add(expected);
     }
   }
-  assert.ok(accepts > 0 && declines > 0, "the rule must actually discriminate");
+  assert.ok(seen.size >= 2, "the tiers must actually discriminate across real trades");
+});
+
+test("a fair-value deal that guts the rival's lineup is not 'likely'", () => {
+  // Barkley + Irving for CMC: dead level on value, but their starters lose several pts/week
+  const r = evaluateTrade(ctx, { myRosterId: 3, theirRosterId: 1, give: [BARKLEY, IRVING], get: ["4034"] });
+  assert.ok(Math.abs(r.them.edgePct) < 10, `their edge ${r.them.edgePct}`);
+  assert.ok(r.them.lineup.deltaPerWeek < -ctx.settings.finder.acceptLikelyMaxLineupLoss);
+  assert.notEqual(r.verdict.acceptance, "likely", "a savvy owner does not sign this at face value");
 });
 
 test("K and DEF cannot be traded", () => {

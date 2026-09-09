@@ -50,8 +50,14 @@ export const DEFAULTS = Object.freeze({
     maxCandidates: 50000,
     minMyEdgePct: -10, // stage 2: reject offers that are already a clear loss for me
     rivalSurplusTolerance: 0.03, // stage 2: rival may lose 3% of what they send
-    rivalMinEdgePct: -2, // stage 5 acceptance gate
-    rivalMinDeltaPerWeek: 0.75, // stage 5 acceptance gate
+    rivalMinEdgePct: -2, // stage 5: value floor for a "likely" acceptance
+    rivalMinDeltaPerWeek: 0.75, // stage 5: lineup gain that buys a "possible" acceptance
+    // A rival reads two numbers too. Fair value alone is not enough if their own starting
+    // lineup collapses, so acceptance is tiered rather than boolean.
+    acceptLikelyMaxLineupLoss: 1.5, // likely: they may lose at most this many pts/week
+    acceptPossibleMaxLineupLoss: 6, // possible: a fair-value deal survives a loss this deep
+    acceptPossibleMinEdge: -6, // possible: a lineup-driven deal survives a value loss this deep
+    likelyBonus: 0.5, // FinderScore bonus for an offer they are likely (not merely able) to take
     valueWeight: 0.05, // κ_v in FinderScore = ΔL_pw + κ_v · Edge%
   }),
 });

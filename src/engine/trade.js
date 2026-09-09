@@ -18,6 +18,30 @@ export const VETO_EDGE = 40;
 export const ACCEPT_EDGE = -2;
 export const ACCEPT_DELTA = 0.75;
 
+/**
+ * How willing the rival is to sign this, judged the way an owner actually judges an offer:
+ * on their own value edge AND their own starting lineup. A trade can be dead fair on value and
+ * still be refused because it guts their week-to-week points.
+ * @param {object} ctx
+ * @param {number} theirEdgePct rival's Edge%
+ * @param {number} theirDeltaPerWeek rival's ΔL_pw
+ * @returns {"likely"|"possible"|"unlikely"}
+ */
+export function acceptanceTier(ctx, theirEdgePct, theirDeltaPerWeek) {
+  const cfg = (ctx.settings && ctx.settings.finder) || {};
+  const minEdge = cfg.rivalMinEdgePct != null ? cfg.rivalMinEdgePct : ACCEPT_EDGE;
+  const minDelta = cfg.rivalMinDeltaPerWeek != null ? cfg.rivalMinDeltaPerWeek : ACCEPT_DELTA;
+  const likelyLoss = cfg.acceptLikelyMaxLineupLoss != null ? cfg.acceptLikelyMaxLineupLoss : 1.5;
+  const possibleLoss = cfg.acceptPossibleMaxLineupLoss != null ? cfg.acceptPossibleMaxLineupLoss : 6;
+  const possibleEdge = cfg.acceptPossibleMinEdge != null ? cfg.acceptPossibleMinEdge : -6;
+
+  const fairValue = theirEdgePct >= minEdge;
+  if (fairValue && theirDeltaPerWeek >= -likelyLoss) return "likely";
+  if (fairValue && theirDeltaPerWeek >= -possibleLoss) return "possible";
+  if (theirDeltaPerWeek >= minDelta && theirEdgePct >= possibleEdge) return "possible";
+  return "unlikely";
+}
+
 /** Human labels for each verdict code. */
 export const VERDICT_LABELS = Object.freeze({
   steal: "Steal — accept now",
@@ -247,13 +271,14 @@ function buildFlags(ctx, me, them, give, get) {
         drop: side.data.dropSuggestion,
       });
     }
+    // sources publish the moving std-dev signed (B1 measured -17..19), so band it on |sd|
     let sd = 0;
     for (const id of side.theirs) {
       const mv = marketValue(ctx, id);
       if (mv.sd != null) sd += Math.abs(mv.sd);
     }
-    if (sd > 0 && sd > UNSETTLED_SHARE * side.data.valueGet.raw) {
-      flags.push({ type: "unsettled", severity: "info", side: side.key });
+    if (sd > 0 && sd > UNSETTLED_SHARE * side.data.valueGet.surplus) {
+      flags.push({ type: "unsettled", severity: "info", side: side.key, sd });
     }
   }
   for (const id of [...give, ...get]) {
@@ -343,7 +368,7 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
     label = VERDICT_LABELS.paper_win;
   }
 
-  const acceptLikely = them.edgePct >= ACCEPT_EDGE || them.lineup.deltaPerWeek >= ACCEPT_DELTA;
+  const acceptance = acceptanceTier(ctx, them.edgePct, them.lineup.deltaPerWeek);
   const bestId = pickBest(ctx, give, get);
 
   const result = {
@@ -361,7 +386,8 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
       deltaPlayoffPerWeek: dpo,
       override,
       veto: Math.abs(edge) >= VETO_EDGE,
-      acceptLikely,
+      acceptance,
+      acceptLikely: acceptance !== "unlikely",
     },
     flags,
     reasons: [],
@@ -439,6 +465,7 @@ function invalidResult(ctx, proposal, problems) {
       deltaPlayoffPerWeek: 0,
       override: null,
       veto: false,
+      acceptance: "unlikely",
       acceptLikely: false,
     },
     flags: problems.map((text) => ({ type: "coverage", severity: "block", text })),

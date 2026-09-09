@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 
 import { activePlayers, buildContext, rosterById } from "../src/engine/context.js";
 import { marketValue, surplus, waiverReplacement } from "../src/engine/values.js";
-import { ACCEPT_DELTA, ACCEPT_EDGE, evaluateTrade } from "../src/engine/trade.js";
+import { acceptanceTier, evaluateTrade } from "../src/engine/trade.js";
 import { DEFAULT_SHAPES, findTrades, positionalSurplus, tradePool } from "../src/engine/finder.js";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
@@ -71,7 +71,7 @@ test("findTrades returns a ranked, deduped, diversified shortlist inside budget"
     if (i > 0) assert.ok(deals[i - 1].score >= d.score, "results must be sorted by score, descending");
 
     // shape
-    for (const k of ["theirRosterId", "give", "get", "shape", "score", "myEdgePct", "myDeltaPerWeek", "theirEdgePct", "theirDeltaPerWeek", "why", "result"]) {
+    for (const k of ["theirRosterId", "give", "get", "shape", "score", "myEdgePct", "myDeltaPerWeek", "theirEdgePct", "theirDeltaPerWeek", "acceptance", "why", "result"]) {
       assert.ok(k in d, `result is missing ${k}`);
     }
     assert.ok(DEFAULT_SHAPES.includes(d.shape));
@@ -109,30 +109,47 @@ test("findTrades returns a ranked, deduped, diversified shortlist inside budget"
   }
 });
 
-test("every candidate passes the rival acceptance gate and is not a loss for me", () => {
+test("the finder never proposes something the rival would refuse", () => {
   const ctx = make({});
   const deals = findTrades(ctx, { myRosterId: 3 });
+  const cfg = ctx.settings.finder;
+  const tiers = new Set();
   for (const d of deals) {
     assert.notEqual(d.result.verdict.code, "invalid");
-    assert.ok(d.result.verdict.acceptLikely, "stage 5 must reject offers the rival would refuse");
+    assert.notEqual(d.acceptance, "unlikely", "stage 5 drops the unlikely tier outright");
+    assert.equal(d.acceptance, d.result.verdict.acceptance);
+    assert.equal(d.acceptance, acceptanceTier(ctx, d.theirEdgePct, d.theirDeltaPerWeek));
+    assert.ok(d.result.verdict.acceptLikely);
+    // no survivor may both lose the rival value and gut their lineup
     assert.ok(
-      d.theirEdgePct >= ACCEPT_EDGE || d.theirDeltaPerWeek >= ACCEPT_DELTA,
-      `rival gate: edge ${d.theirEdgePct}, ΔL_pw ${d.theirDeltaPerWeek}`
+      d.theirDeltaPerWeek >= -cfg.acceptPossibleMaxLineupLoss - 1e-9,
+      `rival would lose ${d.theirDeltaPerWeek} pts/week`
     );
-    assert.ok(d.myEdgePct >= ctx.settings.finder.minMyEdgePct - 1e-9, "stage 2 floors my own Edge%");
-    assert.ok(
-      d.theirEdgePct >= -100 * ctx.settings.finder.rivalSurplusTolerance - 1e-6 || d.theirDeltaPerWeek >= ACCEPT_DELTA,
-      "stage 2 caps how much surplus the rival may lose"
-    );
+    assert.ok(d.theirEdgePct >= cfg.acceptPossibleMinEdge - 1e-9);
+    assert.ok(d.myEdgePct >= cfg.minMyEdgePct - 1e-9, "stage 2 floors my own Edge%");
+    tiers.add(d.acceptance);
+  }
+  assert.ok(tiers.size >= 1);
+});
+
+test("the score rewards a rival who actively wants the deal", () => {
+  const ctx = make({});
+  const deals = findTrades(ctx, { myRosterId: 3 });
+  const cfg = ctx.settings.finder;
+  for (const d of deals) {
+    const bonus = d.acceptance === "likely" ? cfg.likelyBonus : 0;
+    assert.ok(Math.abs(d.score - (d.myDeltaPerWeek + cfg.valueWeight * d.myEdgePct + bonus)) < 1e-9);
+  }
+  const noBonus = findTrades(make({ finder: { likelyBonus: 0 } }), { myRosterId: 3 });
+  for (const d of noBonus) {
+    assert.ok(Math.abs(d.score - (d.myDeltaPerWeek + cfg.valueWeight * d.myEdgePct)) < 1e-9);
   }
 });
 
-test("the finder score is ΔL_pw + κ·Edge% and re-evaluates identically", () => {
+test("every shortlisted trade re-evaluates identically from scratch", () => {
   const ctx = make({});
   const deals = findTrades(ctx, { myRosterId: 3 });
-  const kappa = ctx.settings.finder.valueWeight;
   for (const d of deals) {
-    assert.ok(Math.abs(d.score - (d.myDeltaPerWeek + kappa * d.myEdgePct)) < 1e-9);
     const fresh = evaluateTrade(make({}), {
       myRosterId: 3,
       theirRosterId: d.theirRosterId,
@@ -140,6 +157,7 @@ test("the finder score is ΔL_pw + κ·Edge% and re-evaluates identically", () =
       get: d.get,
     });
     assert.equal(fresh.verdict.code, d.result.verdict.code);
+    assert.equal(fresh.verdict.acceptance, d.acceptance);
     assert.ok(Math.abs(fresh.verdict.edgePct - d.myEdgePct) < 1e-9);
     assert.ok(Math.abs(fresh.verdict.deltaPerWeek - d.myDeltaPerWeek) < 1e-9);
   }

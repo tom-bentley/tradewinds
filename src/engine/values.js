@@ -265,7 +265,33 @@ export function injuryDiscount(ctx, inj) {
 }
 
 /** Fields copied off a source row for display, in preference order. */
-const META_FIELDS = Object.freeze(["r", "pr", "tier", "t", "rp", "tf", "sd"]);
+const META_FIELDS = Object.freeze(["r", "pr", "tier", "t", "rp", "tf", "sd", "ecr"]);
+
+/**
+ * Multiplier that puts a source's roster share on a 0-100 percentage scale. Sources publish it
+ * either way (the committed FantasyCalc tables use 0-100, an older snapshot used 0-1), and the
+ * two are only distinguishable per SOURCE, never per player: a legitimate 0.59% would otherwise
+ * be misread as 59%.
+ * @param {object} ctx
+ * @param {string} sourceId
+ * @returns {number} 1 or 100
+ */
+export function rosterPctScale(ctx, sourceId) {
+  if (!ctx.memo.rosterPctScale) ctx.memo.rosterPctScale = {};
+  const hit = ctx.memo.rosterPctScale[sourceId];
+  if (hit) return hit;
+  let max = 0;
+  const rows = sourceValues(ctx, sourceId);
+  if (rows) {
+    for (const row of Object.values(rows)) {
+      const rp = Number(row && row.rp);
+      if (Number.isFinite(rp) && rp > max) max = rp;
+    }
+  }
+  const scale = max > 1 ? 1 : 100;
+  ctx.memo.rosterPctScale[sourceId] = scale;
+  return scale;
+}
 
 /**
  * Consensus market value for one player, memoized per ctx.
@@ -277,8 +303,8 @@ const META_FIELDS = Object.freeze(["r", "pr", "tier", "t", "rp", "tf", "sd"]);
  *            projV:number|null, sources:Object<string,number>, sourcesRaw:Object<string,number>,
  *            coverage:number, fallback:"blend"|"curve"|null, rank:number|null,
  *            posRank:number|null, tier:number|null, trend:number|null, rosterPct:number|null,
- *            tradeFreq:number|null, sd:number|null, pos:string|null, inj:string|null,
- *            discount:number}}
+ *            tradeFreq:number|null, sd:number|null, ecr:number|null, pos:string|null,
+ *            inj:string|null, discount:number}}
  */
 export function marketValue(ctx, id) {
   if (!ctx.memo.marketValue) ctx.memo.marketValue = new Map();
@@ -305,6 +331,7 @@ export function marketValue(ctx, id) {
     rosterPct: null,
     tradeFreq: null,
     sd: null,
+    ecr: null,
     pos,
     inj,
     discount: 0,
@@ -353,17 +380,18 @@ export function marketValue(ctx, id) {
     const row = (ctx.values[sid] && ctx.values[sid].values && ctx.values[sid].values[id]) || null;
     if (!row) continue;
     for (const f of META_FIELDS) {
-      if (meta[f] == null && row[f] != null) meta[f] = Number(row[f]);
+      if (meta[f] != null || row[f] == null) continue;
+      meta[f] = Number(row[f]) * (f === "rp" ? rosterPctScale(ctx, sid) : 1);
     }
   }
   out.rank = meta.r ?? null;
   out.posRank = meta.pr ?? null;
   out.tier = meta.tier ?? null;
   out.trend = meta.t ?? null;
-  // sources publish roster share either as a 0-1 fraction or a 0-100 percentage; normalize to %
-  out.rosterPct = meta.rp == null ? null : meta.rp <= 1 ? meta.rp * 100 : meta.rp;
+  out.rosterPct = meta.rp ?? null; // always 0-100, whichever scale the source published
   out.tradeFreq = meta.tf ?? null;
-  out.sd = meta.sd ?? null;
+  out.sd = meta.sd ?? null; // signed: sources report direction as well as magnitude
+  out.ecr = meta.ecr ?? null;
 
   out.discount = injuryDiscount(ctx, inj);
   out.mAdj = out.m == null ? null : out.m * (1 - out.discount);

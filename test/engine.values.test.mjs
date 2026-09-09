@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { buildContext } from "../src/engine/context.js";
+import { displayTier, explain, MAX_MEANINGFUL_TIER } from "../src/engine/explain.js";
+import { evaluateTrade } from "../src/engine/trade.js";
 import {
   curveFit,
   curveValue,
@@ -204,4 +206,42 @@ test("the blend renormalizes when a source is missing entirely", () => {
   const both = marketValue(withDp, BARKLEY);
   assert.ok(both.dynasty !== marketValue(ctx, BARKLEY).dynasty, "a present third source changes the dynasty blend");
   assert.ok(both.sources.dp_dynasty > 0);
+});
+
+test("only the top of an overall tier ladder is worth showing", () => {
+  assert.equal(MAX_MEANINGFUL_TIER, 12);
+  assert.equal(displayTier(1), 1);
+  assert.equal(displayTier(12), 12);
+  assert.equal(displayTier(13), null);
+  assert.equal(displayTier(25), null, "FantasyCalc tier 25 of 42 separates nobody");
+  assert.equal(displayTier(null), null);
+
+  // the raw tier survives on marketValue for anything that wants it
+  const deep = (rosterId) =>
+    ctx.rosters
+      .find((r) => r.rosterId === rosterId)
+      .players.filter((id) => {
+        const mv = marketValue(ctx, id);
+        return mv.m != null && mv.posRank != null && mv.tier != null && mv.tier > MAX_MEANINGFUL_TIER;
+      });
+  const mineDeep = deep(3);
+  const theirsDeep = deep(4);
+  assert.ok(mineDeep.length && theirsDeep.length, "both rosters carry deep-tier players");
+  assert.ok(marketValue(ctx, theirsDeep[0]).tier > MAX_MEANINGFUL_TIER);
+
+  // ...but the BEST line shows the position rank alone
+  const r = evaluateTrade(ctx, { myRosterId: 3, theirRosterId: 4, give: [mineDeep[0]], get: [theirsDeep[0]] });
+  const best = explain(ctx, r).lines.find((l) => l.kind === "best");
+  assert.ok(best, `no BEST line for ${r.verdict.label}`);
+  assert.ok(marketValue(ctx, r.best.id).tier > MAX_MEANINGFUL_TIER);
+  assert.ok(!/tier /.test(best.text), `deep tier leaked into "${best.text}"`);
+  assert.match(best.text, /\((QB|RB|WR|TE)\d+\)/, "the position rank still shows");
+
+  // a top-of-market player keeps his tier
+  const elite = [...ctx.players.keys()].find((id) => {
+    const mv = marketValue(ctx, id);
+    return mv.tier != null && mv.tier <= MAX_MEANINGFUL_TIER && mv.posRank != null;
+  });
+  assert.ok(elite);
+  assert.equal(displayTier(marketValue(ctx, elite).tier), marketValue(ctx, elite).tier);
 });
