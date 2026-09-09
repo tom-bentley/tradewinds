@@ -208,11 +208,13 @@ export function seasonLineup(ctx, ids, opts = {}) {
 
 /**
  * Free agents grouped by position, best-first by remaining-season points then market value.
+ * The flat, league-facing pool lives in waiver.js as `freeAgentPool` (design.md §11.2); this one
+ * is the backfill index — keyed by position because backfill always asks "who is the best X left".
  * @param {object} ctx
  * @returns {Object<string, string[]>}
  */
-export function freeAgentPool(ctx) {
-  if (ctx.memo.freeAgentPool) return ctx.memo.freeAgentPool;
+export function freeAgentPoolByPos(ctx) {
+  if (ctx.memo.faPoolByPos) return ctx.memo.faPoolByPos;
   const taken = rosteredIds(ctx);
   const byPos = {};
   for (const [id, p] of ctx.players) {
@@ -228,7 +230,7 @@ export function freeAgentPool(ctx) {
       return mb - ma || (a < b ? -1 : 1);
     });
   }
-  ctx.memo.freeAgentPool = byPos;
+  ctx.memo.faPoolByPos = byPos;
   return byPos;
 }
 
@@ -274,7 +276,7 @@ export function backfill(ctx, ids, targetCount, exclude) {
   const cap = Math.min(targetCount, ctx.league.maxRoster);
   if (roster.length >= cap) return { ids: roster, added };
 
-  const pool = freeAgentPool(ctx);
+  const pool = freeAgentPoolByPos(ctx);
   const blocked = new Set(exclude || []);
   for (const id of roster) blocked.add(id);
   const cursor = {};
@@ -349,7 +351,7 @@ export function backfill(ctx, ids, targetCount, exclude) {
 export function backfillPositions(ctx, ids, positions, exclude) {
   const roster = [...ids];
   const added = [];
-  const pool = freeAgentPool(ctx);
+  const pool = freeAgentPoolByPos(ctx);
   const blocked = new Set(exclude || []);
   for (const id of roster) blocked.add(id);
   for (const pos of positions) {

@@ -19,6 +19,7 @@ import { seasonLineup } from "../src/engine/lineup.js";
 import { evaluateTrade } from "../src/engine/trade.js";
 import { sideNames } from "../src/engine/explain.js";
 import { findLeagueTrades, findTrades, tradePool } from "../src/engine/finder.js";
+import { findFreeAgents, freeAgentPool, gradeTransaction } from "../src/engine/waiver.js";
 
 const LEAGUE_ID = process.argv[2] || SAMPLE_LEAGUE.leagueId;
 const USER_ID = LEAGUE_ID === SAMPLE_LEAGUE.leagueId ? SAMPLE_LEAGUE.userId : null;
@@ -37,18 +38,33 @@ const snapshot = (name) => readJson(`../test/fixtures/${name}`);
  */
 async function live(path, fallbackFixture, notes) {
   const url = `${SLEEPER.base}${path}${path.includes("?") ? "&" : "?"}cb=${Date.now()}`;
+  const label = fallbackFixture || path;
   try {
     const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const body = await response.json();
     if (!body || (Array.isArray(body) && !body.length)) throw new Error("empty body");
-    notes.push(`${fallbackFixture} live`);
+    notes.push(`${label} live`);
     return body;
   } catch (error) {
-    notes.push(`${fallbackFixture} fixture (${error.message})`);
-    return snapshot(fallbackFixture);
+    notes.push(`${label} ${fallbackFixture ? "fixture" : "skipped"} (${error.message})`);
+    // a week with no transactions is an empty list, not a failure — no snapshot needed
+    return fallbackFixture ? snapshot(fallbackFixture) : [];
   }
 }
+
+/** data.js `normalizeTransaction` (design.md §5) — the shape the engine reads. */
+const normalizeTxn = (raw, round) => ({
+  id: String(raw?.transaction_id ?? ""),
+  week: Number(raw?.leg ?? round) || round,
+  type: raw?.type ?? "unknown",
+  status: raw?.status ?? "unknown",
+  created: Number(raw?.created ?? raw?.status_updated ?? 0),
+  adds: raw?.adds ?? {},
+  drops: raw?.drops ?? {},
+  rosterIds: Array.isArray(raw?.roster_ids) ? raw.roster_ids : [],
+  draftPicks: Array.isArray(raw?.draft_picks) ? raw.draft_picks : [],
+});
 
 const notes = [];
 const [league, users, rosters, state] = await Promise.all([
@@ -58,12 +74,37 @@ const [league, users, rosters, state] = await Promise.all([
   live("/v1/state/nfl", "state.json", notes),
 ]);
 
+// §11.2 inputs: every scoring period so far (a drop's `created` is what starts the waiver clock)
+// plus the 24 h trending adds. Scripts may read the clock; the engine may not, so it is injected.
+const stateWeek = Math.max(1, Number(state?.week) || 1);
+const rounds = Array.from({ length: stateWeek }, (_, i) => i + 1);
+const [transactionRounds, trending] = await Promise.all([
+  Promise.all(
+    rounds.map((round) =>
+      live(
+        `/v1/league/${LEAGUE_ID}/transactions/${round}`,
+        round === 1 ? "transactions_1.json" : null,
+        notes
+      ).then((rows) => (Array.isArray(rows) ? rows : []).map((row) => normalizeTxn(row, round)))
+    )
+  ),
+  live(
+    `/v1/players/nfl/trending/add?lookback_hours=${SLEEPER.trendingLookbackHours}&limit=50`,
+    "trending_add.json",
+    notes
+  ),
+]);
+const transactions = transactionRounds.flat().sort((a, b) => b.created - a.created);
+
 const ctx = buildContext(
   {
     league,
     users,
     rosters,
     state,
+    transactions,
+    trending,
+    now: Date.now(),
     players: pipeline("players.json"),
     projections: pipeline("projections.json"),
     values: pipeline("values.json"),
@@ -108,6 +149,44 @@ out(
 );
 const base = seasonLineup(ctx, ctx.rosters.find((r) => r.rosterId === sideA).players);
 out(`${team(sideA)} baseline lineup: ${base.avgPerWeek.toFixed(1)} pts/wk weighted, ${base.playoffAvg.toFixed(1)} in the playoffs`);
+
+// §11.2 — the wire. Roster 3 is Tom's team in the sample league; any other league falls back to
+// side A, so the section prints whatever league you point the script at.
+const faRosterId = ctx.rosters.some((r) => r.rosterId === 3) ? 3 : sideA;
+out(
+  `\n=== findFreeAgents for ${team(faRosterId)} (top 8) === pool ${freeAgentPool(ctx).length} FAs · ` +
+    `${transactions.length} txns wk 1-${stateWeek} · ${trending.length} trending · ` +
+    `waiver ${ctx.league.waiverType === 2 ? `FAAB ${ctx.league.waiverBudget}` : `type ${ctx.league.waiverType}`}, ` +
+    `clears in ${ctx.league.waiverClearDays} d`
+);
+const faStarted = process.hrtime.bigint();
+const fas = findFreeAgents(ctx, { rosterId: faRosterId, maxResults: 8 });
+out(`${fas.length} adds worth making in ${(Number(process.hrtime.bigint() - faStarted) / 1e6).toFixed(0)} ms\n`);
+fas.forEach((fa, i) => {
+  const bid = fa.suggestedBid ? `bid ${fa.suggestedBid.value}-${fa.suggestedBid.aggressive} of ${fa.suggestedBid.remaining}` : "no bid";
+  const clears = fa.clearsAt ? ` until ${fa.clearsAt}` : "";
+  out(
+    `${i + 1}. ADD ${nm(fa.add)} (${fa.pos}) — DROP ${fa.drop ? nm(fa.drop) : "nobody (open spot)"} · ` +
+      `+${fa.gainPerWeek.toFixed(2)} pts/wk (playoffs ${fa.playoffGainPerWeek >= 0 ? "+" : ""}${fa.playoffGainPerWeek.toFixed(2)}) · ` +
+      `value ${fa.valueDelta >= 0 ? "+" : ""}${fa.valueDelta.toFixed(0)} · score ${fa.score.toFixed(2)}`
+  );
+  out(`   ${fa.status}${clears} · ${bid}${fa.trend != null ? ` · trending ${fa.trend}` : ""}`);
+  fa.why.forEach((line) => out(`   · ${line}`));
+});
+
+out("\n=== gradeTransaction (most recent moves) ===");
+const graded = transactions.slice(0, 6).map((txn) => [txn, gradeTransaction(ctx, txn)]);
+const gradedTrades = graded.filter(([txn]) => txn.type === "trade");
+for (const [txn, g] of gradedTrades.length ? gradedTrades.slice(0, 2) : graded.slice(0, 3)) {
+  if (!g) continue;
+  if (g.type === "trade") {
+    out(`wk${g.week} trade: ${team(g.a)} gets ${g.get.map(nm).join(" + ")} ⇄ ${team(g.b)} gets ${g.give.map(nm).join(" + ")}`);
+    out(`   ${team(g.a)}: ${g.labelA} (Edge ${g.edgeA.toFixed(1)}%, ΔL_pw ${g.deltaA.toFixed(2)})`);
+    out(`   ${team(g.b)}: ${g.labelB} (Edge ${g.edgeB.toFixed(1)}%, ΔL_pw ${g.deltaB.toFixed(2)})`);
+  } else {
+    out(`wk${g.week} ${g.type}: ${g.why[0] || `${team(g.rosterId)} moved somebody`} (ΔL_pw ${g.gainPerWeek.toFixed(2)})`);
+  }
+}
 
 out("\n=== findTrades (top 5) ===");
 const started = process.hrtime.bigint();

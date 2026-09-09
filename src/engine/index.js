@@ -14,6 +14,10 @@ export {
   resolveSlots,
   projectionPoints,
   scoringMultipliers,
+  resolveNow,
+  FAAB_WAIVER_TYPE,
+  DEFAULT_WAIVER_CLEAR_DAYS,
+  DEFAULT_WAIVER_BUDGET,
   SLOT_ELIGIBILITY,
   BENCH_SLOTS,
   QB_SLOTS,
@@ -46,7 +50,7 @@ export {
   seasonLineup,
   backfill,
   backfillPositions,
-  freeAgentPool,
+  freeAgentPoolByPos,
   slotDemand,
   weekPoints,
   weekVector,
@@ -80,6 +84,28 @@ export {
   MAX_CANDIDATES,
   DEFAULT_SHAPES,
 } from "./finder.js";
+
+export {
+  freeAgentPool,
+  waiverStatus,
+  findFreeAgents,
+  gradeTransaction,
+  suggestedBid,
+  trendCount,
+  alternativesAt,
+  currentStarters,
+  dropCandidates,
+  protectedBySurplus,
+  DAY_MS,
+  CANDIDATES_PER_POS,
+  MAX_FA_CANDIDATES,
+  PROTECTED_BY_SURPLUS,
+  MAX_BID_SHARE,
+  BID_GAIN_SCALE,
+  BID_PHASE_FLOOR,
+  BID_AGGRESSIVE_MULT,
+  ALT_BAND_PER_WEEK,
+} from "./waiver.js";
 
 export {
   explain,

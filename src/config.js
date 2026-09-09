@@ -44,6 +44,26 @@ export const DEFAULTS = Object.freeze({
     DNR: 0.4,
   }),
 
+  // --- Free agents (design.md §11.2) ------------------------------------------------------
+  // The wire is the cheapest trade there is: every add is measured on the same lineup axis as a
+  // trade, so "worth dropping someone for" is one number, not a vibe.
+  freeAgents: Object.freeze({
+    maxResults: 12,
+    minGainPerWeek: 0.5, // below half a point per week an add is not worth a roster spot
+    valueWeight: 0.05, // κ_v in FaScore = ΔL_pw + κ_v · valueDelta/100
+  }),
+
+  // --- iOS alerts (design.md §11.3) -------------------------------------------------------
+  // Defaults for the pairing payload src/push.js ships to the alerts job; the thresholds keep a
+  // 30-minute cron from pushing noise.
+  alerts: Object.freeze({
+    trades: true,
+    deals: true,
+    freeAgents: true,
+    minDealScore: 2, // FinderScore floor for "a new deal worth proposing"
+    minFaGain: 1, // pts/week floor for "a free agent worth a drop"
+  }),
+
   // --- Trade finder (R3 §f) --------------------------------------------------------------
   finder: Object.freeze({
     shapes: Object.freeze(["1-1", "2-1", "1-2", "2-2"]), // "<#I give>-<#I get>"
@@ -74,6 +94,15 @@ export const SLEEPER = Object.freeze({
   avatar: (id) => (/^https?:\/\//.test(String(id)) ? String(id) : `https://sleepercdn.com/avatars/thumbs/${id}`),
   trendingLookbackHours: 24,
 });
+
+/**
+ * VAPID public key for Web Push (design.md §11.1). Public by design: it is handed to the browser
+ * as `applicationServerKey` and travels in every subscription, so it is not a secret. The private
+ * half never enters this repo — it lives in the GitHub secret `VAPID_PRIVATE_KEY`, which is what
+ * the alerts workflow signs with. Generated 2026-09-09.
+ */
+export const VAPID_PUBLIC_KEY =
+  "BHRrun9caaSWpO0KOYVBrEHU7lo0SJ2qNQ203fkbMP24VIyZTa1Rssxk2XpiFekMscVSUBlj6TakzQ8Xu0l5CQo";
 
 export const FANTASYCALC = Object.freeze({
   // params are derived from league settings at runtime (numTeams, ppr, numQbs)

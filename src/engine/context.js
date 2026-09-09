@@ -1,5 +1,5 @@
 // src/engine/context.js — build the immutable evaluation context every other engine module reads.
-// Pure: no DOM, no fetch, no Date.now(). The current week always comes from the Sleeper state
+// Pure: no DOM, no fetch, no reading of the wall clock. The current week comes from the Sleeper
 // payload so the engine is deterministic and testable.
 //
 // Nothing here is league-specific: scoring, season shape, lineup slots and roster limits are all
@@ -35,7 +35,16 @@ export const QB_SLOTS = Object.freeze(["QB", "SUPER_FLEX"]);
 export const NO_DEADLINE = 99;
 
 /** Settings keys whose values are objects and must be merged key-by-key, not replaced wholesale. */
-const NESTED_SETTING_KEYS = ["weights", "dynastyWeights", "injuryDiscount", "finder"];
+const NESTED_SETTING_KEYS = ["weights", "dynastyWeights", "injuryDiscount", "finder", "freeAgents", "alerts"];
+
+/** Sleeper `waiver_type` for a FAAB league (0 = rolling/reverse standings, 1 = reverse, 2 = FAAB). */
+export const FAAB_WAIVER_TYPE = 2;
+
+/** Sleeper's default free-agent claim window, in days, when the league does not say. */
+export const DEFAULT_WAIVER_CLEAR_DAYS = 1;
+
+/** Sleeper's default FAAB budget when the league does not say. */
+export const DEFAULT_WAIVER_BUDGET = 100;
 
 /**
  * Merge a user settings patch over DEFAULTS, one level deep for the nested option groups.
@@ -253,7 +262,9 @@ export function resolveSlots(rosterPositions) {
 /**
  * Build the engine context from pipeline data + live Sleeper payloads.
  * @param {{league:object, users:object[], rosters:object[], players:object, projections:object,
- *          values:object, schedule:object, state:object}} input
+ *          values:object, schedule:object, state:object, transactions?:object[],
+ *          trending?:object[], now?:number}} input `transactions`, `trending` and `now` are
+ *   optional (design.md §11.2): absent → [], [] and null.
  * @param {object} [settings] user overrides merged over DEFAULTS
  * @returns {object} ctx (see design.md §4 and §10.3)
  */
@@ -313,6 +324,12 @@ export function buildContext(input, settings) {
       vetoVotesNeeded: Number(leagueSettings.veto_votes_needed) || 0,
       tradeReviewDays: Number(leagueSettings.trade_review_days) || 0,
       scoring,
+      // Waiver rules, normalized off `league.settings` for waiver.js (design.md §11.2):
+      // waiverType 2 = FAAB (the only mode with a bid to suggest), waiverClearDays = how long a
+      // dropped player sits on waivers before he is a $0 instant add.
+      waiverType: Number(leagueSettings.waiver_type) || 0,
+      waiverBudget: numberOr(leagueSettings.waiver_budget, DEFAULT_WAIVER_BUDGET),
+      waiverClearDays: numberOr(leagueSettings.waiver_clear_days, DEFAULT_WAIVER_CLEAR_DAYS),
       // QB + SUPER_FLEX: what FantasyCalc calls numQbs, and what picks the value tables (§10.2)
       numQbs: rosterPositions.filter((s) => QB_SLOTS.includes(s)).length,
       ppr: Number(scoring.rec) || 0,
@@ -336,9 +353,45 @@ export function buildContext(input, settings) {
     rosterOf,
     // null when the configured user does not play in this league — viewer mode (§10.3)
     myRosterId: resolveMyRosterId(rosters, merged.userId),
+    // League moves, normalized by data.js `getTransactions` (design.md §11.2). Absent → [], and
+    // every waiver read degrades to "free, status unknown" rather than throwing.
+    transactions: Array.isArray(input.transactions) ? input.transactions : [],
+    // Sleeper trending adds: [{ player_id, count }] over the last 24 h. Absent → [].
+    trending: Array.isArray(input.trending) ? input.trending : [],
+    // Injected wall clock (ms). The engine never reads the clock itself — the caller owns it, so
+    // every waiver window is reproducible in a test. null = no clock, nothing is on waivers.
+    now: resolveNow(merged.now, input.now),
     settings: merged,
     memo: {},
   };
+}
+
+/**
+ * The clock the waiver window is measured against: an explicit settings override first, then the
+ * input payload, then nothing (design.md §11.2).
+ * @param {number|null|undefined} fromSettings
+ * @param {number|null|undefined} fromInput
+ * @returns {number|null} epoch milliseconds
+ */
+export function resolveNow(fromSettings, fromInput) {
+  for (const candidate of [fromSettings, fromInput]) {
+    if (candidate == null) continue;
+    const ms = Number(candidate instanceof Date ? candidate.getTime() : candidate);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return null;
+}
+
+/**
+ * Numeric league setting with a fallback for absent/garbage values (0 is a legal answer, so `||`
+ * is not good enough: `waiver_clear_days: 0` means "no waiver window at all").
+ * @param {any} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function numberOr(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 /**

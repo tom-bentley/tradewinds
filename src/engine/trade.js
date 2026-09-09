@@ -5,7 +5,7 @@
 import { TRADEABLE } from "../config.js";
 import { activePlayers, playerOf, rosPoints, rosterById, slotEligibility } from "./context.js";
 import { marketValue, sideValue, surplus } from "./values.js";
-import { backfill, backfillPositions, freeAgentPool, isBye, seasonLineup } from "./lineup.js";
+import { backfill, backfillPositions, freeAgentPoolByPos, isBye, seasonLineup } from "./lineup.js";
 import {
   explain,
   flagText,
@@ -253,7 +253,7 @@ function evaluateSide(ctx, rosterId, give, get, involved) {
         }
       }
     }
-    const pool = freeAgentPool(ctx);
+    const pool = freeAgentPoolByPos(ctx);
     let working = afterIds;
     for (const pos of positions) {
       const onRoster = new Set(working);

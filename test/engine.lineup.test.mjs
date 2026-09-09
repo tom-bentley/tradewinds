@@ -7,7 +7,7 @@ import {
   backfill,
   backfillPositions,
   bestLineup,
-  freeAgentPool,
+  freeAgentPoolByPos,
   isBye,
   seasonLineup,
   slotDemand,
@@ -129,7 +129,7 @@ test("seasonLineup reports a short slot when the roster cannot cover one", () =>
 });
 
 test("free agents are ranked by remaining points and are genuinely unrostered", () => {
-  const pool = freeAgentPool(ctx);
+  const pool = freeAgentPoolByPos(ctx);
   for (const pos of ["QB", "RB", "WR", "TE", "K", "DEF"]) {
     assert.ok(pool[pos] && pool[pos].length, `${pos} needs free agents`);
     for (const id of pool[pos]) assert.ok(!ctx.rosterOf.has(id));
