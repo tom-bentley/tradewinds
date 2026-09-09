@@ -68,7 +68,8 @@ export const SLEEPER = Object.freeze({
   cdn: "https://sleepercdn.com",
   playerThumb: (id) => `https://sleepercdn.com/content/nfl/players/thumb/${id}.jpg`,
   teamLogo: (team) => `https://sleepercdn.com/images/team_logos/nfl/${String(team).toLowerCase()}.png`,
-  avatar: (id) => `https://sleepercdn.com/avatars/thumbs/${id}`,
+  // Sleeper stores either an avatar hash or (for custom uploads) a full URL in `avatar`.
+  avatar: (id) => (/^https?:\/\//.test(String(id)) ? String(id) : `https://sleepercdn.com/avatars/thumbs/${id}`),
   trendingLookbackHours: 24,
 });
 

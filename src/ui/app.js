@@ -46,7 +46,9 @@ async function boot() {
       },
     });
     set({ ctx: out.ctx, freshness: out.freshness || {}, errors: out.errors || [], status: "ready" }, "ready");
+    store.lastLiveAt = Date.now();
     startRouter();
+    installForegroundRefresh();
     syncThemeColor();
     registerSW();
   } catch (err) {
@@ -71,14 +73,17 @@ async function reload({ hard = false } = {}) {
   try {
     const out = await svc.loadAll({ settings: s });
     set({ ctx: out.ctx, freshness: out.freshness || {}, errors: out.errors || [] }, "reload");
+    store.lastLiveAt = Date.now();
     renderView(true);
   } catch (err) {
     toast("Could not reload: " + (err.message || err), { tone: "warn", timeout: 6000 });
   }
 }
 
-async function refresh() {
-  if (!svc || store.status !== "ready") return;
+let refreshing = false;
+async function refresh({ silent = false } = {}) {
+  if (!svc || store.status !== "ready" || refreshing) return;
+  refreshing = true;
   const btn = $("btn-refresh");
   btn && btn.classList.add("is-spin");
   try {
@@ -86,14 +91,36 @@ async function refresh() {
     store.deals = { ...store.deals, status: "idle", results: [] };
     store.league = { txns: null, txnStatus: "idle" };
     set({ ctx: out.ctx, freshness: out.freshness || {}, errors: out.errors || [] }, "refresh");
+    store.lastLiveAt = Date.now();
     renderView(true);
-    toast("Data refreshed.");
+    if (!silent) toast("Data refreshed.");
   } catch (err) {
     console.error("[app] refresh failed", err);
     toast("Refresh failed — showing the last good data.", { tone: "warn" });
   } finally {
+    refreshing = false;
     btn && btn.classList.remove("is-spin");
   }
+}
+
+/* ----------------------------------------------------- foreground refresh */
+// A home-screen app is resumed, not relaunched: iOS keeps the page alive in the background for
+// hours. Whenever it comes back to the foreground with live data older than this, re-pull
+// rosters/state/values silently so a verdict is never computed on a stale league.
+export const FOREGROUND_REFRESH_MS = 60 * 1000;
+
+function maybeRefreshOnForeground() {
+  if (document.visibilityState !== "visible") return;
+  if (store.status !== "ready" || !store.lastLiveAt) return;
+  if (Date.now() - store.lastLiveAt < FOREGROUND_REFRESH_MS) return;
+  refresh({ silent: true });
+}
+
+function installForegroundRefresh() {
+  document.addEventListener("visibilitychange", maybeRefreshOnForeground);
+  window.addEventListener("focus", maybeRefreshOnForeground);
+  window.addEventListener("pageshow", maybeRefreshOnForeground);
+  window.addEventListener("online", maybeRefreshOnForeground);
 }
 
 /* ================================================================== router */

@@ -15,6 +15,7 @@ export const store = {
   settings: null,
   ctx: null,
   freshness: null,
+  lastLiveAt: 0, // ms timestamp of the last successful live Sleeper/FantasyCalc load
   errors: [],
 
   // routing
