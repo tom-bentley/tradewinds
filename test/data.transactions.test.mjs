@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { getTransactions, normalizeTransaction } from "../src/data.js";
+import {
+  getTransactions,
+  getTransactionsWithNew,
+  markTradesSeen,
+  normalizeTransaction,
+} from "../src/data.js";
 import { fixture, jsonResponse, makeFetchMock } from "./shims/fetch-mock.mjs";
 import { makeMemoryIdb } from "./shims/idb-shim.mjs";
 
@@ -117,4 +122,89 @@ test("a failing round degrades to the cached copy, then to an empty list", async
     deps: { ...deps, fetchImpl: makeFetchMock([{ match: /.*/, respond: () => { throw new TypeError("fetch failed"); } }]) },
   });
   assert.equal(second.length, 7);
+});
+
+/* ────────────────────── new-trade tracking (design §11.4) ────────────────────── */
+
+/** A raw Sleeper trade row: two rosters swapping one player each. */
+const rawTrade = (id, created, status = "complete") => ({
+  transaction_id: id,
+  type: "trade",
+  status,
+  leg: 1,
+  created,
+  adds: { 9221: 1, 4034: 2 },
+  drops: { 9221: 2, 4034: 1 },
+  roster_ids: [1, 2],
+  draft_picks: [],
+});
+
+/** Week 1 = the fixture moves plus two completed trades and one that fell through. */
+function tradeHarness() {
+  const rows = [
+    ...fixture("transactions_1.json"),
+    rawTrade("trade-a", 1788746200000),
+    rawTrade("trade-b", 1788746300000),
+    rawTrade("trade-void", 1788746400000, "failed"),
+  ];
+  const fetchImpl = makeFetchMock([
+    { match: "/transactions/", respond: ({ url }) => (roundOf(url) === 1 ? rows : []) },
+  ]);
+  const idb = makeMemoryIdb();
+  return { fetchImpl, idb, deps: { fetchImpl, idb, request: { backoffMs: [0, 0] } } };
+}
+
+test("newTradeIds: every completed trade on the first run, none after markTradesSeen", async () => {
+  const { deps, idb } = tradeHarness();
+
+  const first = await getTransactions(ctxAt(1), { deps });
+  assert.deepEqual(first.newTradeIds, ["trade-b", "trade-a"], "newest first, failed trade excluded");
+  assert.equal(first.length, 10, "the array itself is still just the transactions");
+
+  // Backwards compatibility: the extra property is invisible to callers that treat it as an array.
+  assert.ok(!Object.keys(first).includes("newTradeIds"));
+  assert.ok(!("newTradeIds" in JSON.parse(JSON.stringify(first))));
+  assert.deepEqual(first, [...first], "deep-equal to a plain array of transactions");
+
+  const seen = await markTradesSeen(ctxAt(1).league.id, first.newTradeIds, { deps });
+  assert.deepEqual(seen, ["trade-b", "trade-a"]);
+  assert.deepEqual(idb.store.get(`seenTrades:${LEAGUE}`).payload, ["trade-b", "trade-a"]);
+
+  const second = await getTransactions(ctxAt(1), { deps });
+  assert.deepEqual(second.newTradeIds, [], "nothing is new the second time round");
+});
+
+test("getTransactionsWithNew is the same data with the ids in the open", async () => {
+  const { deps } = tradeHarness();
+
+  const { txns, newTradeIds } = await getTransactionsWithNew(ctxAt(1), { deps });
+  assert.equal(txns.length, 10);
+  assert.deepEqual(newTradeIds, ["trade-b", "trade-a"]);
+
+  await markTradesSeen(LEAGUE, ["trade-a"], { deps });
+  const after = await getTransactionsWithNew(ctxAt(1), { deps });
+  assert.deepEqual(after.newTradeIds, ["trade-b"], "marking one trade seen leaves the other new");
+});
+
+test("markTradesSeen de-duplicates, keeps the newest first, and stays bounded", async () => {
+  const { deps, idb } = tradeHarness();
+
+  await markTradesSeen(LEAGUE, ["a", "b"], { deps });
+  await markTradesSeen(LEAGUE, ["b", "c"], { deps });
+  assert.deepEqual(idb.store.get(`seenTrades:${LEAGUE}`).payload, ["b", "c", "a"]);
+
+  const many = Array.from({ length: 250 }, (_, i) => `t${i}`);
+  const bounded = await markTradesSeen(LEAGUE, many, { deps });
+  assert.equal(bounded.length, 200, "the list never grows past the alerts job's bound");
+  assert.equal(bounded[0], "t0");
+
+  assert.deepEqual(await markTradesSeen("", ["x"], { deps }), [], "no league id, nothing to remember");
+});
+
+test("only completed trades count as new — waivers and free agents never do", async () => {
+  const { deps } = tradeHarness();
+  const { txns, newTradeIds } = await getTransactionsWithNew(ctxAt(1), { deps });
+  assert.ok(txns.some((t) => t.type === "waiver"), "the waiver claim is still in the list");
+  assert.ok(newTradeIds.every((id) => id.startsWith("trade-")));
+  assert.ok(!newTradeIds.includes("trade-void"));
 });

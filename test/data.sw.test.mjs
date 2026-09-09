@@ -62,7 +62,7 @@ class FakeCache {
 }
 
 /** Boot sw.js inside a fake global scope and return the handles a test needs. */
-function bootServiceWorker({ network, cacheNames = [], hasActiveWorker = false } = {}) {
+function bootServiceWorker({ network, cacheNames = [], hasActiveWorker = false, windows = [SCOPE] } = {}) {
   const cacheStorage = new Map();
   for (const name of cacheNames) cacheStorage.set(name, new FakeCache());
 
@@ -101,9 +101,36 @@ function bootServiceWorker({ network, cacheNames = [], hasActiveWorker = false }
     },
   };
 
+  /** An open page: `url` decides whether the worker treats it as one of ours. */
+  const makeClient = (url) => {
+    const client = {
+      url,
+      focused: 0,
+      messages: [],
+      async focus() {
+        client.focused += 1;
+        return client;
+      },
+      postMessage(data) {
+        client.messages.push(data);
+        posted.push(data);
+      },
+    };
+    return client;
+  };
+  const clients = windows.map(makeClient);
+  const notifications = [];
+  const opened = [];
+
   const self = {
     location: new URL(`${SCOPE}sw.js`),
-    registration: { active: hasActiveWorker ? { state: "activated" } : null },
+    registration: {
+      active: hasActiveWorker ? { state: "activated" } : null,
+      scope: SCOPE,
+      async showNotification(title, options) {
+        notifications.push({ title, options });
+      },
+    },
     skipWaiting: () => {
       state.skipWaiting += 1;
     },
@@ -111,7 +138,11 @@ function bootServiceWorker({ network, cacheNames = [], hasActiveWorker = false }
       claim: async () => {
         state.claimed += 1;
       },
-      matchAll: async () => [{ postMessage: (data) => posted.push(data) }],
+      matchAll: async () => clients,
+      openWindow: async (url) => {
+        opened.push(url);
+        return makeClient(url);
+      },
     },
     addEventListener: (type, handler) => {
       if (!listeners.has(type)) listeners.set(type, []);
@@ -136,8 +167,23 @@ function bootServiceWorker({ network, cacheNames = [], hasActiveWorker = false }
     return responses.length ? await responses[0].catch((error) => error) : undefined;
   };
 
-  return { dispatch, caches, cacheStorage, posted, state, fetchCalls };
+  return { dispatch, caches, cacheStorage, posted, state, fetchCalls, clients, notifications, opened };
 }
+
+/** A PushEvent payload: JSON when it parses, plain text when it does not. */
+const pushData = (body) => ({
+  json: () => JSON.parse(body),
+  text: () => body,
+});
+
+/** Messages are minted inside the vm context (foreign prototype), so compare by field. */
+const messagesOf = (client) => client.messages.map((message) => ({ type: message.type, url: message.url }));
+
+/** The notification the OS hands back on a tap. */
+const clickedNotification = (data) => {
+  const notification = { data, closed: 0, close: () => (notification.closed += 1) };
+  return notification;
+};
 
 /** Everything in the shell resolves except the two files listed as missing. */
 const shellNetwork = (missing = []) => (url) =>
@@ -255,4 +301,91 @@ test("a navigation offline opens the cached app shell", async () => {
     request: new FakeRequest(`${SCOPE}?tab=deals`, { mode: "navigate" }),
   });
   assert.equal(response.body, "<!doctype html>shell");
+});
+
+/* ─────────────────────────── push + notificationclick (design §11.4) ─────────────────────────── */
+
+test("push.js is part of the precached shell", () => {
+  assert.ok(PRECACHE.includes("./src/push.js"), "the alerts module must work offline like the rest");
+});
+
+test("a push shows the notification the alerts job composed", async () => {
+  const sw = bootServiceWorker();
+
+  await sw.dispatch("push", {
+    data: pushData(
+      JSON.stringify({
+        title: "Trade: hobbezilla ⇄ speckledorf",
+        body: "hobbezilla gets Gibbs · speckledorf gets Nabers · hobbezilla +12 % / +2.1 pts/wk",
+        tag: "trade-1402507062906265600",
+        url: `${SCOPE}#league`,
+        icon: "icons/icon-192.png",
+      }),
+    ),
+  });
+
+  assert.equal(sw.notifications.length, 1);
+  const { title, options } = sw.notifications[0];
+  assert.equal(title, "Trade: hobbezilla ⇄ speckledorf");
+  assert.match(options.body, /^hobbezilla gets Gibbs/);
+  assert.equal(options.tag, "trade-1402507062906265600");
+  assert.equal(options.icon, "./icons/icon-192.png", "the precached shell icon, never a pushed URL");
+  assert.equal(options.badge, "./icons/icon-192.png");
+  assert.equal(options.data.url, `${SCOPE}#league`, "the tap target rides on the notification");
+  assert.equal(options.renotify, false);
+});
+
+test("a push that is not JSON still shows something", async () => {
+  // userVisibleOnly means every push MUST end in a notification — a silent one costs the app
+  // its push permission, and iOS shows its own "updated in the background" notice instead.
+  const text = bootServiceWorker();
+  await text.dispatch("push", { data: pushData("Free agent worth a drop: add Tucker") });
+  assert.equal(text.notifications[0].title, "Tradewinds");
+  assert.equal(text.notifications[0].body, undefined);
+  assert.equal(text.notifications[0].options.body, "Free agent worth a drop: add Tucker");
+  assert.equal(text.notifications[0].options.data.url, SCOPE, "no url in the payload → open the app");
+
+  const empty = bootServiceWorker();
+  await empty.dispatch("push", {});
+  assert.equal(empty.notifications.length, 1);
+  assert.equal(empty.notifications[0].title, "Tradewinds");
+  assert.equal(empty.notifications[0].options.body, "");
+  assert.equal(empty.notifications[0].options.tag, "tradewinds");
+});
+
+test("a notification tap focuses the open app and tells it where to go", async () => {
+  const sw = bootServiceWorker();
+  const notification = clickedNotification({ url: `${SCOPE}#deals` });
+
+  await sw.dispatch("notificationclick", { notification });
+
+  assert.equal(notification.closed, 1, "the notification is dismissed");
+  assert.equal(sw.clients[0].focused, 1);
+  assert.deepEqual(messagesOf(sw.clients[0]), [{ type: "open-url", url: `${SCOPE}#deals` }]);
+  assert.deepEqual(sw.opened, [], "no second window when one is already open");
+});
+
+test("a tap with no app open — or only a foreign tab — opens a window", async () => {
+  const none = bootServiceWorker({ windows: [] });
+  await none.dispatch("notificationclick", { notification: clickedNotification({ url: `${SCOPE}#league` }) });
+  assert.deepEqual(none.opened, [`${SCOPE}#league`]);
+
+  // Another site's page is still a window client: it must not be focused or messaged.
+  const foreign = bootServiceWorker({ windows: ["https://example.com/other", "https://tom-bentley.github.io/elsewhere/"] });
+  await foreign.dispatch("notificationclick", { notification: clickedNotification({ url: `${SCOPE}#deals` }) });
+  assert.deepEqual(foreign.opened, [`${SCOPE}#deals`]);
+  assert.deepEqual(foreign.posted, [], "nothing was posted to a page outside our scope");
+  assert.equal(foreign.clients[0].focused, 0);
+});
+
+test("a tap on a notification with no data still opens the app", async () => {
+  const sw = bootServiceWorker({ windows: [] });
+  await sw.dispatch("notificationclick", { notification: clickedNotification(undefined) });
+  assert.deepEqual(sw.opened, [SCOPE]);
+});
+
+test("a relative deep link in the payload resolves against the app scope", async () => {
+  const sw = bootServiceWorker();
+  await sw.dispatch("notificationclick", { notification: clickedNotification({ url: "./#league" }) });
+  assert.deepEqual(messagesOf(sw.clients[0]), [{ type: "open-url", url: `${SCOPE}#league` }]);
 });

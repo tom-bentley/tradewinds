@@ -25,9 +25,10 @@ const boom = () => {
 };
 
 /** Build the standard route table; every layer can be swapped for a failure/short response. */
-function makeRoutes({ data, league, users, rosters, state, fcRedraft, fcDynasty } = {}) {
+function makeRoutes({ data, league, users, rosters, state, trending, fcRedraft, fcDynasty } = {}) {
   return [
     ...PIPELINE_FILES.map((file) => ({ match: `data/${file}`, respond: data ?? (() => fixture(file)) })),
+    { match: "/trending/add", respond: trending ?? (() => fixture("trending_add.json")) },
     { match: /\/league\/[^/?]+\/users/, respond: users ?? (() => fixture("users.json")) },
     { match: /\/league\/[^/?]+\/rosters/, respond: rosters ?? (() => fixture("rosters.json")) },
     { match: /\/league\/[^/?]+\?cb=/, respond: league ?? (() => fixture("league.json")) },
@@ -145,14 +146,19 @@ test("loadAll: happy path builds ctx, live values, and a clean freshness report"
   assert.deepEqual(Object.keys(input).sort(), [
     "league",
     "meta",
+    "now",
     "players",
     "projections",
     "rosters",
     "schedule",
     "state",
+    "trending",
     "users",
     "values",
   ]);
+  assert.equal(input.now, NOW, "the engine is handed the clock, it never reads Date.now()");
+  assert.equal(input.trending.length, fixture("trending_add.json").length, "trending adds ride along");
+  assert.equal(typeof input.trending[0].player_id, "string", "raw Sleeper rows, not a mapped shape");
   assert.equal(input.league.league_id, LEAGUE);
   assert.equal(input.users.length, 8);
   assert.equal(input.rosters.length, 8);
@@ -200,6 +206,7 @@ test("loadAll: happy path builds ctx, live values, and a clean freshness report"
     `sleeper:league:${LEAGUE}`,
     `sleeper:rosters:${LEAGUE}`,
     `sleeper:state:${LEAGUE}`,
+    "sleeper:trending:add",
     `sleeper:users:${LEAGUE}`,
   ]);
 
@@ -297,6 +304,23 @@ test("loadAll: fully offline (no network at all) still opens from cache", async 
   assert.equal(buildContext.seen[0].input.players.count, 871);
   assert.ok(errors.length >= 9, `expected a fallback note per layer, got ${errors.length}`);
   assert.ok(errors.some((e) => e.source === "data/players.json" && /using cached copy/.test(e.message)));
+});
+
+test("loadAll: trending adds are decoration — a failure is silent and falls back to the cache", async () => {
+  const cold = harness({ routes: makeRoutes({ trending: boom }) });
+  const first = await loadAll({ settings, deps: cold.deps });
+  assert.deepEqual(first.errors, [], "a trending outage never reaches the error list");
+  assert.equal(first.freshness.offline, false, "…and never raises the offline banner");
+  assert.deepEqual(cold.buildContext.seen[0].input.trending, [], "the engine gets an empty list, not undefined");
+
+  // A previous load stored the list, so the next failure still has something to show.
+  const warm = harness({ routes: makeRoutes({ trending: boom }), seed: { "sleeper:trending:add": fixture("trending_add.json") } });
+  await loadAll({ settings, deps: warm.deps });
+  assert.equal(warm.buildContext.seen[0].input.trending.length, 50, "last-good trending list");
+
+  const live = harness();
+  await loadAll({ settings, deps: live.deps });
+  assert.equal(live.idb.store.get("sleeper:trending:add").payload.length, 50, "a live list is cached for next time");
 });
 
 test("loadAll: no data files and no cache is a clear, actionable failure", async () => {
@@ -415,7 +439,11 @@ test("refreshLive: re-pulls the league, reuses an unchanged pipeline build", asy
   const { freshness } = await refreshLive(settings, { deps });
 
   assert.equal(fetchImpl.count("data/"), 1, "no re-download of the 250 KB pipeline payload");
-  assert.equal(fetchImpl.count("api.sleeper.app"), 4, "league, users, rosters and state re-pulled");
+  assert.equal(
+    fetchImpl.count("api.sleeper.app"),
+    5,
+    "league, users, rosters, state and the trending list re-pulled",
+  );
   assert.equal(freshness.pipelineSource, "idb");
   assert.equal(freshness.live, NOW_ISO);
   assert.equal(freshness.offline, false);

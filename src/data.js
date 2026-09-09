@@ -45,6 +45,14 @@
 //                        worth a quiet warning, the app still works.
 // `errors` is a parallel, non-fatal list of `{ source, message }` — one entry per layer that had
 // to fall back. An empty array means everything came from the network.
+//
+// ── New trades, for the toast and the League dot (design §11.4) ──────────────────────────────
+//   const { txns, newTradeIds } = await getTransactionsWithNew(ctx);   // ids never shown here
+//   if (newTradeIds.length) showToast(...);                            // then, once on screen:
+//   await markTradesSeen(ctx.league.id, newTradeIds);
+// `getTransactions` still returns a plain array (the ids ride along as a non-enumerable
+// `newTradeIds` property), so older callers are untouched. Push notifications for the same
+// trades are a separate path entirely — see `src/push.js` and `pipeline/alerts.mjs`.
 
 import { DEFAULTS, STORAGE_KEY } from "./config.js";
 import * as sleeper from "./sleeper.js";
@@ -549,6 +557,24 @@ export async function loadAll(options = {}) {
   const liveStamps = [];
   let offline = pipelineOffline;
 
+  // Trending adds decorate the League tab and feed `findFreeAgents` (design §11.2). They are
+  // nice-to-have, never load-bearing: a failure falls back to the cached list, then to an empty
+  // one, and is deliberately kept OUT of `errors` and out of `freshness.offline` so a Sleeper
+  // hiccup on a decoration never raises the offline banner. Started here, awaited below, so it
+  // rides along with the four live calls instead of adding a round trip.
+  const trendingJob = (async () => {
+    const key = "sleeper:trending:add";
+    try {
+      const rows = await sleeper.getTrending("add", 24, 50, request);
+      if (!Array.isArray(rows)) throw new Error("empty response");
+      await idb.set(key, rows);
+      return rows;
+    } catch {
+      const cached = await idb.get(key);
+      return Array.isArray(cached?.payload) ? cached.payload : [];
+    }
+  })();
+
   const liveJobs = [
     ["league", () => sleeper.getLeague(leagueId, request)],
     ["users", () => sleeper.getUsers(leagueId, request)],
@@ -647,6 +673,7 @@ export async function loadAll(options = {}) {
 
   // ── 4. Engine context ───────────────────────────────────────────────────────────────────────
   progress("context", "Building trade context", 3);
+  const trending = await trendingJob;
   const build = buildContext ?? (await loadEngineBuildContext());
   const ctx = await build(
     {
@@ -659,6 +686,10 @@ export async function loadAll(options = {}) {
       values,
       schedule: files["schedule.json"],
       meta: files["meta.json"],
+      // Design §11.2: the engine never calls Date.now(), so the clock is an input. Both keys are
+      // optional on the engine side — nothing breaks if buildContext ignores them.
+      trending,
+      now: nowMs(),
     },
     settings,
   );
@@ -741,13 +772,64 @@ function roundList(rounds, week) {
   return Array.from({ length: last }, (_, index) => index + 1);
 }
 
+/** IDB key holding the trade ids this device has already been shown (design §11.4). */
+const seenTradesKey = (leagueId) => `seenTrades:${leagueId}`;
+
+/** How many trade ids to remember per league — same bound the alerts job uses (design §11.3). */
+const SEEN_TRADES_MAX = 200;
+
+/** Ids of the completed trades in a transaction list, newest first. */
+function tradeIdsOf(txns) {
+  return (Array.isArray(txns) ? txns : [])
+    .filter((txn) => txn?.type === "trade" && txn?.status === "complete" && txn?.id)
+    .map((txn) => String(txn.id));
+}
+
+/**
+ * Which of these trades this device has not seen yet. Reads only — seeing them is the UI's call
+ * (`markTradesSeen`), because a trade counts as seen when the League tab has actually shown it.
+ * @returns {Promise<string[]>} newest first; every trade id on a device with no record yet.
+ */
+async function unseenTradeIds(idb, leagueId, txns) {
+  const ids = tradeIdsOf(txns);
+  if (!ids.length || !leagueId) return ids.length ? ids : [];
+  const record = await idb.get(seenTradesKey(leagueId));
+  const seen = new Set((Array.isArray(record?.payload) ? record.payload : []).map(String));
+  return ids.filter((id) => !seen.has(id));
+}
+
+/**
+ * Mark trades as shown, so `newTradeIds` stops reporting them. Called by the League tab once
+ * the trades are on screen (and by the toast when the user taps it).
+ * @param {string} leagueId
+ * @param {string[]|string} ids
+ * @param {{deps?: LoadDeps}} [options]
+ * @returns {Promise<string[]>} the ids now remembered for this league (newest first, ≤ 200).
+ */
+export async function markTradesSeen(leagueId, ids, options = {}) {
+  const idb = options.deps?.idb ?? defaultIdb;
+  const league = trimmed(leagueId);
+  const incoming = (Array.isArray(ids) ? ids : [ids]).filter(Boolean).map(String);
+  if (!league) return [];
+  const record = await idb.get(seenTradesKey(league));
+  const previous = (Array.isArray(record?.payload) ? record.payload : []).map(String);
+  // Newest first, de-duplicated, bounded — an old league would otherwise grow without limit.
+  const merged = [...new Set([...incoming, ...previous])].slice(0, SEEN_TRADES_MAX);
+  await idb.set(seenTradesKey(league), merged);
+  return merged;
+}
+
 /**
  * League transactions, newest first. Closed weeks are cached in IndexedDB (they never change);
  * the current week is always re-fetched.
+ *
+ * The returned array also carries `newTradeIds` — the completed trades this device has not been
+ * shown yet — as a NON-ENUMERABLE property, so every existing caller (and `assert.deepEqual`)
+ * still sees a plain array of transactions. New code should prefer `getTransactionsWithNew`.
  * @param {object} ctx Engine context (uses `ctx.league.id` and `ctx.week`).
  * @param {{rounds?: number[]|number, deps?: LoadDeps, signal?: AbortSignal}} [options] `rounds`
  *   may be a list of weeks or a single number meaning "weeks 1..N".
- * @returns {Promise<Transaction[]>}
+ * @returns {Promise<Transaction[] & {newTradeIds: string[]}>}
  */
 export async function getTransactions(ctx, options = {}) {
   const { rounds, deps = {}, signal } = options;
@@ -778,7 +860,47 @@ export async function getTransactions(ctx, options = {}) {
     }),
   );
 
-  return results.flat().sort((a, b) => b.created - a.created);
+  const txns = results.flat().sort((a, b) => b.created - a.created);
+  const newTradeIds = await unseenTradeIds(idb, leagueId, txns);
+  Object.defineProperty(txns, "newTradeIds", {
+    value: newTradeIds,
+    enumerable: false, // keeps the array deep-equal to a plain Transaction[]
+    writable: true,
+    configurable: true,
+  });
+  return txns;
+}
+
+/**
+ * The same call, with the new-trade ids in the open. This is the shape new UI code should use:
+ * `const { txns, newTradeIds } = await getTransactionsWithNew(ctx)` → show a toast when
+ * `newTradeIds.length`, then `markTradesSeen(ctx.league.id, newTradeIds)` once they are on screen.
+ * @param {object} ctx
+ * @param {{rounds?: number[]|number, deps?: LoadDeps, signal?: AbortSignal}} [options]
+ * @returns {Promise<{txns: Transaction[], newTradeIds: string[]}>}
+ */
+export async function getTransactionsWithNew(ctx, options = {}) {
+  const txns = await getTransactions(ctx, options);
+  return { txns, newTradeIds: txns.newTradeIds ?? [] };
+}
+
+/**
+ * Fetch the transactions and hang them on the context, which is where the engine's waiver math
+ * looks for them (`ctx.transactions` + `ctx.now`, design §11.2 — `waiverStatus` reads them when
+ * it is called, not when the context is built, so attaching after `loadAll` is enough).
+ * `loadAll` deliberately does not do this itself: it would put up to 17 extra requests on the
+ * cold-start path for a feature only the Deals → Free agents tab needs.
+ * @param {object} ctx
+ * @param {{rounds?: number[]|number, deps?: LoadDeps, signal?: AbortSignal, now?: number}} [options]
+ * @returns {Promise<{txns: Transaction[], newTradeIds: string[]}>}
+ */
+export async function attachTransactions(ctx, options = {}) {
+  const { txns, newTradeIds } = await getTransactionsWithNew(ctx, options);
+  if (ctx && typeof ctx === "object") {
+    ctx.transactions = txns;
+    if (!Number.isFinite(ctx.now)) ctx.now = Number(options.now) || Date.now();
+  }
+  return { txns, newTradeIds };
 }
 
 /**
