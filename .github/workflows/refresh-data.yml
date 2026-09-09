@@ -1,8 +1,8 @@
 name: Refresh data
 
 # Regenerates data/*.json (players, projections, schedule, values, meta) from public sources and
-# commits the result when anything changed. Runs every 6 hours, offset from :00 to dodge GitHub's
-# peak-load scheduling delays. Manual runs: `gh workflow run refresh-data.yml`.
+# commits the result when anything changed. Runs every 3 hours, offset from :00 to dodge GitHub's
+# peak-load scheduling delays (design §11.1). Manual runs: `gh workflow run refresh-data.yml`.
 #
 # Notes (see specs/003 research R2):
 # - GITHUB_TOKEN needs contents:write to push.
@@ -10,10 +10,12 @@ name: Refresh data
 #   build explicitly through the REST API afterwards.
 # - Regular bot commits keep the repository "active", which keeps this schedule from being
 #   auto-disabled after 60 days of inactivity.
+# - alerts.yml commits data/alerts-state.json to the same branch every 30 min, so this job pulls
+#   --rebase before pushing and the two never collide (design §11.1).
 
 on:
   schedule:
-    - cron: "23 */6 * * *"
+    - cron: "23 */3 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -52,6 +54,7 @@ jobs:
             echo "No data changes."
           else
             git commit -m "chore(data): refresh $(date -u +'%Y-%m-%d %H:%MZ')"
+            git pull --rebase origin main
             git push
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi

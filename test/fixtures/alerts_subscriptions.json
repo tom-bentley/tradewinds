@@ -1,0 +1,45 @@
+[
+  {
+    "_comment": "Synthetic pairing payloads (design §11.4). The endpoints are unroutable example.invalid URLs; the keys are real but throwaway P-256/auth material generated for these tests, so encryption runs for real and nothing can ever receive a push.",
+    "v": 1,
+    "sub": {
+      "endpoint": "https://example.invalid/push/tradewinds-phone",
+      "keys": {
+        "p256dh": "BEhSCkK5fWyqEcHgiOwQggVDG6qhzItMO3vb2WgFKK_vBDV-NkQc_uKDAOcAk32G31QUi9ezUPOqDZSQ1xzJkdw",
+        "auth": "YlUFN3_yi5IvTQns9N4iHA"
+      }
+    },
+    "leagueId": "1394476745138147328",
+    "userId": "1394551386997272576",
+    "label": "Tom's iPhone",
+    "prefs": {
+      "trades": true,
+      "deals": true,
+      "freeAgents": true,
+      "minDealScore": 2,
+      "minFaGain": 1
+    },
+    "createdAt": "2026-09-09T18:00:00Z"
+  },
+  {
+    "v": 1,
+    "sub": {
+      "endpoint": "https://example.invalid/push/tradewinds-ipad",
+      "keys": {
+        "p256dh": "BHpbBiaPrUuI9JDEX01BFVNgrqrqXg3V-6HeUrXmQFK6cfvwhuqJhPe2feBjObG7V9QwG8dV2FlMzfwq8xwtF8A",
+        "auth": "O2SAQzmPPSHx_8G1pk7E6g"
+      }
+    },
+    "leagueId": "1394476745138147328",
+    "userId": "1394551386997272576",
+    "label": "iPad",
+    "prefs": {
+      "trades": true,
+      "deals": false,
+      "freeAgents": false,
+      "minDealScore": 2,
+      "minFaGain": 1
+    },
+    "createdAt": "2026-09-09T18:05:00Z"
+  }
+]

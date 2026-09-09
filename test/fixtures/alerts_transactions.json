@@ -1,0 +1,40 @@
+{
+  "_comment": "Synthetic Sleeper transactions for the alerts job tests (design §11.3). Not a capture: the trade is consistent with rosters.json (roster 1 already holds 7526, roster 2 already holds 9997, i.e. the league has already applied it), and the drop is exactly 6 h before `now` so Patrick Mahomes reads as still on waivers (league waiver_clear_days = 1).",
+  "now": 1788768000000,
+  "transactions": [
+    {
+      "status": "complete",
+      "type": "trade",
+      "metadata": null,
+      "created": 1788766200000,
+      "settings": null,
+      "leg": 1,
+      "draft_picks": [],
+      "creator": "1124855411062038528",
+      "transaction_id": "9900000000000000001",
+      "adds": { "7526": 1, "9997": 2 },
+      "consenter_ids": [1, 2],
+      "drops": { "7526": 2, "9997": 1 },
+      "roster_ids": [1, 2],
+      "status_updated": 1788766200000,
+      "waiver_budget": []
+    },
+    {
+      "status": "complete",
+      "type": "free_agent",
+      "metadata": null,
+      "created": 1788746400000,
+      "settings": null,
+      "leg": 1,
+      "draft_picks": [],
+      "creator": "1395283309348552704",
+      "transaction_id": "9900000000000000002",
+      "adds": null,
+      "consenter_ids": [5],
+      "drops": { "4046": 5 },
+      "roster_ids": [5],
+      "status_updated": 1788746400000,
+      "waiver_budget": []
+    }
+  ]
+}

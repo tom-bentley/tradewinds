@@ -357,3 +357,82 @@ export function validateAll(files) {
     meta: validateMeta(files.meta),
   };
 }
+
+/** Schema version data/alerts-state.json must declare (design §11.3). */
+export const ALERTS_STATE_VERSION = 1;
+
+/** Longest history any alerts-state array may keep (design §11.3: "last 200 keys"). */
+export const ALERTS_HISTORY_LIMIT = 200;
+
+/**
+ * One `leagues` or `devices` array of remembered keys.
+ * @param {string[]} problems
+ * @param {string} label
+ * @param {unknown} value
+ */
+function checkKeyList(problems, label, value) {
+  if (!Array.isArray(value)) {
+    problems.push(`${label} must be an array`);
+    return;
+  }
+  if (value.length > ALERTS_HISTORY_LIMIT) {
+    problems.push(`${label} holds ${value.length} keys (bounded to ${ALERTS_HISTORY_LIMIT})`);
+  }
+  for (const [index, key] of value.entries()) {
+    if (typeof key !== "string" || key === "") {
+      problems.push(`${label}[${index}] is not a non-empty string`);
+      return;
+    }
+  }
+  if (new Set(value).size !== value.length) problems.push(`${label} repeats a key`);
+}
+
+/**
+ * Validate data/alerts-state.json (design §11.3). The alerts job rewrites the file from scratch,
+ * so anything that fails here is treated as "start over" rather than a hard error.
+ * @param {unknown} obj
+ * @returns {string[]} problems, empty when valid
+ */
+export function validateAlertsState(obj) {
+  /** @type {string[]} */
+  const problems = [];
+  if (!isPlainObject(obj)) return ["alerts-state: not an object"];
+  if (obj.v !== ALERTS_STATE_VERSION) {
+    problems.push(`alerts-state.v must be ${ALERTS_STATE_VERSION}, got ${JSON.stringify(obj.v)}`);
+  }
+  if (!isPlainObject(obj.leagues)) {
+    problems.push("alerts-state.leagues: not an object");
+  } else {
+    for (const [leagueId, entry] of Object.entries(obj.leagues)) {
+      const label = `alerts-state.leagues["${leagueId}"]`;
+      if (!isPlainObject(entry)) {
+        problems.push(`${label}: not an object`);
+        continue;
+      }
+      checkKeyList(problems, `${label}.seenTradeIds`, entry.seenTradeIds);
+      if (entry.week !== null && (typeof entry.week !== "number" || !Number.isInteger(entry.week))) {
+        problems.push(`${label}.week must be an integer or null`);
+      }
+    }
+  }
+  if (!isPlainObject(obj.devices)) {
+    problems.push("alerts-state.devices: not an object");
+    return problems;
+  }
+  for (const [deviceId, entry] of Object.entries(obj.devices)) {
+    const label = `alerts-state.devices["${deviceId}"]`;
+    if (!isPlainObject(entry)) {
+      problems.push(`${label}: not an object`);
+      continue;
+    }
+    checkKeyList(problems, `${label}.seenDeals`, entry.seenDeals);
+    checkKeyList(problems, `${label}.seenFa`, entry.seenFa);
+    if (entry.lastNotifiedAt !== null && entry.lastNotifiedAt !== undefined) {
+      checkTimestamp(problems, entry.lastNotifiedAt, `${label}.lastNotifiedAt`);
+    }
+    if (entry.expired !== undefined && entry.expired !== true) {
+      problems.push(`${label}.expired, when present, must be true`);
+    }
+  }
+  return problems;
+}

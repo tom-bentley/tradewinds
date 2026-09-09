@@ -1,0 +1,76 @@
+name: Alerts
+
+# Sends the iOS Web Push notifications for new trades, new deals and free agents worth a drop
+# (design §11.3). There is no server, so this job IS the push sender: it signs with VAPID and
+# encrypts the payload through web-push, installed at run time so the repo stays dependency-free.
+#
+# Notes (see specs/003 design §11.1):
+# - PUSH_SUBSCRIPTIONS is a repository secret holding a JSON array of pairing payloads. Tom copies
+#   the code out of the installed PWA and pastes it in by hand — no server, nothing sensitive in
+#   the public repo. No secret => the job prints "nothing paired" and exits 0.
+# - VAPID_PUBLIC_KEY is safe to embed (it is also in src/config.js); VAPID_PRIVATE_KEY is a secret.
+# - Every 30 min. GitHub's cron floor is 5 min and peak-hour runs are routinely 5-30 min late, so
+#   treat delivery as "within the hour", not "on the half hour".
+# - refresh-data.yml commits the same repo, so both workflows pull --rebase before pushing.
+# - A 410/404 from a push service marks the device expired in data/alerts-state.json; the secret
+#   itself has to be edited by hand.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Send one test push per paired device and exit without touching state"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alerts
+  cancel-in-progress: false
+
+# Hard-coded so a fresh clone of the repo works with only the two secrets set; a repository
+# variable of the same name wins if the keys are ever rotated.
+env:
+  VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY || 'BHRrun9caaSWpO0KOYVBrEHU7lo0SJ2qNQ203fkbMP24VIyZTa1Rssxk2XpiFekMscVSUBlj6TakzQ8Xu0l5CQo' }}
+  VAPID_SUBJECT: ${{ vars.VAPID_SUBJECT || 'https://tom-bentley.github.io/tradewinds/' }}
+
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The only dependency this repo has, and it is never committed: --no-save leaves
+      # package.json and the lockfile untouched, so `git add data/alerts-state.json` stays clean.
+      - name: Install web-push
+        run: npm i --no-save web-push@3.6.7
+
+      - name: Send alerts
+        run: node pipeline/alerts.mjs
+        env:
+          PUSH_SUBSCRIPTIONS: ${{ secrets.PUSH_SUBSCRIPTIONS }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          ALERT_TEST: ${{ inputs.test && '1' || '' }}
+
+      - name: Commit alerts state if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/alerts-state.json
+          if git diff --cached --quiet; then
+            echo "No alert state changes."
+          else
+            git commit -m "chore(alerts): state $(date -u +'%Y-%m-%d %H:%MZ')"
+            git pull --rebase origin main
+            git push
+          fi
