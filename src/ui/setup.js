@@ -50,7 +50,7 @@ function render() {
     <form class="card setup-card" id="su-form" novalidate>
       <label class="fld" for="su-user"><span>Sleeper username</span>
         <input type="text" id="su-user" name="username" value="${escapeHtml(s.username || "")}"
-          placeholder="tommyteez" autocapitalize="none" autocorrect="off" autocomplete="username"
+          placeholder="your Sleeper handle" autocapitalize="none" autocorrect="off" autocomplete="username"
           spellcheck="false" enterkeyhint="go" ${busy ? "disabled" : ""}></label>
       <button type="submit" class="btn" ${busy ? "disabled" : ""}>${busy ? "Looking…" : "Find my leagues"}</button>
       <p class="dial-help">Your Sleeper handle, not an email. Nothing is stored anywhere but this phone.</p>
