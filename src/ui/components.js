@@ -109,7 +109,10 @@ export function verdictTone(code) {
 
 export function verdictWord(v) {
   const code = v?.code || "fair";
-  const label = v?.label || VERDICT_LABEL[code] || "Fair";
+  // Long engine labels ("Requires dropping X", "Invalid — X is not …") carry their detail in the
+  // flag chips and headline; the big word stays short so the panel never wraps three lines.
+  const SHORT = { needs_drop: "Needs a drop", invalid: "Invalid" };
+  const label = SHORT[code] || v?.label || VERDICT_LABEL[code] || "Fair";
   return `<span class="verdict-word" data-tone="${verdictTone(code)}">${escapeHtml(label)}</span>`;
 }
 

@@ -13,7 +13,7 @@
  * iOS Safari re-checks this file instead of serving it from the HTTP cache (research R2 §A).
  */
 
-const CACHE = "tradewinds-v1";
+const CACHE = "tradewinds-v0.1.0"; // keep equal to "tradewinds-v" + APP_VERSION (src/config.js) — bump both on every app deploy
 const CACHE_PREFIX = "tradewinds-";
 
 const PRECACHE = [

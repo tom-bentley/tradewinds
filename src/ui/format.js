@@ -129,3 +129,16 @@ export function byDesc(get) {
     return y - x;
   };
 }
+
+/**
+ * Map the engine's rival-acceptance tier to a phrase + CSS tone class.
+ * Falls back to the boolean `acceptLikely` for older result objects.
+ * @param {{acceptance?: string, acceptLikely?: boolean}} verdict
+ * @returns {{tier: string, short: string, long: string, cls: string}}
+ */
+export function acceptPhrase(verdict = {}) {
+  const tier = verdict.acceptance || (verdict.acceptLikely ? "likely" : "unlikely");
+  if (tier === "likely") return { tier, short: "likely accepts", long: "They'd likely accept", cls: "yes" };
+  if (tier === "possible") return { tier, short: "might accept", long: "They might accept", cls: "maybe" };
+  return { tier, short: "unlikely to accept", long: "They'd likely decline", cls: "no" };
+}

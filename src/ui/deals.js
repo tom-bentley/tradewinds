@@ -2,7 +2,7 @@
 
 import { store, setIn } from "./store.js";
 import { avatar, playerChip, icon, skeleton, empty, signTone } from "./components.js";
-import { escapeHtml, fmtPct, fmtPts, clip } from "./format.js";
+import { escapeHtml, fmtPct, fmtPts, clip, acceptPhrase } from "./format.js";
 import { prefill } from "./analyze.js";
 
 export const title = "Deals";
@@ -122,9 +122,12 @@ function card(r, i) {
   const rival = ctx.rosters.find((x) => x.rosterId === r.theirRosterId);
   const v = r.result?.verdict || {};
   const tone = v.code || "fair";
-  const read = r.theirEdgePct >= 0
-    ? `They gain ${Math.abs(r.theirEdgePct).toFixed(0)}% — likely accepts`
-    : `They give up ${Math.abs(r.theirEdgePct).toFixed(0)}% — worth asking`;
+  const acc = acceptPhrase(v);
+  const theirDelta = Number(r.theirDeltaPerWeek ?? r.result?.them?.lineup?.deltaPerWeek ?? 0);
+  const lineupNote = Math.abs(theirDelta) >= 0.5
+    ? ` and ${theirDelta < 0 ? "lose" : "gain"} ${Math.abs(theirDelta).toFixed(1)} pts/wk`
+    : "";
+  const read = `They ${r.theirEdgePct >= 0 ? "gain" : "give up"} ${Math.abs(r.theirEdgePct).toFixed(0)}%${lineupNote} — ${acc.short}`;
   const idx = store.deals.results.indexOf(r);
   return `<li class="deal" data-tone="${escapeHtml(tone)}">
     <button type="button" class="deal-hit" data-act="open" data-i="${idx}">
@@ -139,7 +142,7 @@ function card(r, i) {
         <span class="deal-stats">
           <span class="dstat"><b class="num" data-tone="${signTone(r.myDeltaPerWeek)}">${fmtPts(r.myDeltaPerWeek)}</b> pts/wk</span>
           <span class="dstat"><b class="num" data-tone="${signTone(r.myEdgePct, 0.5)}">${fmtPct(r.myEdgePct)}</b> edge</span>
-          <span class="dstat dstat-read${r.result?.verdict?.acceptLikely ? " yes" : ""}">${escapeHtml(read)}</span>
+          <span class="dstat dstat-read ${acc.cls}">${escapeHtml(read)}</span>
         </span>
         ${r.why && r.why.length ? `<span class="deal-why">${escapeHtml(r.why[0])}</span>` : ""}
       </span>

@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 
 const SCOPE = "https://tom-bentley.github.io/tradewinds/";
 const SW_SOURCE = readFileSync(new URL("../sw.js", import.meta.url), "utf8");
+const CACHE_NAME = SW_SOURCE.match(/^const CACHE = "([^"]+)";/m)[1]; // versioned with APP_VERSION
 
 class FakeResponse {
   constructor(body = "", init = {}) {
@@ -144,7 +145,7 @@ test("install precaches the shell and survives files that do not exist yet", asy
 
   await sw.dispatch("install", {});
 
-  const cache = sw.cacheStorage.get("tradewinds-v1");
+  const cache = sw.cacheStorage.get(CACHE_NAME);
   assert.ok(cache, "the versioned cache was created");
   assert.ok(cache.entries.has(`${SCOPE}index.html`), "index.html precached");
   assert.ok(cache.entries.has(`${SCOPE}src/data.js`), "modules precached");
@@ -167,11 +168,11 @@ test("a first install stays quiet; an update tells the open tabs", async () => {
 });
 
 test("activate drops old Tradewinds caches, keeps foreign ones, and claims clients", async () => {
-  const sw = bootServiceWorker({ cacheNames: ["tradewinds-v0", "tradewinds-v1", "some-other-app"] });
+  const sw = bootServiceWorker({ cacheNames: ["tradewinds-v0", CACHE_NAME, "some-other-app"] });
 
   await sw.dispatch("activate", {});
 
-  assert.deepEqual(await sw.caches.keys(), ["tradewinds-v1", "some-other-app"]);
+  assert.deepEqual(await sw.caches.keys(), [CACHE_NAME, "some-other-app"]);
   assert.equal(sw.state.claimed, 1);
 });
 
@@ -206,10 +207,10 @@ test("data/*.json is network-first and falls back to the cached copy offline", a
 
   const online = await sw.dispatch("fetch", { request });
   assert.equal(online.body, "fresh-values");
-  assert.equal((await sw.cacheStorage.get("tradewinds-v1").match(request)).body, "fresh-values", "cached for later");
+  assert.equal((await sw.cacheStorage.get(CACHE_NAME).match(request)).body, "fresh-values", "cached for later");
 
   const offline = bootServiceWorker({ network: () => undefined });
-  const cache = await offline.caches.open("tradewinds-v1");
+  const cache = await offline.caches.open(CACHE_NAME);
   await cache.put(request, new FakeResponse("last-good-values"));
   const cached = await offline.dispatch("fetch", { request });
   assert.equal(cached.body, "last-good-values");
@@ -218,7 +219,7 @@ test("data/*.json is network-first and falls back to the cached copy offline", a
 test("shell assets are served from cache and refreshed in the background", async () => {
   const sw = bootServiceWorker({ network: () => new FakeResponse("v2-styles") });
   const request = new FakeRequest(`${SCOPE}styles.css`);
-  const cache = await sw.caches.open("tradewinds-v1");
+  const cache = await sw.caches.open(CACHE_NAME);
   await cache.put(request, new FakeResponse("v1-styles"));
 
   const served = await sw.dispatch("fetch", { request });
@@ -235,7 +236,7 @@ test("an uncached asset offline resolves to a 504 rather than a hard rejection",
 
 test("a navigation offline opens the cached app shell", async () => {
   const sw = bootServiceWorker({ network: () => undefined });
-  const cache = await sw.caches.open("tradewinds-v1");
+  const cache = await sw.caches.open(CACHE_NAME);
   await cache.put(new FakeRequest(`${SCOPE}index.html`), new FakeResponse("<!doctype html>shell"));
 
   const response = await sw.dispatch("fetch", {

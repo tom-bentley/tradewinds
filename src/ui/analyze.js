@@ -7,7 +7,7 @@ import {
   avatar, teamName, playerRow, positionGroups, verdictWord, valueBars, bestBadge, flagChips,
   statStrip, icon, empty, toast, copyText, openSheet,
 } from "./components.js";
-import { escapeHtml, fmtPct, fmtPts, fmtNum, fmtValue, fmtFull, clip } from "./format.js";
+import { escapeHtml, fmtPct, fmtPts, fmtNum, fmtValue, fmtFull, clip, acceptPhrase } from "./format.js";
 
 export const title = "Analyze";
 
@@ -105,7 +105,7 @@ function panel(ctx, a) {
   return `<div class="vp" data-tone="${v.code}">
     <div class="vp-top">
       ${verdictWord(v)}
-      <span class="vp-accept ${v.acceptLikely ? "yes" : "no"}">${v.acceptLikely ? "They'd likely accept" : "They'd likely decline"}</span>
+      ${v.code === "invalid" ? "" : `<span class="vp-accept ${acceptPhrase(v).cls}">${acceptPhrase(v).long}</span>`}
     </div>
     ${statStrip(v)}
     ${valueBars(r.me)}
@@ -169,7 +169,8 @@ function onClick(e) {
       b.setAttribute("aria-pressed", String(on));
     });
     root.querySelector("#an-q").value = "";
-    document.getElementById("an-cols").innerHTML = columns(store.ctx, a);
+    // resetAnalyze() replaced store.analyze — never render from the stale `a` reference.
+    document.getElementById("an-cols").innerHTML = columns(store.ctx, store.analyze);
     renderPanel();
     return;
   }
@@ -234,7 +235,7 @@ async function doCopy() {
     `I get:  ${r.get.map(nm).join(", ")}`,
     `Edge ${fmtPct(r.verdict.edgePct)} · starters ${fmtPts(r.verdict.deltaPerWeek)} pts/wk (${fmtPts(r.verdict.deltaPlayoffPerWeek)} in wk 15-17)`,
     `Surplus ${fmtFull(r.me.valueGive.surplus)} out vs ${fmtFull(r.me.valueGet.surplus)} in (raw ${fmtValue(r.me.valueGive.raw)} vs ${fmtValue(r.me.valueGet.raw)})`,
-    `${theirs?.teamName || "They"}: ${fmtPct(r.them.edgePct)} — ${r.verdict.acceptLikely ? "likely accepts" : "likely declines"}`,
+    `${theirs?.teamName || "They"}: ${fmtPct(r.them.edgePct)} — ${acceptPhrase(r.verdict).short}`,
     ...(r.reasons || []).slice(0, 3).map((x) => `• ${x.text}`),
   ].join("\n");
   const ok = await copyText(text);

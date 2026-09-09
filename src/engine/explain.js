@@ -125,6 +125,11 @@ export function flagText(ctx, flag) {
   }
 }
 
+/** |Edge%| below this reads as "even on value" in the headline. */
+const EVEN_EDGE_PCT = 0.5;
+/** |ΔL_pw| below this reads as "no change to your starters". */
+const EVEN_DELTA_PW = 0.05;
+
 /**
  * Render a TradeResult as a headline plus the reason lines that fire.
  * @param {object} ctx
@@ -139,9 +144,16 @@ export function explain(ctx, result) {
   const edge = Number(v.edgePct) || 0;
   const dpw = Number(v.deltaPerWeek) || 0;
 
-  const headline =
-    `${v.label}: you ${edge >= 0 ? "win" : "lose"} by ${fmt1(Math.abs(edge))}% ` +
-    `and ${dpw >= 0 ? "gain" : "lose"} ${fmt1(Math.abs(dpw))} pts/week.`;
+  // Below half a percent the value axis is a wash — say so instead of "lose by 0%".
+  const valuePhrase =
+    Math.abs(edge) < EVEN_EDGE_PCT
+      ? "even on value"
+      : `you ${edge >= 0 ? "win" : "lose"} by ${fmt1(Math.abs(edge))}% on value`;
+  const lineupPhrase =
+    Math.abs(dpw) < EVEN_DELTA_PW
+      ? "no change to your starters"
+      : `${dpw >= 0 ? "gain" : "lose"} ${fmt1(Math.abs(dpw))} pts/week`;
+  const headline = `${v.label}: ${valuePhrase}, ${lineupPhrase}.`;
   lines.push({ kind: "headline", text: headline });
 
   // BEST — who gets the best player in the deal

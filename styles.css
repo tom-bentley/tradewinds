@@ -288,6 +288,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .verdict-word { font-size: 30px; font-weight: 800; letter-spacing: -.032em; line-height: 1.05; }
 .vp-accept { font-size: 14px; text-align: right; flex: none; max-width: 42%; }
 .vp-accept.yes { color: var(--mine); }
+.vp-accept.maybe { color: var(--theirs); }
 .vp-accept.no { color: var(--ink-3); }
 
 .stats { display: flex; gap: 16px; margin: 8px 0 10px; }
@@ -390,6 +391,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .dstat b { font-size: 16px; font-weight: 700; margin-right: 3px; }
 .dstat-read { flex-basis: 100%; margin-top: 1px; color: var(--ink-2); }
 .dstat-read.yes { color: var(--mine); }
+.dstat-read.maybe { color: var(--theirs); }
 .deal-why { display: block; margin-top: 7px; font-size: 14px; color: var(--ink-2); }
 
 /* ------------------------------------------------------------------ league */

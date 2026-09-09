@@ -90,6 +90,11 @@ gh api "repos/<you>/tradewinds/pages" -X POST -f "source[branch]=main" -f "sourc
 gh workflow run refresh-data.yml
 ```
 
-The site appears at `https://<you>.github.io/tradewinds/` after the first Pages build. GitHub
+The site appears at `https://<you>.github.io/tradewinds/` after the first Pages build.
+
+**Releasing app changes:** bump `APP_VERSION` in `src/config.js` and the matching `CACHE` name in
+`sw.js` (a unit test enforces they agree), then push. Installed phones fetch the new service
+worker on their next launch and show an "Update available" toast; the scheduled data refresh
+needs no release, the app fetches `data/*.json` network-first. GitHub
 Pages on a free plan requires a public repository; nothing in this repo is secret (Sleeper
 league ids and usernames are already public through Sleeper's API).
