@@ -37,6 +37,7 @@ const PRECACHE = [
   "./src/ui/league.js",
   "./src/ui/players.js",
   "./src/ui/settings.js",
+  "./src/ui/setup.js",
   "./src/ui/components.js",
   "./src/ui/format.js",
   "./icons/icon.svg",

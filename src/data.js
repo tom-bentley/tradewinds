@@ -4,10 +4,33 @@
 // IndexedDB last-good copy behind it), layers today's live league state on top, optionally
 // refreshes FantasyCalc values, and hands the lot to the engine's `buildContext`.
 //
+// ── Using it (the UI's whole contract with this module) ──────────────────────────────────────
+//   import { applyDeepLink, clearDeepLink, loadAll, saveSettings, SetupRequiredError } from "../data.js";
+//
+//   const patch = await applyDeepLink();       // ?league=<id>&user=<username|id> → settings patch
+//   if (patch) { saveSettings(patch); clearDeepLink(); }   // then the address bar is tidy again
+//   try {
+//     const { ctx, freshness, errors } = await loadAll({ onProgress });
+//   } catch (error) {
+//     if (error instanceof SetupRequiredError) return showSetup();  // no league yet → onboarding
+//     throw error;                                                  // anything else is a real failure
+//   }
+// There is no baked-in league any more: `settings.leagueId` starts null and `loadAll` throws
+// `SetupRequiredError` (`code: "SETUP_REQUIRED"`) until onboarding saves one. `settings.userId`
+// stays optional — a league with no user loads fine and `ctx.myRosterId` is null (viewer mode).
+// For the onboarding league picker: `getCurrentSeason()` → season label, then
+// `listLeagues(userId, season)`; both `lookupUser` and `listLeagues` are re-exported here.
+//
 // ── The freshness object (for the UI header chips) ───────────────────────────────────────────
 //   freshness.pipeline : ISO string | null — `generated_at` of the committed data files, i.e.
 //                        when the cron job last rebuilt players/projections/values/schedule.
 //                        Render as "values built 3 h ago".
+//   freshness.pipelineSource : "network" — the data files were downloaded on this load.
+//                        "idb" — `data/meta.json` still carried the same `generated_at` as the
+//                        stored copy, so the 250 KB behind it was reused from IndexedDB
+//                        (or, when offline, the last-good copy was all we had).
+//   freshness.season   : string — season the app is in, from `state.league_season` (Sleeper flips
+//                        it in the spring), falling back to `state.season` then `settings.season`.
 //   freshness.live     : ISO string | null — "as of" time of the league snapshot in ctx. Equals
 //                        now when league/users/rosters/state all came off the network; when any
 //                        piece came from the cache it is the OLDEST piece's save time, so the
@@ -36,14 +59,21 @@ export const PIPELINE_FILES = Object.freeze([
   "meta.json",
 ]);
 
+/** The heavy four. `meta.json` is fetched first and decides whether these are downloaded at all. */
+const PIPELINE_DATA_FILES = Object.freeze(PIPELINE_FILES.filter((file) => file !== "meta.json"));
+
 /** Without these three there is nothing to analyze. */
 const REQUIRED_FILES = Object.freeze(["players.json", "projections.json", "values.json"]);
 
 /** Minimum row counts before a live FantasyCalc table may replace the committed one (design §3). */
-export const FC_FLOORS = Object.freeze({ fc_redraft: 150, fc_dynasty: 300 });
+export const FC_FLOORS = Object.freeze({
+  fc_redraft: 150,
+  fc_dynasty: 300,
+  fc_redraft_2qb: 150,
+  fc_dynasty_2qb: 300,
+});
 
 const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
-const PIPELINE_REUSE_MS = 5 * 60 * 1000;
 const PROGRESS_TOTAL = 4;
 
 const isPlainObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -89,6 +119,140 @@ export function saveSettings(patch = {}) {
     console.warn("Tradewinds: settings could not be saved locally", error);
   }
   return next;
+}
+
+// ── Setup, deep links and the season label ───────────────────────────────────────────────────
+
+/**
+ * No league configured yet. The UI catches this (or `error.code === "SETUP_REQUIRED"`) and shows
+ * onboarding instead of an error card — it is a starting state, not a failure.
+ */
+export class SetupRequiredError extends Error {
+  /** @param {string} [message] */
+  constructor(message = "Tradewinds has no Sleeper league yet.") {
+    super(message);
+    this.name = "SetupRequiredError";
+    this.code = "SETUP_REQUIRED";
+  }
+}
+
+const trimmed = (value) => (value === null || value === undefined ? "" : String(value).trim());
+
+/** Sleeper ids (leagues, users) are numeric snowflake strings; a username never is. */
+const isNumericId = (value) => /^\d+$/.test(value);
+
+/** Query parameters that make up a shared league link. */
+const DEEP_LINK_PARAMS = Object.freeze(["league", "user"]);
+
+/**
+ * Parse a shared link — `?league=<id>&user=<username or numeric id>` — into a settings patch.
+ * Pure: no network, no storage. `user` is optional (the league then opens in viewer mode) and is
+ * read as a user id when it is all digits, otherwise as a username for `applyDeepLink` to resolve.
+ * @param {string} [search] defaults to `location.search`
+ * @returns {{leagueId: string, userId?: string, username?: string}|null} null when there is no
+ *   usable `league` parameter (absent, empty, or not a Sleeper id).
+ */
+export function readDeepLink(search = globalThis.location?.search ?? "") {
+  let params;
+  try {
+    params = new URLSearchParams(trimmed(search).replace(/^[?#]/, ""));
+  } catch {
+    return null;
+  }
+  const leagueId = trimmed(params.get("league"));
+  if (!isNumericId(leagueId)) return null;
+  const user = trimmed(params.get("user"));
+  if (!user) return { leagueId };
+  return isNumericId(user) ? { leagueId, userId: user } : { leagueId, username: user };
+}
+
+/**
+ * `readDeepLink` plus the one network call it may need: turning a username into a user id.
+ * The UI applies the result with `saveSettings(patch)` before `loadAll`, then `clearDeepLink()`.
+ * An unresolvable username is not fatal — the league still opens read-only.
+ * @param {{search?: string, deps?: LoadDeps, signal?: AbortSignal}} [options]
+ * @returns {Promise<{leagueId: string, userId?: string, username?: string}|null>}
+ */
+export async function applyDeepLink(options = {}) {
+  const { search, deps, signal } = options;
+  const patch = readDeepLink(search);
+  if (!patch?.username) return patch;
+  try {
+    const user = await lookupUser(patch.username, { deps, signal });
+    return { leagueId: patch.leagueId, userId: user.user_id, username: user.display_name };
+  } catch (error) {
+    console.warn(`Tradewinds: deep-link user "${patch.username}" not found —`, message(error));
+    return { leagueId: patch.leagueId, username: patch.username };
+  }
+}
+
+/** Drop the deep-link parameters from the address bar once they have been saved. Never throws. */
+export function clearDeepLink() {
+  const history = globalThis.history;
+  const href = globalThis.location?.href;
+  if (typeof history?.replaceState !== "function" || !href) return;
+  try {
+    const url = new URL(href);
+    if (!DEEP_LINK_PARAMS.some((key) => url.searchParams.has(key))) return;
+    for (const key of DEEP_LINK_PARAMS) url.searchParams.delete(key);
+    history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  } catch {
+    /* a browser that refuses replaceState is not worth failing the boot over */
+  }
+}
+
+/** Season label from the calendar: Sleeper rolls over to the next season in March. */
+function fallbackSeason(now = Date.now()) {
+  const date = new Date(now);
+  const year = date.getUTCFullYear();
+  return String(date.getUTCMonth() >= 2 ? year : year - 1);
+}
+
+/** Last season `loadAll`/`getCurrentSeason` saw from Sleeper — the default for `listLeagues`. */
+let lastKnownSeason = null;
+
+/**
+ * Which season a Sleeper `/state/nfl` payload describes. `league_season` is the one leagues are
+ * filed under (it flips before `season` does in the spring), so it wins.
+ * @param {object} state
+ * @param {object} [settings]
+ * @returns {string}
+ */
+export function seasonFromState(state, settings = {}) {
+  for (const candidate of [state?.league_season, state?.season, settings?.season]) {
+    const value = trimmed(candidate);
+    if (value) return value;
+  }
+  return fallbackSeason();
+}
+
+/**
+ * Best season known without a network call: what the last load saw, else settings, else the
+ * calendar. Used as the default for `listLeagues`.
+ * @param {object} [settings]
+ * @returns {string}
+ */
+export function currentSeason(settings) {
+  if (lastKnownSeason) return lastKnownSeason;
+  return trimmed(settings?.season) || trimmed(loadSettings().season) || fallbackSeason();
+}
+
+/**
+ * Ask Sleeper which season it is — onboarding needs this before any league exists. Falls back to
+ * `currentSeason()` when the network is gone.
+ * @param {{settings?: object, deps?: LoadDeps, signal?: AbortSignal}} [options]
+ * @returns {Promise<string>}
+ */
+export async function getCurrentSeason(options = {}) {
+  const { settings, deps = {}, signal } = options;
+  const request = { fetchImpl: deps.fetchImpl ?? globalThis.fetch, signal, ...(deps.request ?? {}) };
+  try {
+    lastKnownSeason = seasonFromState(await sleeper.getState(request), settings ?? {});
+    return lastKnownSeason;
+  } catch (error) {
+    console.warn("Tradewinds: could not read the NFL state —", message(error));
+    return currentSeason(settings);
+  }
 }
 
 /** Resolve a repo-relative path against the document, so the app works under `/tradewinds/`. */
@@ -142,6 +306,18 @@ export function fcParamsFromLeague(league) {
   return { numQbs, numTeams, ppr: Number.isFinite(rec) ? rec : 0 };
 }
 
+/**
+ * Which committed values tables a league's shape resolves to (design §10.2). Superflex/2QB
+ * leagues price quarterbacks on a different scale, so they get their own tables; everything else
+ * (numTeams, ppr) moves values ≤ 2 % and shares the 1QB tables.
+ * @param {number} numQbs QB + SUPER_FLEX slots in `roster_positions`
+ * @returns {{fc_redraft: string, fc_dynasty: string}} role → table name
+ */
+export function fcTableNames(numQbs) {
+  const suffix = Number(numQbs) >= 2 ? "_2qb" : "";
+  return { fc_redraft: `fc_redraft${suffix}`, fc_dynasty: `fc_dynasty${suffix}` };
+}
+
 function assign(target, key, value) {
   if (value !== null && value !== undefined) target[key] = value;
 }
@@ -150,11 +326,12 @@ function assign(target, key, value) {
  * Normalize raw FantasyCalc rows into the committed values-table shape (design §3), so a live
  * overlay is byte-compatible with what the pipeline writes.
  * @param {object[]} rows raw rows from `getFantasyCalc`
- * @param {{label: string, kind: string, url: string, fetchedAt?: string}} meta
+ * @param {{label: string, kind: string, url: string, fetchedAt?: string,
+ *          variant?: {numQbs?: number, ppr?: number}}} meta
  * @returns {{label: string, kind: string, fetched_at: string, ok: boolean, count: number,
- *            url: string, values: Record<string, object>}}
+ *            url: string, variant?: object, values: Record<string, object>}}
  */
-export function normalizeFantasyCalc(rows, { label, kind, url, fetchedAt } = {}) {
+export function normalizeFantasyCalc(rows, { label, kind, url, fetchedAt, variant } = {}) {
   const values = {};
   let count = 0;
   for (const row of Array.isArray(rows) ? rows : []) {
@@ -175,7 +352,7 @@ export function normalizeFantasyCalc(rows, { label, kind, url, fetchedAt } = {})
     values[String(id)] = entry;
     count += 1;
   }
-  return {
+  const table = {
     label,
     kind,
     fetched_at: fetchedAt || new Date().toISOString(),
@@ -184,11 +361,13 @@ export function normalizeFantasyCalc(rows, { label, kind, url, fetchedAt } = {})
     url,
     values,
   };
+  if (variant) table.variant = variant;
+  return table;
 }
 
 const FC_OVERLAYS = Object.freeze([
-  { name: "fc_redraft", isDynasty: false, label: "FantasyCalc redraft", kind: "redraft" },
-  { name: "fc_dynasty", isDynasty: true, label: "FantasyCalc dynasty", kind: "dynasty" },
+  { role: "fc_redraft", isDynasty: false, labelBase: "FantasyCalc redraft", kind: "redraft" },
+  { role: "fc_dynasty", isDynasty: true, labelBase: "FantasyCalc dynasty", kind: "dynasty" },
 ]);
 
 const fcCacheKey = (name, params) =>
@@ -207,65 +386,54 @@ async function loadEngineBuildContext() {
 }
 
 /**
- * @typedef {object} LoadDeps
- * @property {typeof fetch} [fetchImpl] Fetch used for both data files and APIs.
- * @property {{get: Function, set: Function, del: Function, keys: Function}} [idb] Cache backend.
- * @property {Function} [buildContext] Engine entry point (default: dynamic import of engine/context.js).
- * @property {() => number} [now] Clock, for tests.
- * @property {object} [request] Extra options forwarded to sleeper.js (timeoutMs, retries, backoffMs).
+ * The pipeline layer, meta first (design §10.4).
+ *
+ * `data/meta.json` is ~250 bytes and carries the build stamp for all five files, so it is always
+ * fetched; when its `generated_at` still matches the stored copy AND every other file is in the
+ * drawer, the 250 KB behind it is reused from IndexedDB instead of downloaded again. That check
+ * replaces v1's "reuse anything fetched in the last 5 minutes" rule: a matching stamp means the
+ * bytes are provably identical, and a changed stamp always wins, however recent the copy is.
+ * @param {{fetchImpl: Function, idb: object, force: boolean,
+ *          errors: Array<{source: string, message: string}>}} args
+ * @returns {Promise<{files: Record<string, any>, fileSource: Record<string, string>,
+ *                    pipelineSource: "network"|"idb"}>}
  */
-
-/**
- * @typedef {object} LoadResult
- * @property {object} ctx Engine context from `buildContext`.
- * @property {{pipeline: string|null, live: string|null, values: "live"|"pipeline"|"cache",
- *             offline: boolean, stale: boolean}} freshness See the header comment.
- * @property {Array<{source: string, message: string}>} errors Non-fatal fallbacks.
- */
-
-/**
- * Load everything the app needs and build the engine context.
- * @param {{settings?: object, onProgress?: (p: {step: string, label: string, done: number,
- *          total: number}) => void, deps?: LoadDeps, force?: boolean,
- *          signal?: AbortSignal}} [options]
- * @returns {Promise<LoadResult>}
- * @throws {Error} only when the app truly cannot run (no data files and no cache, or no league).
- */
-export async function loadAll(options = {}) {
-  const { settings = loadSettings(), onProgress, deps = {}, force = false, signal } = options;
-  const {
-    fetchImpl = globalThis.fetch,
-    idb = defaultIdb,
-    buildContext,
-    now = Date.now,
-  } = deps;
-  const request = { fetchImpl, signal, ...(deps.request ?? {}) };
-  const progress = makeProgress(onProgress);
-  /** @type {Array<{source: string, message: string}>} */
-  const errors = [];
-  const nowMs = () => now();
-
-  // ── 1. Pipeline files ───────────────────────────────────────────────────────────────────────
-  progress("pipeline", "Loading players and projections", 0);
+async function loadPipelineFiles({ fetchImpl, idb, force, errors }) {
   /** @type {Record<string, any>} */
   const files = {};
-  /** @type {Record<string, "network"|"reuse"|"cache">} How each file was obtained. */
+  /** @type {Record<string, "network"|"idb"|"cache">} How each file was obtained. */
   const fileSource = {};
+  const storedMeta = await idb.get("pipeline:meta.json");
+
+  try {
+    files["meta.json"] = await fetchDataFile("meta.json", fetchImpl);
+    fileSource["meta.json"] = "network";
+  } catch (error) {
+    if (storedMeta) {
+      files["meta.json"] = storedMeta.payload;
+      fileSource["meta.json"] = "cache";
+      errors.push({ source: "data/meta.json", message: `${message(error)} — using cached copy` });
+    } else {
+      errors.push({ source: "data/meta.json", message: message(error) });
+    }
+  }
+
+  const stamp = isoOrNull(files["meta.json"]?.generated_at);
+  const storedStamp = isoOrNull(storedMeta?.payload?.generated_at);
+  if (!force && fileSource["meta.json"] === "network" && stamp && stamp === storedStamp) {
+    const stored = await Promise.all(PIPELINE_DATA_FILES.map((file) => idb.get(`pipeline:${file}`)));
+    if (stored.every((record) => record?.payload !== undefined && record?.payload !== null)) {
+      PIPELINE_DATA_FILES.forEach((file, index) => {
+        files[file] = stored[index].payload;
+        fileSource[file] = "idb";
+      });
+      return { files, fileSource, pipelineSource: "idb" };
+    }
+  }
+
   await Promise.all(
-    PIPELINE_FILES.map(async (file) => {
+    PIPELINE_DATA_FILES.map(async (file) => {
       const key = `pipeline:${file}`;
-      if (force) {
-        // A manual refresh re-pulls the league, not the 250 KB of pipeline output that the cron
-        // only rewrites every 6 h — reuse a copy saved in the last 5 minutes. That is a
-        // deliberate reuse of fresh data, not an offline fallback.
-        const recent = await idb.get(key);
-        const savedAt = Date.parse(recent?.savedAt ?? "");
-        if (recent && Number.isFinite(savedAt) && nowMs() - savedAt < PIPELINE_REUSE_MS) {
-          files[file] = recent.payload;
-          fileSource[file] = "reuse";
-          return;
-        }
-      }
       try {
         files[file] = await fetchDataFile(file, fetchImpl);
         fileSource[file] = "network";
@@ -282,6 +450,79 @@ export async function loadAll(options = {}) {
       }
     }),
   );
+
+  // Stamp the drawer with the new build only once its files are actually in it: storing a newer
+  // meta over half-downloaded data would make the next load trust yesterday's players.
+  if (
+    fileSource["meta.json"] === "network" &&
+    PIPELINE_DATA_FILES.every((file) => fileSource[file] === "network")
+  ) {
+    await idb.set("pipeline:meta.json", files["meta.json"]);
+  }
+
+  const downloaded = PIPELINE_DATA_FILES.some((file) => fileSource[file] === "network");
+  return { files, fileSource, pipelineSource: downloaded ? "network" : "idb" };
+}
+
+/**
+ * @typedef {object} LoadDeps
+ * @property {typeof fetch} [fetchImpl] Fetch used for both data files and APIs.
+ * @property {{get: Function, set: Function, del: Function, keys: Function}} [idb] Cache backend.
+ * @property {Function} [buildContext] Engine entry point (default: dynamic import of engine/context.js).
+ * @property {() => number} [now] Clock, for tests.
+ * @property {object} [request] Extra options forwarded to sleeper.js (timeoutMs, retries, backoffMs).
+ */
+
+/**
+ * @typedef {object} LoadResult
+ * @property {object} ctx Engine context from `buildContext`.
+ * @property {{pipeline: string|null, pipelineSource: "network"|"idb", season: string,
+ *             live: string|null, values: "live"|"pipeline"|"cache", offline: boolean,
+ *             stale: boolean}} freshness See the header comment.
+ * @property {Array<{source: string, message: string}>} errors Non-fatal fallbacks.
+ */
+
+/**
+ * Load everything the app needs and build the engine context.
+ * @param {{settings?: object, onProgress?: (p: {step: string, label: string, done: number,
+ *          total: number}) => void, deps?: LoadDeps, force?: boolean,
+ *          signal?: AbortSignal}} [options] `force: true` re-downloads the pipeline files even
+ *   when `data/meta.json` says they are unchanged (Settings → "reload data").
+ * @returns {Promise<LoadResult>}
+ * @throws {SetupRequiredError} when no league is configured yet — show onboarding, not an error.
+ * @throws {Error} when the app truly cannot run (no data files and no cache, no league snapshot).
+ */
+export async function loadAll(options = {}) {
+  const { settings = loadSettings(), onProgress, deps = {}, force = false, signal } = options;
+  const {
+    fetchImpl = globalThis.fetch,
+    idb = defaultIdb,
+    buildContext,
+    now = Date.now,
+  } = deps;
+  const request = { fetchImpl, signal, ...(deps.request ?? {}) };
+  const progress = makeProgress(onProgress);
+  /** @type {Array<{source: string, message: string}>} */
+  const errors = [];
+  const nowMs = () => now();
+
+  // No baked-in league any more: without one there is nothing to fetch, so bail out before
+  // touching the network. `userId` stays optional — a league opens fine in viewer mode.
+  const leagueId = trimmed(settings?.leagueId);
+  if (!leagueId) {
+    throw new SetupRequiredError(
+      "Tradewinds has no Sleeper league yet — choose one in setup, or open a ?league=<id> link.",
+    );
+  }
+
+  // ── 1. Pipeline files (meta first, then only what changed) ──────────────────────────────────
+  progress("pipeline", "Loading players and projections", 0);
+  const { files, fileSource, pipelineSource } = await loadPipelineFiles({
+    fetchImpl,
+    idb,
+    force,
+    errors,
+  });
 
   const missing = REQUIRED_FILES.filter((file) => !files[file]);
   if (missing.length) {
@@ -301,7 +542,6 @@ export async function loadAll(options = {}) {
 
   // ── 2. Live Sleeper layer ───────────────────────────────────────────────────────────────────
   progress("league", "Fetching live league state", 1);
-  const leagueId = String(settings.leagueId ?? "");
   const nowIso = new Date(nowMs()).toISOString();
   /** @type {Record<string, any>} */
   const live = {};
@@ -344,6 +584,9 @@ export async function loadAll(options = {}) {
   }
   if (!live.users) live.users = [];
   const liveAt = liveStamps.length ? liveStamps.slice().sort()[0] : null;
+  // Sleeper files leagues under `league_season`, which flips before `season` does in the spring.
+  const season = seasonFromState(live.state, settings);
+  lastKnownSeason = season;
 
   // ── 3. FantasyCalc live overlay ─────────────────────────────────────────────────────────────
   progress("values", "Refreshing trade values", 2);
@@ -351,21 +594,34 @@ export async function loadAll(options = {}) {
   const values = { ...valuesFile, sources: { ...(valuesFile?.sources ?? {}) } };
   let valuesMode = fileSource["values.json"] === "cache" ? "cache" : "pipeline";
   const fcParams = fcParamsFromLeague(live.league);
+  // A superflex league reads its values off the `_2qb` tables, so that is where the live overlay
+  // has to land — writing it into `fc_redraft` would be values for a league shape nobody is in.
+  const fcTables = fcTableNames(fcParams.numQbs);
   let anyLive = false;
   let anyFcCache = false;
 
   await Promise.all(
-    FC_OVERLAYS.map(async ({ name, isDynasty, label, kind }) => {
+    FC_OVERLAYS.map(async ({ role, isDynasty, labelBase, kind }) => {
+      const name = fcTables[role];
       const params = { isDynasty, ...fcParams };
       const url = sleeper.fantasyCalcUrl(params);
       const key = fcCacheKey(name, fcParams);
+      const floor = FC_FLOORS[name] ?? FC_FLOORS[role];
       try {
         const rows = await sleeper.getFantasyCalc(params, request);
-        const table = normalizeFantasyCalc(rows, { label, kind, url, fetchedAt: nowIso });
-        if (table.count < FC_FLOORS[name]) {
+        const table = normalizeFantasyCalc(rows, {
+          // Keep the committed table's wording when there is one, so the UI's source list does
+          // not change label halfway through a session.
+          label: values.sources[name]?.label ?? `${labelBase}${fcParams.numQbs >= 2 ? " 2QB" : ""}`,
+          kind,
+          url,
+          fetchedAt: nowIso,
+          variant: { numQbs: fcParams.numQbs },
+        });
+        if (table.count < floor) {
           errors.push({
             source: name,
-            message: `FantasyCalc returned ${table.count} rows (floor ${FC_FLOORS[name]}) — keeping the committed table`,
+            message: `FantasyCalc returned ${table.count} rows (floor ${floor}) — keeping the committed table`,
           });
           return;
         }
@@ -412,6 +668,8 @@ export async function loadAll(options = {}) {
     ctx,
     freshness: {
       pipeline: pipelineAt,
+      pipelineSource,
+      season,
       live: liveAt,
       values: valuesMode,
       offline,
@@ -422,15 +680,16 @@ export async function loadAll(options = {}) {
 }
 
 /**
- * Pull-to-refresh: re-fetch the live layers, reusing pipeline files fetched in the last 5 minutes.
- * Sleeper is never served from the cache first here — the cache is only a last resort so a refresh
- * with no signal degrades instead of blanking the app (`freshness.offline` then reads true).
+ * Pull-to-refresh: the live layers are always re-fetched (they are never served from the cache
+ * first — it is a last resort, so a refresh with no signal degrades instead of blanking the app
+ * and `freshness.offline` then reads true). The pipeline files come back only if
+ * `data/meta.json` says the cron has rebuilt them since the last load.
  * @param {object} [settings]
  * @param {{onProgress?: Function, deps?: LoadDeps, signal?: AbortSignal}} [options]
  * @returns {Promise<LoadResult>}
  */
 export function refreshLive(settings, options = {}) {
-  return loadAll({ ...options, settings: settings ?? loadSettings(), force: true });
+  return loadAll({ ...options, settings: settings ?? loadSettings() });
 }
 
 /**
@@ -542,14 +801,14 @@ export async function lookupUser(username, options = {}) {
 }
 
 /**
- * Every league a user is in for a season, for the Settings league picker.
+ * Every league a user is in for a season, for onboarding and the Settings league picker.
  * @param {string} userId
- * @param {string|number} [season]
+ * @param {string|number} [season] defaults to the season the last load saw (`currentSeason()`).
  * @param {{deps?: LoadDeps, signal?: AbortSignal}} [options]
  * @returns {Promise<Array<{league_id: string, name: string, total_rosters: number,
  *           status: string, season: string}>>}
  */
-export async function listLeagues(userId, season = DEFAULTS.season, options = {}) {
+export async function listLeagues(userId, season = currentSeason(), options = {}) {
   const { deps = {}, signal } = options;
   const request = { fetchImpl: deps.fetchImpl ?? globalThis.fetch, signal, ...(deps.request ?? {}) };
   const leagues = await sleeper.getUserLeagues(String(userId), season, request);

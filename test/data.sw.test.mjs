@@ -9,6 +9,9 @@ import { readFileSync } from "node:fs";
 const SCOPE = "https://tom-bentley.github.io/tradewinds/";
 const SW_SOURCE = readFileSync(new URL("../sw.js", import.meta.url), "utf8");
 const CACHE_NAME = SW_SOURCE.match(/^const CACHE = "([^"]+)";/m)[1]; // versioned with APP_VERSION
+const PRECACHE = SW_SOURCE.match(/^const PRECACHE = \[([\s\S]*?)\];$/m)[1].match(/"[^"]+"/g).map(
+  (entry) => JSON.parse(entry),
+);
 
 class FakeResponse {
   constructor(body = "", init = {}) {
@@ -151,7 +154,16 @@ test("install precaches the shell and survives files that do not exist yet", asy
   assert.ok(cache.entries.has(`${SCOPE}src/data.js`), "modules precached");
   assert.ok(cache.entries.has(`${SCOPE}icons/apple-touch-icon.png`));
   assert.ok(!cache.entries.has(`${SCOPE}src/ui/deals.js`), "a 404 is skipped, not fatal");
-  assert.equal(cache.entries.size, 26 - 2, "every other shell file landed");
+  assert.equal(cache.entries.size, PRECACHE.length - 2, "every other shell file landed");
+});
+
+test("the shell list covers every module the app boots with, onboarding included", () => {
+  // setup.js is loaded on a cold start with no league saved — if it is not precached, the very
+  // first offline launch of a fresh install has nothing to show.
+  for (const asset of ["./index.html", "./src/data.js", "./src/ui/setup.js", "./src/ui/app.js"]) {
+    assert.ok(PRECACHE.includes(asset), `${asset} must be precached`);
+  }
+  assert.equal(new Set(PRECACHE).size, PRECACHE.length, "no duplicate shell entries");
 });
 
 test("a first install stays quiet; an update tells the open tabs", async () => {

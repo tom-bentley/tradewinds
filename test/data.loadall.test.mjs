@@ -5,6 +5,8 @@ import {
   FC_FLOORS,
   PIPELINE_FILES,
   fcParamsFromLeague,
+  fcTableNames,
+  listLeagues,
   loadAll,
   normalizeFantasyCalc,
   refreshLive,
@@ -129,6 +131,8 @@ test("loadAll: happy path builds ctx, live values, and a clean freshness report"
   assert.deepEqual(errors, []);
   assert.deepEqual(freshness, {
     pipeline: PIPELINE_AT,
+    pipelineSource: "network",
+    season: "2026",
     live: NOW_ISO,
     values: "live",
     offline: false,
@@ -154,7 +158,13 @@ test("loadAll: happy path builds ctx, live values, and a clean freshness report"
   assert.equal(input.rosters.length, 8);
   assert.equal(input.state.week, 1);
   assert.equal(input.players.count, 871);
-  assert.equal(Object.keys(input.projections.players).length, 539);
+  // Projections v2 (raw stat lines) are handed to the engine untouched — this layer never
+  // reshapes a pipeline file, so the count tracks whatever the pipeline last committed.
+  assert.equal(input.projections.version, 2);
+  assert.equal(
+    Object.keys(input.projections.players).length,
+    Object.keys(fixture("projections.json").players).length,
+  );
   assert.equal(input.schedule.byes.KC, 5);
   assert.equal(applied, settings);
   assert.equal(ctx.league.name, "Boyball 🏈");
@@ -321,26 +331,182 @@ test("loadAll: works with IndexedDB unavailable (private mode)", async () => {
   assert.equal(freshness.offline, false);
 });
 
-test("refreshLive: reuses pipeline files fetched in the last 5 minutes, re-pulls the league", async () => {
-  const { deps, fetchImpl } = harness({
+// ── Meta-first conditional download (design §10.4) ──────────────────────────────────────────
+// `data/meta.json` carries the build stamp for all five files. An unchanged stamp means the
+// 250 KB behind it is byte-identical, so it is reused from IndexedDB instead of downloaded.
+
+/** The stored copy of a previous, older pipeline build. */
+const olderPipelineSeed = (generatedAt = "2026-09-09T09:59:31Z") => ({
+  ...pipelineSeed(),
+  "pipeline:meta.json": { ...fixture("meta.json"), generated_at: generatedAt },
+});
+
+test("loadAll: an unchanged meta.json reuses the stored files and downloads nothing else", async () => {
+  const { deps, fetchImpl, buildContext } = harness({
     seed: pipelineSeed(),
+    seedSavedAt: "2026-09-08T16:00:00Z", // deliberately old: the stamp decides, not the clock
+  });
+
+  const { freshness, errors } = await loadAll({ settings, deps });
+
+  assert.equal(fetchImpl.count("data/"), 1, "only meta.json was fetched");
+  assert.deepEqual(fetchImpl.urls("data/"), ["data/meta.json"]);
+  assert.equal(freshness.pipelineSource, "idb");
+  assert.equal(freshness.pipeline, PIPELINE_AT, "the stamp still describes the data in play");
+  assert.equal(freshness.offline, false, "reusing an unchanged build is not an offline fallback");
+  assert.deepEqual(errors, [], "and it is not an error either");
+  assert.equal(buildContext.seen[0].input.players.count, 871, "the engine got the stored files");
+});
+
+test("loadAll: a changed meta.json re-downloads all five files", async () => {
+  const { deps, fetchImpl, idb } = harness({ seed: olderPipelineSeed() });
+
+  const { freshness } = await loadAll({ settings, deps });
+
+  assert.equal(fetchImpl.count("data/"), 5);
+  assert.equal(freshness.pipelineSource, "network");
+  assert.equal(
+    idb.store.get("pipeline:meta.json").payload.generated_at,
+    PIPELINE_AT,
+    "the drawer is re-stamped with the build it now holds",
+  );
+});
+
+test("loadAll: a half-downloaded build never re-stamps the cache", async () => {
+  // Stamping meta before the files land would make the NEXT load reuse the previous players.
+  const stale = "2026-09-09T09:59:31Z";
+  const routes = makeRoutes().map((route) =>
+    route.match === "data/players.json" ? { ...route, respond: boom } : route,
+  );
+  const { deps, idb, buildContext } = harness({ routes, seed: olderPipelineSeed(stale) });
+
+  const { errors } = await loadAll({ settings, deps });
+
+  assert.equal(idb.store.get("pipeline:meta.json").payload.generated_at, stale, "old stamp kept");
+  assert.equal(buildContext.seen[0].input.players.count, 871, "the app still opens on the copy");
+  assert.ok(errors.some((e) => e.source === "data/players.json" && /using cached copy/.test(e.message)));
+});
+
+test("loadAll: meta.json unreachable falls back to the stored copy and still loads", async () => {
+  const routes = makeRoutes().map((route) =>
+    route.match === "data/meta.json" ? { ...route, respond: boom } : route,
+  );
+  const { deps, fetchImpl, idb } = harness({ routes, seed: pipelineSeed() });
+
+  const { freshness, errors } = await loadAll({ settings, deps });
+
+  assert.equal(fetchImpl.count("data/"), 5, "meta was attempted, the other four downloaded");
+  assert.equal(freshness.pipelineSource, "network");
+  assert.equal(freshness.pipeline, PIPELINE_AT, "the stored meta still dates the build");
+  assert.ok(errors.some((e) => e.source === "data/meta.json"));
+  assert.equal(idb.store.get("pipeline:players.json").payload.count, 871);
+});
+
+test("loadAll: force re-downloads even when the stamp is unchanged", async () => {
+  const { deps, fetchImpl } = harness({ seed: pipelineSeed() });
+  const { freshness } = await loadAll({ settings, deps, force: true });
+  assert.equal(fetchImpl.count("data/"), 5);
+  assert.equal(freshness.pipelineSource, "network");
+});
+
+test("refreshLive: re-pulls the league, reuses an unchanged pipeline build", async () => {
+  const { deps, fetchImpl } = harness({ seed: pipelineSeed() });
+
+  const { freshness } = await refreshLive(settings, { deps });
+
+  assert.equal(fetchImpl.count("data/"), 1, "no re-download of the 250 KB pipeline payload");
+  assert.equal(fetchImpl.count("api.sleeper.app"), 4, "league, users, rosters and state re-pulled");
+  assert.equal(freshness.pipelineSource, "idb");
+  assert.equal(freshness.live, NOW_ISO);
+  assert.equal(freshness.offline, false);
+});
+
+test("refreshLive: a fresh copy does not bypass a changed stamp", async () => {
+  // The v1 rule ("anything fetched in the last 5 minutes is fine") would have kept this copy.
+  const { deps, fetchImpl } = harness({
+    seed: olderPipelineSeed(),
     seedSavedAt: new Date(NOW - 60_000).toISOString(),
   });
 
   const { freshness } = await refreshLive(settings, { deps });
 
-  assert.equal(fetchImpl.count("data/"), 0, "no re-download of the 250 KB pipeline payload");
-  assert.equal(fetchImpl.count("api.sleeper.app"), 4, "league, users, rosters and state re-pulled");
-  assert.equal(freshness.live, NOW_ISO);
-  assert.equal(freshness.offline, false, "reusing a 1-minute-old pipeline copy is not 'offline'");
+  assert.equal(fetchImpl.count("data/"), 5, "the cron rebuilt: take the new files");
+  assert.equal(freshness.pipelineSource, "network");
 });
 
-test("refreshLive: a pipeline copy older than 5 minutes is re-fetched", async () => {
-  const { deps, fetchImpl } = harness({
-    seed: pipelineSeed(),
-    seedSavedAt: new Date(NOW - 10 * 60_000).toISOString(),
+// ── League-shape variants (design §10.2) ────────────────────────────────────────────────────
+
+/** The fixture league with a SUPER_FLEX slot bolted on — a 2QB league in every way that counts. */
+function superflexLeague() {
+  const league = fixture("league.json");
+  league.roster_positions = [...league.roster_positions, "SUPER_FLEX"];
+  return league;
+}
+
+test("fcTableNames maps a league shape to the committed tables", () => {
+  assert.deepEqual(fcTableNames(1), { fc_redraft: "fc_redraft", fc_dynasty: "fc_dynasty" });
+  assert.deepEqual(fcTableNames(2), { fc_redraft: "fc_redraft_2qb", fc_dynasty: "fc_dynasty_2qb" });
+  assert.deepEqual(fcTableNames(3), { fc_redraft: "fc_redraft_2qb", fc_dynasty: "fc_dynasty_2qb" });
+});
+
+test("loadAll: a superflex league overlays the _2qb tables, not the 1QB ones", async () => {
+  const { deps, fetchImpl, idb, buildContext } = harness({
+    routes: makeRoutes({ league: superflexLeague }),
   });
 
-  await refreshLive(settings, { deps });
-  assert.equal(fetchImpl.count("data/"), 5);
+  const { freshness } = await loadAll({ settings, deps });
+  const used = buildContext.seen[0].input.values.sources;
+  const committed = fixture("values.json").sources;
+
+  assert.equal(freshness.values, "live");
+  assert.equal(used.fc_redraft_2qb.count, 199, "the live table landed in the 2QB slot");
+  assert.equal(used.fc_dynasty_2qb.count, 423);
+  assert.deepEqual(used.fc_redraft_2qb.variant, { numQbs: 2 }, "tagged with the shape it prices");
+  assert.equal(used.fc_redraft_2qb.label, "FantasyCalc redraft 2QB");
+  assert.equal(used.fc_redraft_2qb.fetched_at, NOW_ISO);
+  assert.deepEqual(used.fc_redraft, committed.fc_redraft, "the 1QB tables are left alone");
+  assert.deepEqual(used.fc_dynasty, committed.fc_dynasty);
+
+  assert.equal(fetchImpl.count("numQbs=2"), 2, "FantasyCalc was asked for 2QB values");
+  assert.ok(idb.store.has("fc:fc_redraft_2qb:2:8:0.5"), "cached under the variant key");
+});
+
+// ── Season (design §10.4) ───────────────────────────────────────────────────────────────────
+
+test("loadAll: the season comes from league_season, and listLeagues follows it", async () => {
+  const state = () => ({ ...fixture("state.json"), season: "2026", league_season: "2027" });
+  const { deps } = harness({ routes: makeRoutes({ state }) });
+
+  const { freshness } = await loadAll({ settings, deps });
+  assert.equal(freshness.season, "2027", "Sleeper files leagues under league_season");
+
+  // The picker asks for "this season" without saying which — the last load decides.
+  const picker = makeFetchMock([{ match: "/leagues/nfl/", respond: [] }]);
+  await listLeagues("1394551386997272576", undefined, {
+    deps: { fetchImpl: picker, request: { backoffMs: [0, 0] } },
+  });
+  assert.match(picker.calls[0].url, /\/user\/1394551386997272576\/leagues\/nfl\/2027\?cb=/);
+});
+
+test("loadAll: a state payload without league_season falls back to season", async () => {
+  const state = () => {
+    const payload = { ...fixture("state.json"), season: "2025" };
+    delete payload.league_season;
+    return payload;
+  };
+  const { deps } = harness({ routes: makeRoutes({ state }) });
+  const { freshness } = await loadAll({ settings, deps });
+  assert.equal(freshness.season, "2025");
+});
+
+test("loadAll: a league with no user loads in viewer mode, settings passed through untouched", async () => {
+  const { deps, buildContext } = harness();
+  const viewer = { leagueId: LEAGUE, season: "2026" }; // no userId, no username
+
+  const { freshness } = await loadAll({ settings: viewer, deps });
+
+  assert.equal(buildContext.seen[0].settings, viewer, "handed to the engine as-is, by reference");
+  assert.deepEqual(Object.keys(viewer).sort(), ["leagueId", "season"], "and never written to");
+  assert.equal(freshness.season, "2026");
+  assert.equal(buildContext.seen[0].input.rosters.length, 8, "the whole league is still readable");
 });

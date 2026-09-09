@@ -130,3 +130,41 @@ test("listLeagues returns just what the league picker needs", async () => {
     season: "2026",
   });
 });
+
+test("null league/user defaults survive the merge (a fresh install, pre-onboarding)", (t) => {
+  // config.js ships leagueId/userId/username as null now; the merge must treat an explicit null
+  // as a value rather than tripping over it, or the app cannot boot into setup.
+  t.after(
+    installLocalStorage({
+      [STORAGE_KEY]: JSON.stringify({ leagueId: null, userId: null, username: null }),
+    }),
+  );
+  const settings = loadSettings();
+
+  assert.equal(settings.leagueId, null);
+  assert.equal(settings.userId, null);
+  assert.equal(settings.username, null);
+  assert.deepEqual(settings.weights, DEFAULTS.weights, "the rest of the defaults are untouched");
+  assert.deepEqual(settings.finder.shapes, DEFAULTS.finder.shapes);
+});
+
+test("onboarding writes a league over an empty default and it sticks", (t) => {
+  t.after(installLocalStorage({ [STORAGE_KEY]: JSON.stringify({ leagueId: null, userId: null }) }));
+
+  const saved = saveSettings({
+    leagueId: "1394476745138147328",
+    userId: "1394551386997272576",
+    username: "tommyteez",
+  });
+
+  assert.equal(saved.leagueId, "1394476745138147328");
+  assert.equal(loadSettings().userId, "1394551386997272576");
+  assert.equal(loadSettings().username, "tommyteez");
+});
+
+test("a viewer keeps their league but drops the user (browse-only mode)", (t) => {
+  t.after(installLocalStorage({ [STORAGE_KEY]: JSON.stringify({ leagueId: "42", userId: "7" }) }));
+  const saved = saveSettings({ userId: null, username: null });
+  assert.equal(saved.leagueId, "42");
+  assert.equal(saved.userId, null, "an explicit null clears a stored id");
+});
