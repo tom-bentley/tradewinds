@@ -77,10 +77,11 @@ python -m http.server 8787         # then open http://127.0.0.1:8787/
 
 ## Use it for your own league
 
-Open **Settings**, enter your Sleeper username, and pick your league. The league id, user id,
-and value weights are stored in the browser. The scheduled pipeline builds projections with one
-league's scoring (set by `TRADEWINDS_LEAGUE_ID` in the workflow), so fork the repo and change
-that variable for a different league.
+On first launch, enter your Sleeper username and pick your league; the app remembers it. Settings
+lets you switch leagues later, and a link of the form `…/tradewinds/?league=<id>&user=<username>`
+opens a league directly. The scheduled pipeline is league-agnostic: it ships raw projected stat
+lines, and your phone applies your league's own scoring settings, roster slots (including
+superflex), playoff weeks, and trade deadline.
 
 ## Deploy your own copy (free)
 
