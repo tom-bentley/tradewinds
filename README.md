@@ -70,7 +70,7 @@ iPhone (PWA on GitHub Pages) ──live──► api.sleeper.app · api.fantasyc
 ## Run locally
 
 ```bash
-node --test test/                 # unit tests
+node --test "test/*.test.mjs"      # unit tests
 node pipeline/refresh.mjs          # rebuild data/*.json from live sources
 python -m http.server 8787         # then open http://127.0.0.1:8787/
 ```
