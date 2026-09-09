@@ -62,8 +62,10 @@ iPhone (PWA on GitHub Pages) ──live──► api.sleeper.app · api.fantasyc
 
 - Static files only: `index.html`, `styles.css`, ES modules under `src/`, `sw.js`. No build step,
   no dependencies.
-- `pipeline/refresh.mjs` (Node ≥ 20, no dependencies) regenerates `data/*.json` and the
-  workflow in `.github/workflows/refresh-data.yml` commits the result when it changed.
+- `pipeline/refresh.mjs` (Node ≥ 20, no dependencies) regenerates `data/*.json` every three hours
+  and the workflow in `.github/workflows/refresh-data.yml` commits the result when it changed.
+- `pipeline/alerts.mjs` runs every 30 minutes, grades new completed trades, re-runs the deal and
+  free-agent finders for each paired phone, and sends push notifications (see Alerts).
 - The engine under `src/engine/` is pure and unit-tested against fixtures snapshotted on
   2026-09-09 (`test/fixtures/`).
 
@@ -74,6 +76,27 @@ node --test "test/*.test.mjs"      # unit tests
 node pipeline/refresh.mjs          # rebuild data/*.json from live sources
 python -m http.server 8787         # then open http://127.0.0.1:8787/
 ```
+
+## Alerts on your iPhone
+
+Alerts are real push notifications, and on iOS they only work for a web app that has been added to
+the Home Screen (iOS 16.4 or later). There is no server behind this app, so the scheduled GitHub
+Action sends the notifications, and your phone's push subscription has to be stored where only that
+Action can read it: a repository secret.
+
+1. Install the app (Safari → Share → Add to Home Screen) and open it from the icon.
+2. Settings → Alerts → **Enable alerts**, allow notifications, then **Copy** the pairing code.
+3. On github.com open the repo → Settings → Secrets and variables → Actions and create (or edit)
+   the secret `PUSH_SUBSCRIPTIONS`. Its value is a JSON array: `[<pairing code>]`, or several codes
+   separated by commas for more than one phone.
+4. Alerts begin within about 30 minutes. To test immediately, run the **Alerts** workflow from the
+   Actions tab with `test` checked.
+
+You will be alerted when a trade completes in the league, when a new deal for your team clears
+your score threshold, and when a free agent is worth a drop. Thresholds and the three switches are
+in Settings → Alerts; after changing them, copy and paste the code again so the job sees the new
+preferences. The endpoint and keys in the pairing code let a sender push to your phone, which is
+why they live in a secret and never in the repository.
 
 ## Use it for your own league
 
@@ -89,7 +112,11 @@ superflex), playoff weeks, and trade deadline.
 gh repo create <you>/tradewinds --public --source=. --push
 gh api "repos/<you>/tradewinds/pages" -X POST -f "source[branch]=main" -f "source[path]=/" -f "build_type=legacy"
 gh workflow run refresh-data.yml
+gh secret set VAPID_PRIVATE_KEY   # paste the private half of your VAPID key pair (never commit it)
 ```
+
+Generate your own VAPID key pair with `node scripts/vapid.mjs` (or `npx web-push generate-vapid-keys`)
+and put the public half in `src/config.js`.
 
 The site appears at `https://<you>.github.io/tradewinds/` after the first Pages build.
 
