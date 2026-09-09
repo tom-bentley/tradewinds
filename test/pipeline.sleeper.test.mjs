@@ -5,20 +5,24 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
+  PROJECTIONS_VERSION,
+  PROJECTION_EXCLUDED_KEYS,
   SEASON_WEEKS,
-  accumulateProjectionWeek,
+  accumulateStatWeek,
   buildNameIndex,
   buildPlayers,
   buildSchedule,
   buildTeamNameIndex,
   computeByes,
+  decodeStatLine,
   finalizeProjections,
+  statLinePoints,
+  statPairs,
   weeklyPoints,
 } from "../pipeline/sources/sleeper.mjs";
 import { validatePlayers, validateProjections, validateSchedule } from "../pipeline/contract.mjs";
 
 const GENERATED_AT = "2026-09-09T12:00:00Z";
-const LEAGUE_ID = "1394476745138147328";
 
 /** @param {string} name */
 function fixture(name) {
@@ -34,6 +38,21 @@ const rawProjections = fixture("sleeper_projections_wk1_raw.json");
 const byes = computeByes(rawSchedule);
 const schedule = buildSchedule(rawSchedule, { season: "2026", generatedAt: GENERATED_AT });
 const players = buildPlayers(rawPlayers, byes, { generatedAt: GENERATED_AT });
+const allowedIds = new Set(Object.keys(players.players));
+
+/**
+ * Encode the raw week-1 sample as projections v2.
+ * @param {{ weeks?: number }} [options] replay week 1 into `weeks` weeks
+ */
+function encodeSample(options = {}) {
+  const { weeks = 1 } = options;
+  /** @type {Map<string, any>} */
+  const target = new Map();
+  for (let week = 1; week <= weeks; week += 1) {
+    accumulateStatWeek(target, week, rawProjections, { allowedIds });
+  }
+  return finalizeProjections(target, { season: "2026", generatedAt: GENERATED_AT });
+}
 
 test("computeByes gives all 32 teams exactly one bye", () => {
   assert.equal(Object.keys(byes).length, 32);
@@ -100,6 +119,155 @@ test("buildPlayers names team defenses <TEAM> D/ST with null bio fields", () => 
   });
 });
 
+// --- projections v2: raw stat lines ----------------------------------------
+
+test("statPairs drops derived keys and zeros, rounds to 2 decimals and sorts by key", () => {
+  assert.deepEqual(
+    statPairs({
+      rush_yd: 12.345,
+      rec: 0,
+      pts_half_ppr: 18.4,
+      pts_ppr: 18.4,
+      pts_std: 18.4,
+      gp: 1,
+      cmp_pct: 66.4,
+      adp_dd_ppr: 999,
+      pos_adp_dd_ppr: 999,
+      bonus_rec_rb: 1.5,
+      broken: Number.NaN,
+      text: "nope",
+    }),
+    [
+      ["bonus_rec_rb", 1.5],
+      ["rush_yd", 12.35],
+    ],
+  );
+  assert.equal(statPairs({ rec: 0, gp: 1 }), null, "a line with nothing scoreable is not shipped");
+  assert.equal(statPairs(null), null);
+});
+
+test("the excluded key list is exactly the seven derived/meta keys of design 10.1", () => {
+  assert.deepEqual(
+    [...PROJECTION_EXCLUDED_KEYS].sort(),
+    ["adp_dd_ppr", "cmp_pct", "gp", "pos_adp_dd_ppr", "pts_half_ppr", "pts_ppr", "pts_std"],
+  );
+});
+
+test("accumulateStatWeek keeps fantasy positions and known ids only", () => {
+  /** @type {Map<string, any>} */
+  const target = new Map();
+  const result = accumulateStatWeek(target, 1, rawProjections, { allowedIds });
+
+  assert.equal(target.has("1379"), false, "FB row must be skipped");
+  assert.equal(target.has("12713"), false, "kicker outside allowedIds must be skipped");
+  assert.equal(result.skippedPosition, 1);
+  assert.equal(result.skippedUnknown, 1);
+  assert.equal(result.kept, 6);
+
+  const gibbs = target.get("9221");
+  assert.equal(gibbs.length, SEASON_WEEKS);
+  assert.deepEqual(gibbs.slice(1), new Array(SEASON_WEEKS - 1).fill(null));
+});
+
+test("finalizeProjections emits the v2 shape: version, keys vocabulary and 18 week entries", () => {
+  const projections = encodeSample();
+  assert.equal(projections.version, PROJECTIONS_VERSION);
+  assert.equal(projections.season, "2026");
+  assert.deepEqual(projections.weeks, Array.from({ length: SEASON_WEEKS }, (_, i) => i + 1));
+  assert.equal(projections.scoring, undefined, "v2 is league-agnostic — no scoring field");
+
+  assert.ok(projections.keys.length > 20, `only ${projections.keys.length} stat keys`);
+  assert.equal(new Set(projections.keys).size, projections.keys.length, "keys must be unique");
+  for (const key of projections.keys) assert.equal(PROJECTION_EXCLUDED_KEYS.has(key), false);
+
+  const gibbs = projections.players["9221"];
+  assert.equal(gibbs.length, SEASON_WEEKS);
+  assert.deepEqual(gibbs.slice(1), new Array(SEASON_WEEKS - 1).fill(0), "weeks with no projection are 0");
+  assert.ok(Array.isArray(gibbs[0]) && gibbs[0].length % 2 === 0);
+  assert.equal(decodeStatLine(gibbs[0], projections.keys).rec_yd, 30.67);
+});
+
+test("finalizeProjections orders players by id and grows the vocabulary deterministically", () => {
+  const first = encodeSample();
+  const second = encodeSample();
+  assert.equal(JSON.stringify(first), JSON.stringify(second), "a rerun must be byte-identical");
+  assert.deepEqual(Object.keys(first.players), ["4866", "6794", "9221", "11564", "JAX", "KC"]);
+
+  // The vocabulary is the first-appearance order of the id walk, so the first player's own
+  // stat names lead the array in alphabetical order.
+  const leadPairs = decodeStatLine(first.players["4866"][0], first.keys);
+  assert.deepEqual(first.keys.slice(0, Object.keys(leadPairs).length), Object.keys(leadPairs).sort());
+});
+
+test("finalizeProjections drops players with no projected week and is contract-valid", () => {
+  /** @type {Map<string, any>} */
+  const target = new Map();
+  for (let week = 1; week <= SEASON_WEEKS; week += 1) {
+    accumulateStatWeek(target, week, rawProjections, { allowedIds });
+  }
+  target.set("0000", new Array(SEASON_WEEKS).fill(null));
+
+  const projections = finalizeProjections(target, { season: "2026", generatedAt: GENERATED_AT });
+  assert.equal(projections.players["0000"], undefined, "a player with no week is dropped");
+
+  const problems = validateProjections(projections).filter((p) => !p.startsWith("projections: only"));
+  assert.deepEqual(problems, []);
+});
+
+test("ANCHOR 1: v2 client scoring equals the v1 league-exact formula on identical raw rows", () => {
+  const projections = encodeSample();
+  const ids = Object.keys(projections.players);
+  assert.equal(ids.length, 6, "the sample should carry six scoreable players");
+
+  for (const id of ids) {
+    const raw = rawProjections.find((row) => row.player_id === id);
+    const client = statLinePoints(projections.players[id][0], projections.keys, scoring);
+    const exact = weeklyPoints(raw.stats, scoring);
+    assert.ok(
+      Math.abs(client - exact) < 1e-9,
+      `${id}: client ${client} vs league-exact ${exact} (diff ${Math.abs(client - exact)})`,
+    );
+    assert.ok(exact > 0, `${id} should score something`);
+  }
+});
+
+test("ANCHOR 1 covers a QB, a kicker-free DEF and a RB, and ignores unscored keys", () => {
+  const projections = encodeSample();
+  const gibbs = decodeStatLine(projections.players["9221"][0], projections.keys);
+  // bonus_rec_rb is shipped (some leagues score it) but Boyball does not, so it cannot move points.
+  assert.ok(gibbs.bonus_rec_rb > 0);
+  assert.equal(scoring.bonus_rec_rb, undefined);
+  const withoutBonus = { ...gibbs };
+  delete withoutBonus.bonus_rec_rb;
+  const points = Object.entries(withoutBonus).reduce((sum, [k, v]) => sum + v * (scoring[k] ?? 0), 0);
+  assert.ok(Math.abs(points - weeklyPoints(rawProjections.find((r) => r.player_id === "9221").stats, scoring)) < 1e-9);
+
+  const kc = decodeStatLine(projections.players.KC[0], projections.keys);
+  assert.equal(kc.pts_half_ppr, undefined, "derived keys never ship");
+  assert.ok(kc.sack > 0 && kc.pts_allow_14_20 > 0);
+
+  const qb = decodeStatLine(projections.players["11564"][0], projections.keys);
+  assert.ok(qb.pass_yd > 0 && qb.pass_td > 0);
+});
+
+test("decodeStatLine is the inverse of the encoding and tolerates a 0 week", () => {
+  const projections = encodeSample();
+  assert.deepEqual(decodeStatLine(0, projections.keys), {});
+  assert.deepEqual(decodeStatLine(undefined, projections.keys), {});
+  const decoded = decodeStatLine(projections.players["6794"][0], projections.keys);
+  const raw = rawProjections.find((row) => row.player_id === "6794").stats;
+  for (const [key, value] of Object.entries(decoded)) assert.equal(value, raw[key]);
+});
+
+test("statLinePoints is 0 without an entry or without scoring", () => {
+  const projections = encodeSample();
+  assert.equal(statLinePoints(0, projections.keys, scoring), 0);
+  assert.equal(statLinePoints(projections.players.KC[0], projections.keys, null), 0);
+  assert.equal(statLinePoints(projections.players.KC[0], projections.keys, {}), 0);
+});
+
+// --- weeklyPoints: the v1 reference the anchor is measured against ----------
+
 test("weeklyPoints equals the manual league-exact sum for Jahmyr Gibbs wk1", () => {
   const gibbs = rawProjections.find((row) => row.player_id === "9221");
   assert.ok(gibbs, "fixture should contain Gibbs");
@@ -120,14 +288,7 @@ test("weeklyPoints equals the manual league-exact sum for Jahmyr Gibbs wk1", () 
     assert.equal(scoring[key], weight, `league scoring for ${key}`);
     manual += gibbs.stats[key] * weight;
   }
-
   assert.ok(Math.abs(weeklyPoints(gibbs.stats, scoring) - manual) < 1e-9);
-  // bonus_rec_rb is in the projection but not in this league's scoring, so it must be ignored.
-  assert.ok(gibbs.stats.bonus_rec_rb > 0);
-  assert.equal(scoring.bonus_rec_rb, undefined);
-  // pts_half_ppr must never be an input either.
-  assert.ok(gibbs.stats.pts_half_ppr > 0);
-  assert.equal(scoring.pts_half_ppr, undefined);
 });
 
 test("league-exact points stay within 0.2 of Sleeper's pts_half_ppr cross-check", () => {
@@ -156,44 +317,7 @@ test("weeklyPoints is 0 for missing stats or missing scoring", () => {
   assert.equal(weeklyPoints({ not_a_stat: 5 }, scoring), 0);
 });
 
-test("accumulateProjectionWeek keeps fantasy positions and known ids only", () => {
-  const allowedIds = new Set(Object.keys(players.players));
-  const target = new Map();
-  const result = accumulateProjectionWeek(target, 1, rawProjections, scoring, { allowedIds });
-
-  assert.equal(target.has("1379"), false, "FB row must be skipped");
-  assert.equal(target.has("12713"), false, "kicker outside allowedIds must be skipped");
-  assert.ok(result.skippedPosition >= 1);
-  assert.ok(result.skippedUnknown >= 1);
-
-  const gibbs = target.get("9221");
-  assert.equal(gibbs.length, SEASON_WEEKS);
-  assert.ok(Math.abs(gibbs[0] - 21.36) < 0.01, `expected ~21.36, got ${gibbs[0]}`);
-  assert.deepEqual(gibbs.slice(1), new Array(SEASON_WEEKS - 1).fill(0));
-});
-
-test("finalizeProjections drops all-zero players and is contract-valid", () => {
-  const allowedIds = new Set(Object.keys(players.players));
-  const target = new Map();
-  // Enough rows to clear the validator's minimum: replay week 1 into every week.
-  for (let week = 1; week <= SEASON_WEEKS; week += 1) {
-    accumulateProjectionWeek(target, week, rawProjections, scoring, { allowedIds });
-  }
-  target.set("0000", new Array(SEASON_WEEKS).fill(0));
-
-  const projections = finalizeProjections(target, {
-    season: "2026",
-    leagueId: LEAGUE_ID,
-    generatedAt: GENERATED_AT,
-  });
-  assert.equal(projections.scoring, `league:${LEAGUE_ID}`);
-  assert.equal(projections.weeks.length, SEASON_WEEKS);
-  assert.equal(projections.players["0000"], undefined, "all-zero player is dropped");
-  assert.ok(Object.keys(projections.players).length >= 5);
-
-  const problems = validateProjections(projections).filter((p) => !p.startsWith("projections: only"));
-  assert.deepEqual(problems, []);
-});
+// --- id indexes -------------------------------------------------------------
 
 test("buildNameIndex keys on name+position and nulls ambiguous names", () => {
   const index = buildNameIndex(players.players);

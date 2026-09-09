@@ -1,40 +1,38 @@
 // FantasyCalc source: crowd trade values, redraft and dynasty, keyed by sleeperId.
 // https://api.fantasycalc.com/values/current?isDynasty=&numQbs=&numTeams=&ppr=
 // CORS `*` (R1) — the browser re-fetches this live; the pipeline copy is the offline fallback.
+//
+// Since design §10.2 the pipeline is league-agnostic and ships four committed tables: redraft
+// and dynasty, each in a 1QB and a 2QB variant. `numTeams`/`ppr` move values <= 2 % (R3), so the
+// committed copies pin 12-team half-PPR; only `numQbs` gets its own table.
 
 import { compact, fetchJson, isoTimestamp, numOrNull, orderedById } from "../util.mjs";
 
 export const FANTASYCALC_API = "https://api.fantasycalc.com/values/current";
 
-/** Roster slots that consume a quarterback, for FantasyCalc's `numQbs`. */
-const QB_SLOTS = new Set(["QB", "SUPER_FLEX"]);
+/** League shape the committed tables are pinned to (design §10.2). */
+export const FC_NUM_TEAMS = 12;
+export const FC_PPR = 0.5;
 
 /** FantasyCalc reports roster share as 0..1; the contract wants a percentage. */
 const ROSTER_PERCENT_SCALE = 100;
 
 /**
- * @typedef {{ numQbs: number, numTeams: number, ppr: number }} FantasyCalcParams
+ * The four committed FantasyCalc tables, in values.json id order.
+ * @type {{ id: string, isDynasty: boolean, numQbs: number, label: string, kind: string }[]}
  */
+export const FC_TABLES = [
+  { id: "fc_dynasty", isDynasty: true, numQbs: 1, label: "FantasyCalc dynasty 1QB", kind: "dynasty" },
+  { id: "fc_dynasty_2qb", isDynasty: true, numQbs: 2, label: "FantasyCalc dynasty 2QB", kind: "dynasty" },
+  { id: "fc_redraft", isDynasty: false, numQbs: 1, label: "FantasyCalc redraft 1QB", kind: "redraft" },
+  { id: "fc_redraft_2qb", isDynasty: false, numQbs: 2, label: "FantasyCalc redraft 2QB", kind: "redraft" },
+];
 
 /**
- * Derive FantasyCalc's league-shape parameters from the Sleeper league object.
- * @param {{ roster_positions?: string[], total_rosters?: number,
- *   scoring_settings?: Record<string, number> }} league
- * @returns {FantasyCalcParams}
- */
-export function fantasyCalcParams(league) {
-  const rosterPositions = Array.isArray(league?.roster_positions) ? league.roster_positions : [];
-  const numQbs = rosterPositions.filter((slot) => QB_SLOTS.has(slot)).length || 1;
-  const numTeams = numOrNull(league?.total_rosters) ?? 12;
-  const ppr = numOrNull(league?.scoring_settings?.rec) ?? 0;
-  return { numQbs, numTeams, ppr };
-}
-
-/**
- * @param {FantasyCalcParams & { isDynasty: boolean }} options
+ * @param {{ isDynasty: boolean, numQbs: number, numTeams?: number, ppr?: number }} options
  * @returns {string}
  */
-export function fantasyCalcUrl({ isDynasty, numQbs, numTeams, ppr }) {
+export function fantasyCalcUrl({ isDynasty, numQbs, numTeams = FC_NUM_TEAMS, ppr = FC_PPR }) {
   return `${FANTASYCALC_API}?isDynasty=${isDynasty}&numQbs=${numQbs}&numTeams=${numTeams}&ppr=${ppr}`;
 }
 
@@ -74,12 +72,14 @@ export function normalizeFantasyCalc(rows) {
 
 /**
  * Fetch one FantasyCalc table in data/values.json source shape.
- * @param {FantasyCalcParams & { isDynasty: boolean, label: string, kind: string }} options
- * @returns {Promise<{ label: string, kind: string, fetched_at: string, ok: true, count: number,
- *   url: string, values: Record<string, Record<string, number>>, dropped: number }>}
+ * @param {{ isDynasty: boolean, numQbs: number, label: string, kind: string,
+ *   numTeams?: number, ppr?: number }} options
+ * @returns {Promise<{ label: string, kind: string, variant: { numQbs: number },
+ *   fetched_at: string, ok: true, count: number, url: string,
+ *   values: Record<string, Record<string, number>>, dropped: number }>}
  */
 export async function fetchFantasyCalcTable(options) {
-  const { isDynasty, numQbs, numTeams, ppr, label, kind } = options;
+  const { isDynasty, numQbs, label, kind, numTeams = FC_NUM_TEAMS, ppr = FC_PPR } = options;
   const url = fantasyCalcUrl({ isDynasty, numQbs, numTeams, ppr });
   const rows = await fetchJson(url);
   if (!Array.isArray(rows)) throw new Error(`unexpected FantasyCalc payload from ${url}`);
@@ -87,6 +87,7 @@ export async function fetchFantasyCalcTable(options) {
   return {
     label,
     kind,
+    variant: { numQbs },
     fetched_at: isoTimestamp(),
     ok: true,
     count: Object.keys(values).length,

@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 // Tradewinds data pipeline entry point.
 //
-//   node pipeline/refresh.mjs          (env TRADEWINDS_LEAGUE_ID overrides the league)
+//   node pipeline/refresh.mjs
 //
 // Writes data/{players,projections,values,schedule,meta}.json.
+// League-agnostic since design §10.6: nothing here reads a league. projections.json ships raw
+// stat lines (v2) and values.json ships one table per league shape, so the phone can score any
+// Sleeper league from the same committed files.
+//
 // Exit 0 when the Sleeper core (players + projections + schedule) succeeded, 1 when it did not.
 // FantasyCalc / DynastyProcess / Boris Chen are optional: a failure there keeps the last good
 // table and never fails the run.
@@ -14,6 +18,7 @@ import { dirname, join } from "node:path";
 import {
   PIPELINE_VERSION,
   POLITE_DELAY_MS,
+  formatSize,
   isoTimestamp,
   orderedByKey,
   sleep,
@@ -21,19 +26,27 @@ import {
 } from "./util.mjs";
 import { validateAll } from "./contract.mjs";
 import { ROW_FLOORS, applyLastGood, loadPreviousValueSources } from "./lastgood.mjs";
-import { buildNameIndex, collectSleeper, fetchLeague, fetchState } from "./sources/sleeper.mjs";
-import { fantasyCalcParams, fetchFantasyCalcTable } from "./sources/fantasycalc.mjs";
-import { fetchDynastyProcessTable } from "./sources/dynastyprocess.mjs";
-import { fetchBorisChenTable } from "./sources/borischen.mjs";
+import { buildNameIndex, collectSleeper, fetchState } from "./sources/sleeper.mjs";
+import { FC_NUM_TEAMS, FC_PPR, FC_TABLES, fetchFantasyCalcTable } from "./sources/fantasycalc.mjs";
+import { DP_TABLES, fetchDynastyProcessTables } from "./sources/dynastyprocess.mjs";
+import { BC_FORMATS, fetchBorisChenTables } from "./sources/borischen.mjs";
 
-/** Tom's Boyball league — the app's default. */
-export const DEFAULT_LEAGUE_ID = "1394476745138147328";
-
-/** Total data/ budget; the run warns (does not fail) above it. */
-const SIZE_BUDGET_BYTES = 600_000;
+/** Total data/ budget; the run warns (does not fail) above it. Stat lines dominate it. */
+const SIZE_BUDGET_BYTES = 1_600_000;
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DATA_DIR = join(REPO_ROOT, "data");
+
+/**
+ * Every value table this pipeline publishes -> its `variant` (design §10.2). Also the whitelist
+ * of ids the last-good guard may carry forward, so a retired table id disappears on the next run.
+ * @type {Readonly<Record<string, Record<string, number>>>}
+ */
+export const PUBLISHED_TABLES = Object.freeze({
+  ...Object.fromEntries(FC_TABLES.map((spec) => [spec.id, { numQbs: spec.numQbs }])),
+  ...Object.fromEntries(DP_TABLES.map((spec) => [spec.id, { numQbs: spec.numQbs }])),
+  ...Object.fromEntries(BC_FORMATS.map((spec) => [spec.id, { ppr: spec.ppr }])),
+});
 
 /**
  * Only the contract fields reach data/values.json — diagnostics stay in meta/stdout.
@@ -45,6 +58,7 @@ function toContractTable(table) {
   const out = {
     label: table.label,
     kind: table.kind,
+    variant: table.variant,
     fetched_at: table.fetched_at,
     ok: table.ok,
     count: table.count,
@@ -73,7 +87,21 @@ async function attempt(id, run) {
 }
 
 /**
- * @param {string} status "ok" | "warn" | "fail"
+ * Run a source that produces several tables at once, spreading a failure across all of them.
+ * @param {string} id
+ * @param {string[]} ids table ids the group publishes
+ * @param {() => Promise<Record<string, any>>} run
+ * @returns {Promise<Record<string, { table: any, error: string|null }>>}
+ */
+async function attemptGroup(id, ids, run) {
+  const { table: tables, error } = await attempt(id, run);
+  return Object.fromEntries(
+    ids.map((tableId) => [tableId, { table: tables?.[tableId] ?? null, error }]),
+  );
+}
+
+/**
+ * @param {string} status_ "ok" | "warn" | "fail"
  * @param {string} id
  * @param {string} detail
  */
@@ -86,50 +114,33 @@ function status(status_, id, detail) {
  * @returns {Promise<number>} process exit code
  */
 export async function main() {
-  const leagueId = process.env.TRADEWINDS_LEAGUE_ID || DEFAULT_LEAGUE_ID;
   const generatedAt = isoTimestamp();
-  process.stdout.write(`tradewinds pipeline ${PIPELINE_VERSION} — league ${leagueId} — ${generatedAt}\n`);
+  process.stdout.write(`tradewinds pipeline ${PIPELINE_VERSION} — league-agnostic — ${generatedAt}\n`);
 
-  // --- league + state -------------------------------------------------------
-  /** @type {Record<string, any>} */
-  let league;
+  // --- season + week --------------------------------------------------------
   /** @type {Record<string, any>} */
   let state;
   try {
-    league = await fetchLeague(leagueId);
-    await sleep(POLITE_DELAY_MS);
     state = await fetchState();
     await sleep(POLITE_DELAY_MS);
   } catch (error) {
-    status("fail", "sleeper_league", error.message);
-    return 1;
-  }
-  if (!league || typeof league !== "object" || !league.scoring_settings) {
-    status("fail", "sleeper_league", `league ${leagueId} returned no scoring_settings — check TRADEWINDS_LEAGUE_ID`);
+    status("fail", "sleeper_state", error.message);
     return 1;
   }
   if (!state || typeof state !== "object") {
     status("fail", "sleeper_state", "https://api.sleeper.app/v1/state/nfl returned no state object");
     return 1;
   }
-  const scoring = league.scoring_settings ?? {};
-  const season = String(league.season ?? state.season ?? new Date().getUTCFullYear());
+  const season = String(state.league_season ?? state.season ?? new Date().getUTCFullYear());
   const week = Math.max(1, Number(state.week) || 1);
-  status(
-    "ok",
-    "sleeper_league",
-    `${league.name ?? "?"} · season ${season} · week ${week} · ${league.total_rosters ?? "?"} teams · ` +
-      `${Object.keys(scoring).length} scoring keys`,
-  );
+  status("ok", "sleeper_state", `season ${season} · week ${week} · leg ${state.leg ?? "?"}`);
 
   // --- Sleeper core (required) ---------------------------------------------
   /** @type {Awaited<ReturnType<typeof collectSleeper>>} */
   let core;
   try {
     core = await collectSleeper({
-      leagueId,
       season,
-      scoring,
       generatedAt,
       log: (message) => status("ok", `sleeper_${message.split(":")[0]}`, message.split(": ").slice(1).join(": ")),
     });
@@ -145,34 +156,31 @@ export async function main() {
   const nameIndex = buildNameIndex(core.players.players);
 
   // --- optional value sources ----------------------------------------------
-  const fcParams = fantasyCalcParams(league);
-  status("ok", "fantasycalc_params", `numQbs=${fcParams.numQbs} numTeams=${fcParams.numTeams} ppr=${fcParams.ppr}`);
-
-  const fcRedraft = await attempt("fc_redraft", () =>
-    fetchFantasyCalcTable({ ...fcParams, isDynasty: false, label: "FantasyCalc redraft", kind: "redraft" }),
-  );
-  await sleep(POLITE_DELAY_MS);
-  const fcDynasty = await attempt("fc_dynasty", () =>
-    fetchFantasyCalcTable({ ...fcParams, isDynasty: true, label: "FantasyCalc dynasty", kind: "dynasty" }),
-  );
-  await sleep(POLITE_DELAY_MS);
-  const dpDynasty = await attempt("dp_dynasty", () => fetchDynastyProcessTable({ nameIndex }));
-  await sleep(POLITE_DELAY_MS);
-  const bcTiers = await attempt("bc_tiers", () =>
-    fetchBorisChenTable({ week, nameIndex, teamNameIndex: core.teamNameIndex }),
-  );
+  status("ok", "fantasycalc_params", `numTeams=${FC_NUM_TEAMS} ppr=${FC_PPR} · numQbs 1 and 2`);
 
   /** @type {Record<string, { table: any, error: string|null }>} */
-  const attempts = {
-    fc_redraft: fcRedraft,
-    fc_dynasty: fcDynasty,
-    dp_dynasty: dpDynasty,
-    bc_tiers: bcTiers,
-  };
+  const attempts = {};
+  for (const spec of FC_TABLES) {
+    attempts[spec.id] = await attempt(spec.id, () => fetchFantasyCalcTable(spec));
+    await sleep(POLITE_DELAY_MS);
+  }
+  Object.assign(
+    attempts,
+    await attemptGroup("dp_dynasty", DP_TABLES.map((spec) => spec.id), () =>
+      fetchDynastyProcessTables({ nameIndex }),
+    ),
+  );
+  await sleep(POLITE_DELAY_MS);
+  Object.assign(
+    attempts,
+    await attemptGroup("bc_tiers", BC_FORMATS.map((spec) => spec.id), () =>
+      fetchBorisChenTables({ week, nameIndex, teamNameIndex: core.teamNameIndex }),
+    ),
+  );
 
   // --- last-good guard ------------------------------------------------------
   const valuesFile = join(DATA_DIR, "values.json");
-  const previous = loadPreviousValueSources(valuesFile);
+  const previous = loadPreviousValueSources(valuesFile, { keep: Object.keys(PUBLISHED_TABLES) });
   const guarded = applyLastGood({
     attempts: Object.fromEntries(
       Object.entries(attempts).map(([id, result]) => [
@@ -183,9 +191,15 @@ export async function main() {
     previous,
     floors: ROW_FLOORS,
   });
+  // A table carried over from an older schema predates `variant`; stamp the current one on.
+  for (const [id, variant] of Object.entries(PUBLISHED_TABLES)) {
+    const table = guarded.sources[id];
+    if (table && table.variant === undefined) table.variant = variant;
+  }
   for (const note of guarded.notes) status("warn", "lastgood", note);
 
-  for (const [id, result] of Object.entries(attempts)) {
+  for (const id of Object.keys(PUBLISHED_TABLES).sort()) {
+    const result = attempts[id] ?? { table: null, error: "not attempted" };
     const published = guarded.sources[id];
     if (result.error) {
       status("fail", id, `${result.error}${guarded.kept.includes(id) ? " — kept last good" : ""}`);
@@ -209,21 +223,19 @@ export async function main() {
 
   /** @type {Record<string, any>} */
   const metaSources = {
-    bc_tiers: metaEntry(guarded.sources.bc_tiers, attempts.bc_tiers, generatedAt),
-    dp_dynasty: metaEntry(guarded.sources.dp_dynasty, attempts.dp_dynasty, generatedAt),
-    fc_dynasty: metaEntry(guarded.sources.fc_dynasty, attempts.fc_dynasty, generatedAt),
-    fc_redraft: metaEntry(guarded.sources.fc_redraft, attempts.fc_redraft, generatedAt),
     players: { ok: true, fetched_at: generatedAt, count: core.players.count },
     projections: { ok: true, fetched_at: generatedAt, count: projectionCount },
     schedule: { ok: true, fetched_at: generatedAt, count: core.schedule.games.length },
   };
+  for (const id of Object.keys(PUBLISHED_TABLES)) {
+    metaSources[id] = metaEntry(guarded.sources[id], attempts[id], generatedAt);
+  }
   const meta = {
     generated_at: generatedAt,
     season,
     week,
-    league_id: leagueId,
     pipeline_version: PIPELINE_VERSION,
-    sources: metaSources,
+    sources: orderedByKey(metaSources),
   };
 
   const files = {
@@ -244,24 +256,20 @@ export async function main() {
   if (problemCount === 0) status("ok", "contract", "all five files valid");
 
   let totalBytes = 0;
+  let totalGzip = 0;
   for (const [name, value] of Object.entries(files)) {
-    const bytes = writeJsonFile(join(DATA_DIR, `${name}.json`), value);
-    totalBytes += bytes;
-    status("ok", `write:${name}.json`, `${bytes.toLocaleString("en-US")} bytes`);
+    const size = writeJsonFile(join(DATA_DIR, `${name}.json`), value);
+    totalBytes += size.bytes;
+    totalGzip += size.gzip;
+    status("ok", `write:${name}.json`, formatSize(size));
   }
   status(
     totalBytes > SIZE_BUDGET_BYTES ? "warn" : "ok",
     "data size",
-    `${totalBytes.toLocaleString("en-US")} bytes of a ${SIZE_BUDGET_BYTES.toLocaleString("en-US")} byte budget`,
+    `${formatSize({ bytes: totalBytes, gzip: totalGzip })} of a ` +
+      `${SIZE_BUDGET_BYTES.toLocaleString("en-US")} byte budget`,
   );
   status("ok", "byes", JSON.stringify(core.stats.byes));
-  if (core.stats.medianHalfPprDiff !== null) {
-    status(
-      "ok",
-      "half-ppr xcheck",
-      `median |league-exact − pts_half_ppr| = ${core.stats.medianHalfPprDiff.toFixed(3)} pts`,
-    );
-  }
 
   return 0;
 }
@@ -269,7 +277,7 @@ export async function main() {
 /**
  * meta.json entry for one value source.
  * @param {any} published table actually written to values.json
- * @param {{ table: any, error: string|null }} attemptResult
+ * @param {{ table: any, error: string|null }|undefined} attemptResult
  * @param {string} fallbackTimestamp
  * @returns {{ ok: boolean, fetched_at: string, count: number, error?: string, unmatched?: number }}
  */
@@ -282,6 +290,7 @@ function metaEntry(published, attemptResult, fallbackTimestamp) {
   };
   if (published?.error !== undefined) entry.error = published.error;
   else if (attemptResult?.error) entry.error = attemptResult.error;
+  else if (entry.ok === false) entry.error = "source produced no table";
   if (typeof attemptResult?.table?.unmatched === "number") entry.unmatched = attemptResult.table.unmatched;
   return entry;
 }

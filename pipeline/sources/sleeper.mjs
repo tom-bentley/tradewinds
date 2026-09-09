@@ -1,15 +1,17 @@
-// Sleeper source: players, league-exact weekly projections, schedule and byes.
+// Sleeper source: players, projected STAT LINES (projections v2), schedule and byes.
 //
 // Endpoints (R4 §5 — projections live under /projections, NOT /v1):
-//   /v1/league/{id}            league (scoring_settings, roster_positions, total_rosters)  ?cb=
 //   /v1/state/nfl              season + week                                               ?cb=
 //   /v1/players/nfl            ~15 MB player dump                                          no cb
 //   /projections/nfl/{season}/{week}?season_type=regular&position[]=...                    no cb
 //   /schedule/nfl/regular/{season}                                                         no cb
+//
+// The league endpoint is deliberately NOT used: since design §10.1/§10.6 the pipeline is
+// league-agnostic. We ship raw stat lines and every league's scoring is applied on the phone.
 
 import {
-  POINTS_DECIMALS,
   POLITE_DELAY_MS,
+  compareIds,
   fetchJson,
   normalizeName,
   numOrNull,
@@ -29,6 +31,27 @@ const FANTASY_POSITION_SET = new Set(FANTASY_POSITIONS);
 /** NFL regular season length; index 0 of a projections array is week 1. */
 export const SEASON_WEEKS = 18;
 
+/** Schema version stamped into data/projections.json (design §10.1). */
+export const PROJECTIONS_VERSION = 2;
+
+/** Decimals kept on a projected stat value. Sleeper already publishes 2. */
+export const STAT_DECIMALS = 2;
+
+/**
+ * Derived / meta keys that no `scoring_settings` ever references, so shipping them
+ * would only cost bytes (design §10.1). Everything else is kept — some leagues score
+ * `pass_att`, `rec_40p`, `bonus_rec_te`, `yds_allow_*`, ...
+ */
+export const PROJECTION_EXCLUDED_KEYS = new Set([
+  "adp_dd_ppr",
+  "pos_adp_dd_ppr",
+  "gp",
+  "pts_std",
+  "pts_half_ppr",
+  "pts_ppr",
+  "cmp_pct",
+]);
+
 /** Repeatable `position[]=` filter — shrinks a weekly projection call 5.7 MB -> 2.1 MB (R1 §6). */
 export const PROJECTION_POSITION_QUERY = FANTASY_POSITIONS.map((p) => `position[]=${p}`).join("&");
 
@@ -46,16 +69,6 @@ const BYE_WEEK_RANGE = [4, 15];
  *   age: number|null, exp: number|null, num: number|null, dc: number|null,
  *   fp: string[], bye: number|null }} ContractPlayer
  */
-
-/**
- * @param {string} leagueId
- * @returns {Promise<Record<string, any>>}
- */
-export async function fetchLeague(leagueId) {
-  return /** @type {Record<string, any>} */ (
-    await fetchJson(`${SLEEPER_API}/v1/league/${leagueId}`, { cacheBust: true })
-  );
-}
 
 /** @returns {Promise<Record<string, any>>} */
 export async function fetchState() {
@@ -103,9 +116,10 @@ export async function fetchProjectionsWeek(season, week) {
 }
 
 /**
- * League-exact weekly points: sum over the stat keys present in BOTH the
- * projection's `stats` and the league's `scoring_settings` (R4 §1.1).
- * `pts_half_ppr` is deliberately never an input.
+ * League-exact weekly points: sum over the stat keys present in BOTH the projection's
+ * `stats` and a league's `scoring_settings` (R4 §1.1). The pipeline no longer needs this
+ * — points are computed on the phone from the v2 stat lines — but it stays exported as
+ * the reference implementation the projections-v2 anchor test is measured against.
  * @param {Record<string, number>|null|undefined} stats
  * @param {Record<string, number>|null|undefined} scoring
  * @returns {number}
@@ -136,22 +150,78 @@ export function projectionRowPosition(row) {
 }
 
 /**
- * Fold one week of raw projection rows into `target` (id -> number[SEASON_WEEKS]).
+ * One week of raw `stats` as ordered [key, value] pairs: nonzero, non-excluded, finite,
+ * rounded to STAT_DECIMALS and sorted by key name so encoding is deterministic.
+ * @param {Record<string, unknown>|null|undefined} stats
+ * @returns {[string, number][]|null} null when the week carries nothing worth shipping
+ */
+export function statPairs(stats) {
+  if (!stats || typeof stats !== "object") return null;
+  /** @type {[string, number][]} */
+  const pairs = [];
+  for (const key of Object.keys(stats).sort()) {
+    if (PROJECTION_EXCLUDED_KEYS.has(key)) continue;
+    const raw = stats[key];
+    if (typeof raw !== "number" || !Number.isFinite(raw)) continue;
+    const value = round(raw, STAT_DECIMALS);
+    if (value === 0) continue;
+    pairs.push([key, value]);
+  }
+  return pairs.length > 0 ? pairs : null;
+}
+
+/**
+ * Decode one v2 week entry back to `{ stat: value }` — the inverse of the encoding,
+ * used by the tests and by the run report.
+ * @param {number[]|0|null|undefined} entry
+ * @param {string[]} keys
+ * @returns {Record<string, number>}
+ */
+export function decodeStatLine(entry, keys) {
+  /** @type {Record<string, number>} */
+  const out = {};
+  if (!Array.isArray(entry)) return out;
+  for (let i = 0; i + 1 < entry.length; i += 2) {
+    const name = keys[entry[i]];
+    if (typeof name === "string") out[name] = entry[i + 1];
+  }
+  return out;
+}
+
+/**
+ * The client-side scoring formula of design §10.1:
+ * `pts(w) = Σ value × (scoring_settings[keys[idx]] ?? 0)`.
+ * @param {number[]|0|null|undefined} entry
+ * @param {string[]} keys
+ * @param {Record<string, number>|null|undefined} scoring
+ * @returns {number}
+ */
+export function statLinePoints(entry, keys, scoring) {
+  if (!Array.isArray(entry) || !scoring) return 0;
+  let total = 0;
+  for (let i = 0; i + 1 < entry.length; i += 2) {
+    const weight = scoring[keys[entry[i]]];
+    if (typeof weight !== "number") continue;
+    total += entry[i + 1] * weight;
+  }
+  return total;
+}
+
+/**
+ * Fold one week of raw projection rows into `target` (id -> [key, value][] per week).
  * Rows outside the six fantasy positions, or outside `allowedIds`, are ignored.
- * @param {Map<string, number[]>} target mutated in place
+ * @param {Map<string, ([string, number][]|null)[]>} target mutated in place
  * @param {number} week 1-based
  * @param {any[]} rows raw Sleeper projection rows
- * @param {Record<string, number>} scoring league scoring_settings
  * @param {{ allowedIds?: Set<string>|null }} [options]
- * @returns {{ kept: number, skippedPosition: number, skippedUnknown: number, halfPprDiffs: number[] }}
+ * @returns {{ kept: number, skippedPosition: number, skippedUnknown: number, skippedEmpty: number }}
  */
-export function accumulateProjectionWeek(target, week, rows, scoring, options = {}) {
+export function accumulateStatWeek(target, week, rows, options = {}) {
   const { allowedIds = null } = options;
   let kept = 0;
   let skippedPosition = 0;
   let skippedUnknown = 0;
-  /** @type {number[]} */
-  const halfPprDiffs = [];
+  let skippedEmpty = 0;
 
   for (const row of rows) {
     const id = row?.player_id;
@@ -165,43 +235,71 @@ export function accumulateProjectionWeek(target, week, rows, scoring, options = 
       skippedUnknown += 1;
       continue;
     }
-    const points = weeklyPoints(row.stats, scoring);
-    if (points === 0) continue;
+    const pairs = statPairs(row.stats);
+    if (!pairs) {
+      skippedEmpty += 1;
+      continue;
+    }
     let weeks = target.get(id);
     if (!weeks) {
-      weeks = new Array(SEASON_WEEKS).fill(0);
+      weeks = new Array(SEASON_WEEKS).fill(null);
       target.set(id, weeks);
     }
-    weeks[week - 1] = round(points, POINTS_DECIMALS);
+    weeks[week - 1] = pairs;
     kept += 1;
-    const half = row?.stats?.pts_half_ppr;
-    if (typeof half === "number" && Number.isFinite(half)) halfPprDiffs.push(points - half);
   }
-  return { kept, skippedPosition, skippedUnknown, halfPprDiffs };
+  return { kept, skippedPosition, skippedUnknown, skippedEmpty };
 }
 
 /**
- * Wrap an accumulator into data/projections.json shape. Players whose every
- * week is 0 are dropped.
- * @param {Map<string, number[]>} accumulated
- * @param {{ season: string, leagueId: string, generatedAt: string, weeks?: number[] }} meta
- * @returns {{ generated_at: string, season: string, scoring: string, weeks: number[],
- *   players: Record<string, number[]> }}
+ * Wrap an accumulator into data/projections.json v2 shape. Players with no projected
+ * week at all are dropped. Determinism: players ascend by id (numeric-aware), the stat
+ * vocabulary grows by first appearance in that same walk, and each week entry lists its
+ * stats alphabetically — so a rerun on identical input is byte-identical, and a new stat
+ * key appends to `keys` instead of renumbering the file.
+ * @param {Map<string, ([string, number][]|null)[]>} accumulated
+ * @param {{ season: string|number, generatedAt: string, weeks?: number[] }} meta
+ * @returns {{ generated_at: string, season: string, version: number, weeks: number[],
+ *   keys: string[], players: Record<string, (number[]|0)[]> }}
  */
 export function finalizeProjections(accumulated, meta) {
   const weeks = meta.weeks ?? Array.from({ length: SEASON_WEEKS }, (_, i) => i + 1);
-  /** @type {Record<string, number[]>} */
+  /** @type {string[]} */
+  const keys = [];
+  /** @type {Map<string, number>} */
+  const keyIndex = new Map();
+  /** @type {Record<string, (number[]|0)[]>} */
   const players = {};
-  for (const [id, values] of accumulated) {
-    if (!values.some((v) => v !== 0)) continue;
-    players[id] = values;
+
+  const ids = [...accumulated.keys()]
+    .filter((id) => (accumulated.get(id) ?? []).some((week) => week && week.length > 0))
+    .sort(compareIds);
+
+  for (const id of ids) {
+    players[id] = (accumulated.get(id) ?? []).map((pairs) => {
+      if (!pairs || pairs.length === 0) return 0;
+      /** @type {number[]} */
+      const flat = [];
+      for (const [key, value] of pairs) {
+        let index = keyIndex.get(key);
+        if (index === undefined) {
+          index = keys.length;
+          keys.push(key);
+          keyIndex.set(key, index);
+        }
+        flat.push(index, value);
+      }
+      return flat;
+    });
   }
+
   return {
     generated_at: meta.generatedAt,
     season: String(meta.season),
-    scoring: `league:${meta.leagueId}`,
+    version: PROJECTIONS_VERSION,
     weeks,
-    players: orderedById(players),
+    keys,
+    players,
   };
 }
 
@@ -353,7 +451,7 @@ export function buildTeamNameIndex(rawPlayers) {
 }
 
 /**
- * Median of a numeric array (used for the pts_half_ppr cross-check).
+ * Median of a numeric array.
  * @param {number[]} values
  * @returns {number|null}
  */
@@ -366,14 +464,13 @@ export function median(values) {
 
 /**
  * Fetch and normalize everything Sleeper contributes. Requests are sequential
- * with POLITE_DELAY_MS between them.
- * @param {{ leagueId: string, season: string, scoring: Record<string, number>,
- *   generatedAt: string, log?: (message: string) => void }} options
+ * with POLITE_DELAY_MS between them. No league is involved.
+ * @param {{ season: string, generatedAt: string, log?: (message: string) => void }} options
  * @returns {Promise<{ players: any, projections: any, schedule: any,
  *   teamNameIndex: Map<string, string>, stats: Record<string, any> }>}
  */
 export async function collectSleeper(options) {
-  const { leagueId, season, scoring, generatedAt, log = () => {} } = options;
+  const { season, generatedAt, log = () => {} } = options;
 
   const rawGames = await fetchScheduleRaw(season);
   const schedule = buildSchedule(rawGames, { season, generatedAt });
@@ -386,27 +483,28 @@ export async function collectSleeper(options) {
   await sleep(POLITE_DELAY_MS);
 
   const allowedIds = new Set(Object.keys(players.players));
-  /** @type {Map<string, number[]>} */
+  /** @type {Map<string, ([string, number][]|null)[]>} */
   const accumulated = new Map();
-  /** @type {number[]} */
-  const halfPprDiffs = [];
   let unfilteredWeeks = 0;
   let skippedUnknown = 0;
+  let weekEntries = 0;
 
   for (let week = 1; week <= SEASON_WEEKS; week += 1) {
     const { rows, filtered } = await fetchProjectionsWeek(season, week);
     if (!filtered) unfilteredWeeks += 1;
-    const result = accumulateProjectionWeek(accumulated, week, rows, scoring, { allowedIds });
+    const result = accumulateStatWeek(accumulated, week, rows, { allowedIds });
     skippedUnknown += result.skippedUnknown;
-    halfPprDiffs.push(...result.halfPprDiffs);
+    weekEntries += result.kept;
     if (week < SEASON_WEEKS) await sleep(POLITE_DELAY_MS);
   }
 
-  const projections = finalizeProjections(accumulated, { season, leagueId, generatedAt });
-  log(`projections: ${Object.keys(projections.players).length} players over ${SEASON_WEEKS} weeks`);
+  const projections = finalizeProjections(accumulated, { season, generatedAt });
+  log(
+    `projections: ${Object.keys(projections.players).length} players, ${projections.keys.length} stat keys, ` +
+      `${weekEntries} week entries over ${SEASON_WEEKS} weeks`,
+  );
 
   const teamNameIndex = buildTeamNameIndex(rawPlayers);
-  const rawPlayerCount = Object.keys(rawPlayers).length;
 
   return {
     players,
@@ -414,10 +512,11 @@ export async function collectSleeper(options) {
     schedule,
     teamNameIndex,
     stats: {
-      rawPlayerCount,
+      rawPlayerCount: Object.keys(rawPlayers).length,
       unfilteredWeeks,
       skippedUnknownProjectionRows: skippedUnknown,
-      medianHalfPprDiff: median(halfPprDiffs.map((d) => Math.abs(d))),
+      weekEntries,
+      statKeys: projections.keys.length,
       byes: orderedByKey(schedule.byes),
     },
   };

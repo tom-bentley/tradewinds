@@ -37,8 +37,6 @@ jobs:
 
       - name: Run pipeline
         run: node pipeline/refresh.mjs
-        env:
-          TRADEWINDS_LEAGUE_ID: "1394476745138147328"
 
       - name: Run tests
         run: node --test "test/*.test.mjs"

@@ -6,27 +6,42 @@
 
 import { readJsonIfExists } from "./util.mjs";
 
-/** Row-count sanity floors per source id (design.md §3). */
+/** Row-count sanity floors per source id (design.md §3, extended to the §10.2 variants). */
 export const ROW_FLOORS = Object.freeze({
-  fc_redraft: 150,
-  fc_dynasty: 300,
+  bc_tiers_half: 100,
+  bc_tiers_ppr: 100,
+  bc_tiers_std: 100,
   dp_dynasty: 300,
-  bc_tiers: 100,
+  dp_dynasty_2qb: 300,
+  fc_dynasty: 300,
+  fc_dynasty_2qb: 300,
+  fc_redraft: 150,
+  fc_redraft_2qb: 150,
 });
 
 /**
- * @typedef {{ label: string, kind: string, fetched_at: string, ok: boolean, count: number,
- *   url: string, values: Record<string, Record<string, number>>, error?: string }} ValueTable
+ * @typedef {{ label: string, kind: string, variant?: Record<string, number>, fetched_at: string,
+ *   ok: boolean, count: number, url: string,
+ *   values: Record<string, Record<string, number>>, error?: string }} ValueTable
  */
 
 /**
  * @param {string} file path to the existing data/values.json
+ * @param {{ keep?: Iterable<string>|null }} [options] when given, only these source ids are
+ *   considered — a table id the pipeline no longer publishes (e.g. the pre-§10.2 `bc_tiers`)
+ *   must not be carried forward forever.
  * @returns {Record<string, ValueTable>} previous source tables, {} when absent/unreadable
  */
-export function loadPreviousValueSources(file) {
+export function loadPreviousValueSources(file, options = {}) {
   const previous = readJsonIfExists(file);
   const sources = previous && typeof previous === "object" ? previous.sources : null;
-  return sources && typeof sources === "object" && !Array.isArray(sources) ? sources : {};
+  if (!sources || typeof sources !== "object" || Array.isArray(sources)) return {};
+  const keep = options.keep ? new Set(options.keep) : null;
+  if (!keep) return sources;
+  /** @type {Record<string, ValueTable>} */
+  const filtered = {};
+  for (const [id, table] of Object.entries(sources)) if (keep.has(id)) filtered[id] = table;
+  return filtered;
 }
 
 /**

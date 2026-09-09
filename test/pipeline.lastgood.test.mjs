@@ -3,7 +3,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { ROW_FLOORS, applyLastGood, resolveSource, rowCount } from "../pipeline/lastgood.mjs";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  ROW_FLOORS,
+  applyLastGood,
+  loadPreviousValueSources,
+  resolveSource,
+  rowCount,
+} from "../pipeline/lastgood.mjs";
 
 const PREVIOUS_FETCHED_AT = "2026-09-08T06:00:00Z";
 
@@ -18,6 +28,7 @@ function table(rows, overrides = {}) {
   return {
     label: "FantasyCalc redraft",
     kind: "redraft",
+    variant: { numQbs: 1 },
     fetched_at: PREVIOUS_FETCHED_AT,
     ok: true,
     count: rows,
@@ -27,8 +38,37 @@ function table(rows, overrides = {}) {
   };
 }
 
-test("row floors match the design contract", () => {
-  assert.deepEqual(ROW_FLOORS, { fc_redraft: 150, fc_dynasty: 300, dp_dynasty: 300, bc_tiers: 100 });
+test("row floors match the design contract, 2QB variants included", () => {
+  assert.deepEqual(ROW_FLOORS, {
+    bc_tiers_half: 100,
+    bc_tiers_ppr: 100,
+    bc_tiers_std: 100,
+    dp_dynasty: 300,
+    dp_dynasty_2qb: 300,
+    fc_dynasty: 300,
+    fc_dynasty_2qb: 300,
+    fc_redraft: 150,
+    fc_redraft_2qb: 150,
+  });
+});
+
+test("loadPreviousValueSources drops table ids the pipeline no longer publishes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tradewinds-lastgood-"));
+  const file = join(dir, "values.json");
+  writeFileSync(
+    file,
+    JSON.stringify({
+      generated_at: PREVIOUS_FETCHED_AT,
+      sources: { fc_redraft: table(200), bc_tiers: table(450, { kind: "tiers" }) },
+    }),
+    "utf8",
+  );
+
+  assert.deepEqual(Object.keys(loadPreviousValueSources(file)).sort(), ["bc_tiers", "fc_redraft"]);
+  assert.deepEqual(Object.keys(loadPreviousValueSources(file, { keep: ["fc_redraft", "bc_tiers_half"] })), [
+    "fc_redraft",
+  ]);
+  assert.deepEqual(loadPreviousValueSources(join(dir, "missing.json"), { keep: ["fc_redraft"] }), {});
 });
 
 test("rowCount ignores a table's self-reported count", () => {

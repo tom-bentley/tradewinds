@@ -1,4 +1,4 @@
-// Contract validators for the five files in data/ (design.md §3).
+// Contract validators for the five files in data/ (design.md §3, projections and values per §10).
 // Every validator returns an array of human-readable problems; empty means valid.
 // refresh.mjs warns on problems; the tests assert on them.
 
@@ -10,6 +10,9 @@ export const VALID_POSITIONS = new Set(["QB", "RB", "WR", "TE", "K", "DEF"]);
 
 /** Value-table kinds the engine knows how to blend. */
 export const VALID_VALUE_KINDS = new Set(["redraft", "dynasty", "tiers"]);
+
+/** Schema version data/projections.json must declare (design §10.1). */
+export const PROJECTIONS_VERSION = 2;
 
 /** Rows we expect at minimum before a file is worth publishing. */
 export const MIN_PLAYERS = 300;
@@ -93,7 +96,45 @@ export function validatePlayers(obj) {
 }
 
 /**
- * Validate data/projections.json.
+ * One v2 week entry: `0`, or a flat [keyIdx, value, keyIdx, value, ...] array.
+ * @param {string[]} problems
+ * @param {string} label
+ * @param {unknown} entry
+ * @param {number} keyCount
+ */
+function checkStatLine(problems, label, entry, keyCount) {
+  if (entry === 0) return;
+  if (!Array.isArray(entry)) {
+    problems.push(`${label} must be 0 or an array, got ${JSON.stringify(entry)}`);
+    return;
+  }
+  if (entry.length === 0 || entry.length % 2 !== 0) {
+    problems.push(`${label} must hold [keyIdx, value] pairs, got length ${entry.length}`);
+    return;
+  }
+  /** @type {Set<number>} */
+  const seen = new Set();
+  for (let i = 0; i < entry.length; i += 2) {
+    const index = entry[i];
+    if (!Number.isInteger(index) || index < 0 || index >= keyCount) {
+      problems.push(`${label}[${i}] is not a key index below ${keyCount}: ${JSON.stringify(index)}`);
+      return;
+    }
+    if (seen.has(index)) {
+      problems.push(`${label} repeats key index ${index}`);
+      return;
+    }
+    seen.add(index);
+    const value = entry[i + 1];
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      problems.push(`${label}[${i + 1}] is not a finite number: ${JSON.stringify(value)}`);
+      return;
+    }
+  }
+}
+
+/**
+ * Validate data/projections.json (v2 — raw stat lines, design §10.1).
  * @param {unknown} obj
  * @returns {string[]}
  */
@@ -103,31 +144,47 @@ export function validateProjections(obj) {
   if (!isPlainObject(obj)) return ["projections: not an object"];
   checkTimestamp(problems, obj.generated_at, "projections.generated_at");
   if (typeof obj.season !== "string") problems.push("projections.season must be a string");
-  if (typeof obj.scoring !== "string" || !obj.scoring.startsWith("league:")) {
-    problems.push(`projections.scoring must be "league:<id>", got ${JSON.stringify(obj.scoring)}`);
+  if (obj.version !== PROJECTIONS_VERSION) {
+    problems.push(`projections.version must be ${PROJECTIONS_VERSION}, got ${JSON.stringify(obj.version)}`);
   }
   if (!Array.isArray(obj.weeks) || obj.weeks.length !== EXPECTED_WEEKS) {
     problems.push(`projections.weeks must list ${EXPECTED_WEEKS} weeks`);
+  }
+  if (!Array.isArray(obj.keys) || obj.keys.length === 0) {
+    problems.push("projections.keys must be a non-empty array of stat names");
+    return problems;
+  }
+  /** @type {Set<string>} */
+  const seenKeys = new Set();
+  for (const [index, key] of obj.keys.entries()) {
+    if (typeof key !== "string" || key === "") {
+      problems.push(`projections.keys[${index}] is not a stat name: ${JSON.stringify(key)}`);
+    } else if (seenKeys.has(key)) {
+      problems.push(`projections.keys[${index}] repeats "${key}"`);
+    } else {
+      seenKeys.add(key);
+    }
   }
   if (!isPlainObject(obj.players)) {
     problems.push("projections.players: not an object");
     return problems;
   }
+  const keyCount = obj.keys.length;
   const entries = Object.entries(obj.players);
   if (entries.length < MIN_PROJECTION_PLAYERS) {
     problems.push(`projections: only ${entries.length} players (expected >= ${MIN_PROJECTION_PLAYERS})`);
   }
   for (const [id, weeks] of entries) {
     if (!Array.isArray(weeks) || weeks.length !== EXPECTED_WEEKS) {
-      problems.push(`projections.players["${id}"] must be ${EXPECTED_WEEKS} numbers`);
+      problems.push(`projections.players["${id}"] must be ${EXPECTED_WEEKS} week entries`);
       continue;
     }
-    if (weeks.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
-      problems.push(`projections.players["${id}"] contains a non-finite value`);
-      continue;
+    const before = problems.length;
+    for (const [index, entry] of weeks.entries()) {
+      checkStatLine(problems, `projections.players["${id}"][${index}]`, entry, keyCount);
     }
-    if (!weeks.some((value) => value !== 0)) {
-      problems.push(`projections.players["${id}"] is all zero`);
+    if (problems.length === before && !weeks.some((entry) => Array.isArray(entry) && entry.length > 0)) {
+      problems.push(`projections.players["${id}"] has no projected week`);
     }
   }
   return problems;
@@ -149,6 +206,17 @@ function checkValueTable(problems, id, table) {
   }
   if (typeof table.kind !== "string" || !VALID_VALUE_KINDS.has(table.kind)) {
     problems.push(`values.sources["${id}"].kind is ${JSON.stringify(table.kind)}`);
+  }
+  if (!isPlainObject(table.variant)) {
+    problems.push(`values.sources["${id}"].variant must be an object like {"numQbs":1} or {"ppr":0.5}`);
+  } else {
+    const fields = Object.entries(table.variant);
+    if (fields.length === 0) problems.push(`values.sources["${id}"].variant is empty`);
+    for (const [field, value] of fields) {
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        problems.push(`values.sources["${id}"].variant.${field} is not a finite number`);
+      }
+    }
   }
   checkTimestamp(problems, table.fetched_at, `values.sources["${id}"].fetched_at`);
   if (typeof table.ok !== "boolean") problems.push(`values.sources["${id}"].ok must be a boolean`);
@@ -250,7 +318,10 @@ export function validateMeta(obj) {
   checkTimestamp(problems, obj.generated_at, "meta.generated_at");
   if (typeof obj.season !== "string") problems.push("meta.season must be a string");
   if (typeof obj.week !== "number" || obj.week < 1) problems.push("meta.week must be a positive number");
-  if (typeof obj.league_id !== "string" || obj.league_id === "") problems.push("meta.league_id is empty");
+  // league_id is optional since design §10.6: the pipeline is league-agnostic.
+  if (obj.league_id !== undefined && (typeof obj.league_id !== "string" || obj.league_id === "")) {
+    problems.push("meta.league_id, when present, must be a non-empty string");
+  }
   if (typeof obj.pipeline_version !== "string") problems.push("meta.pipeline_version must be a string");
   if (!isPlainObject(obj.sources)) {
     problems.push("meta.sources: not an object");

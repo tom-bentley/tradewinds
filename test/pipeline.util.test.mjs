@@ -3,10 +3,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { gunzipSync, gzipSync } from "node:zlib";
+
 import {
+  PIPELINE_VERSION,
   compact,
   compareIds,
   csvRecords,
+  formatSize,
+  gzipBytes,
   normalizeName,
   numOrNull,
   orderedById,
@@ -14,6 +22,7 @@ import {
   parseCsv,
   round,
   withCacheBust,
+  writeJsonFile,
 } from "../pipeline/util.mjs";
 
 test("parseCsv handles plain rows", () => {
@@ -93,4 +102,32 @@ test("round trims to two decimals by default", () => {
 test("withCacheBust appends cb with the right separator", () => {
   assert.match(withCacheBust("https://x/y"), /^https:\/\/x\/y\?cb=\d+$/);
   assert.match(withCacheBust("https://x/y?a=1"), /^https:\/\/x\/y\?a=1&cb=\d+$/);
+});
+
+test("the pipeline version is the league-agnostic v2 schema", () => {
+  assert.match(PIPELINE_VERSION, /^2\./);
+});
+
+test("gzipBytes measures what GitHub Pages will actually transfer", () => {
+  const text = JSON.stringify({ players: Array.from({ length: 500 }, (_, i) => [i, i / 3]) });
+  const size = gzipBytes(text);
+  assert.ok(size > 0 && size < text.length, `gzip ${size} vs raw ${text.length}`);
+  assert.equal(gzipBytes(Buffer.from(text, "utf8")), size);
+});
+
+test("writeJsonFile reports raw and gzip size and writes parseable JSON with a trailing newline", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "tradewinds-util-")), "out.json");
+  const value = { a: 1, b: [1, 2, 3] };
+  const size = writeJsonFile(file, value);
+
+  const written = readFileSync(file, "utf8");
+  assert.equal(written, `${JSON.stringify(value)}\n`);
+  assert.equal(size.bytes, Buffer.byteLength(written, "utf8"));
+  assert.equal(size.gzip, gzipBytes(written));
+  assert.deepEqual(JSON.parse(written), value);
+  assert.equal(gunzipSync(gzipSync(Buffer.from(written, "utf8"))).toString("utf8"), written);
+});
+
+test("formatSize prints thousands separators and KB of gzip", () => {
+  assert.equal(formatSize({ bytes: 1135834, gzip: 103424 }), "1,135,834 B (101 KB gz)");
 });

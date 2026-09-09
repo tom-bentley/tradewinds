@@ -3,12 +3,13 @@
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
+import { gzipSync } from "node:zlib";
 
 /** Version stamped into data/meta.json. Bump when the output shape changes. */
-export const PIPELINE_VERSION = "1.0.0";
+export const PIPELINE_VERSION = "2.0.0";
 
 /** Identifies this cron to the public APIs we read. */
-export const USER_AGENT = "tradewinds-pipeline/1.0 (personal use)";
+export const USER_AGENT = "tradewinds-pipeline/2.0 (personal use)";
 
 /** Minimum gap between outbound requests, so a run never looks like a burst. */
 export const POLITE_DELAY_MS = 250;
@@ -22,7 +23,7 @@ export const FETCH_RETRIES = 2;
 /** Backoff between attempts is RETRY_BACKOFF_MS * attemptNumber. */
 export const RETRY_BACKOFF_MS = 750;
 
-/** Decimals kept on projected points — enough precision, small diffs. */
+/** Decimals kept on projected stat values — enough precision, small diffs. */
 export const POINTS_DECIMALS = 2;
 
 /** Name suffixes dropped before matching a name across sources. */
@@ -313,11 +314,29 @@ export function readJsonIfExists(file) {
  * Write compact JSON plus a trailing newline (git-friendly).
  * @param {string} file
  * @param {unknown} value
- * @returns {number} bytes written
+ * @returns {{ bytes: number, gzip: number }} raw and gzipped size of what was written
  */
 export function writeJsonFile(file, value) {
   const text = `${JSON.stringify(value)}\n`;
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, text, "utf8");
-  return Buffer.byteLength(text, "utf8");
+  return { bytes: Buffer.byteLength(text, "utf8"), gzip: gzipBytes(text) };
+}
+
+/**
+ * Transfer size of a payload once GitHub Pages gzips it.
+ * @param {string|Buffer} text
+ * @returns {number}
+ */
+export function gzipBytes(text) {
+  return gzipSync(typeof text === "string" ? Buffer.from(text, "utf8") : text, { level: 9 }).length;
+}
+
+/**
+ * Human-readable byte count: "1,135,834 B (101 KB gz)".
+ * @param {{ bytes: number, gzip: number }} size
+ * @returns {string}
+ */
+export function formatSize(size) {
+  return `${size.bytes.toLocaleString("en-US")} B (${Math.round(size.gzip / 1024).toLocaleString("en-US")} KB gz)`;
 }
