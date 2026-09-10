@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import {
+  ADVISOR_ITEM_LIMIT,
+  validateAdvisor,
   validateAll,
   validateMeta,
   validatePlayers,
@@ -52,6 +54,41 @@ test("validatePlayers catches a count mismatch, a bad position and a mis-named d
 test("validatePlayers rejects a non-object", () => {
   assert.deepEqual(validatePlayers(null), ["players: not an object"]);
   assert.deepEqual(validatePlayers([]), ["players: not an object"]);
+});
+
+test("validatePlayers accepts the v2.1 advisor fields and rejects the wrong types", () => {
+  /** @param {object} extra */
+  const check = (extra) =>
+    validatePlayers({
+      generated_at: "2026-09-09T12:00:00Z",
+      count: 2,
+      players: {
+        11604: {
+          id: "11604",
+          name: "Brock Bowers",
+          pos: "TE",
+          team: "LV",
+          inj: "Doubtful",
+          fp: ["TE"],
+          bye: 13,
+          ...extra,
+        },
+        KC: { id: "KC", name: "KC D/ST", pos: "DEF", team: "KC", inj: null, fp: ["DEF"], bye: 5 },
+      },
+    }).filter((problem) => problem.includes("11604"));
+
+  // present and well-typed
+  assert.deepEqual(check({ injPart: "Knee - Meniscus", injNotes: "Surgery", newsAt: 1788984945628 }), []);
+  // explicit nulls are the healthy case
+  assert.deepEqual(check({ injPart: null, injNotes: null, newsAt: null }), []);
+  // absent is fine: files written before design §12.3 simply do not carry them
+  assert.deepEqual(check({}), []);
+
+  const wrong = check({ injPart: 7, injNotes: ["surgery"], newsAt: "yesterday" });
+  assert.equal(wrong.length, 3);
+  assert.ok(wrong.some((p) => p.includes('players["11604"].injPart must be a string or null')));
+  assert.ok(wrong.some((p) => p.includes('players["11604"].injNotes must be a string or null')));
+  assert.ok(wrong.some((p) => p.includes('players["11604"].newsAt must be a number or null')));
 });
 
 /**
@@ -232,4 +269,76 @@ test("validateMeta accepts a league-agnostic meta object (design 10.6)", () => {
     }),
     [],
   );
+});
+
+// --- data/advisor.json (design 12.3) ---------------------------------------
+
+/**
+ * @param {object} [patch] merged into the one advisory
+ * @returns {object} a contract-valid advisor feed
+ */
+function advisorFeed(patch = {}) {
+  return {
+    v: 1,
+    generated_at: "2026-09-10T14:20:00Z",
+    leagues: {
+      // quoted: an unquoted 19-digit key would be rounded through Number and change identity
+      "1394476745138147328": {
+        week: 1,
+        items: [
+          {
+            key: "11604:Doubtful|Knee - Meniscus|Surgery",
+            id: "11604",
+            name: "Brock Bowers",
+            severity: "high",
+            headline: "Bowers -> Doubtful (knee - meniscus)",
+            summary: "Start Goedert at TE (8.8). IR opens when his status becomes Out.",
+            moves: [{ type: "start", text: "Start Dallas Goedert at TE" }],
+            at: "2026-09-10T14:20:00Z",
+            ...patch,
+          },
+        ],
+      },
+    },
+  };
+}
+
+test("validateAdvisor accepts the feed the alerts job writes", () => {
+  assert.deepEqual(validateAdvisor(advisorFeed()), []);
+  assert.deepEqual(
+    validateAdvisor({ v: 1, generated_at: "2026-09-10T14:20:00Z", leagues: {} }),
+    [],
+    "a run with nothing to say still writes a valid file",
+  );
+});
+
+test("validateAdvisor rejects a bad version, timestamp, severity and shape", () => {
+  assert.deepEqual(validateAdvisor(null), ["advisor: not an object"]);
+  assert.deepEqual(validateAdvisor([]), ["advisor: not an object"]);
+
+  const problems = validateAdvisor({ v: 2, generated_at: "yesterday", leagues: { L: { week: 1.5, items: {} } } });
+  assert.ok(problems.some((p) => p.includes("advisor.v must be 1")));
+  assert.ok(problems.some((p) => p.includes("advisor.generated_at")));
+  assert.ok(problems.some((p) => p.includes('advisor.leagues["L"].week must be an integer or null')));
+  assert.ok(problems.some((p) => p.includes('advisor.leagues["L"].items must be an array')));
+
+  const bad = validateAdvisor(advisorFeed({ severity: "urgent", headline: "", moves: "start Goedert", at: 17 }));
+  assert.ok(bad.some((p) => p.includes(".severity is \"urgent\"")));
+  assert.ok(bad.some((p) => p.includes(".headline is not a non-empty string")));
+  assert.ok(bad.some((p) => p.includes(".moves must be an array")));
+  assert.ok(bad.some((p) => p.includes(".at: expected an ISO timestamp")));
+});
+
+test("validateAdvisor bounds a league to 30 items and refuses a repeated key", () => {
+  const feed = advisorFeed();
+  const [item] = feed.leagues["1394476745138147328"].items;
+  feed.leagues["1394476745138147328"].items = Array.from({ length: ADVISOR_ITEM_LIMIT + 1 }, (_, index) => ({
+    ...item,
+    key: `${item.key}#${index}`,
+  }));
+  assert.ok(validateAdvisor(feed).some((p) => p.includes(`bounded to ${ADVISOR_ITEM_LIMIT}`)));
+
+  const dupes = advisorFeed();
+  dupes.leagues["1394476745138147328"].items.push({ ...item });
+  assert.ok(validateAdvisor(dupes).some((p) => p.includes("repeats key")));
 });

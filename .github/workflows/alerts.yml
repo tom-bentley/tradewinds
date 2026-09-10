@@ -1,27 +1,45 @@
 name: Alerts
 
-# Sends the iOS Web Push notifications for new trades, new deals and free agents worth a drop
-# (design §11.3). There is no server, so this job IS the push sender: it signs with VAPID and
-# encrypts the payload through web-push, installed at run time so the repo stays dependency-free.
+# Sends the iOS Web Push notifications: advice on my players' injury news first (design §12), then
+# new trades, new deals and free agents worth a drop (§11.3). There is no server, so this job IS
+# the push sender: it signs with VAPID and encrypts the payload through web-push, installed at run
+# time so the repo stays dependency-free.
 #
-# Notes (see specs/003 design §11.1):
+# Notes (see specs/003 design §11.1, §12.1):
 # - PUSH_SUBSCRIPTIONS is a repository secret holding a JSON array of pairing payloads. Tom copies
 #   the code out of the installed PWA and pastes it in by hand — no server, nothing sensitive in
 #   the public repo. No secret => the job prints "nothing paired" and exits 0.
 # - VAPID_PUBLIC_KEY is safe to embed (it is also in src/config.js); VAPID_PRIVATE_KEY is a secret.
-# - Every 30 min. GitHub's cron floor is 5 min and peak-hour runs are routinely 5-30 min late, so
-#   treat delivery as "within the hour", not "on the half hour".
+# - GitHub's `schedule` is a lottery, not a clock. Measured gaps for this repo on 2026-09-09/10:
+#   2-5 h between runs of a `*/30` cron (120-309 min), and 4-6.5 h for `23 */3`. The cron below is
+#   `4-59/10` (every 10 min, off the top of the hour where every repo on GitHub queues up) purely
+#   to buy more tickets. Injury news does not wait, so ANY external pinger can fire the job too:
+#     gh workflow run alerts.yml
+#     curl -X POST -H "Accept: application/vnd.github+json" \
+#          -H "Authorization: Bearer <PAT>" \
+#          https://api.github.com/repos/tom-bentley/tradewinds/dispatches \
+#          -d '{"event_type":"alerts"}'
+#   The PAT is fine-grained on this repo only, with Contents: read and Actions: write. Task
+#   Scheduler on Tom's PC runs that curl every 10 minutes while the machine is awake.
+# - The app recomputes the same advice on open, so a late push never means a wrong decision.
 # - refresh-data.yml commits the same repo, so both workflows pull --rebase before pushing.
 # - A 410/404 from a push service marks the device expired in data/alerts-state.json; the secret
 #   itself has to be edited by hand.
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "4-59/10 * * * *"
+  repository_dispatch:
+    types: [alerts]
   workflow_dispatch:
     inputs:
       test:
         description: "Send one test push per paired device and exit without touching state"
+        type: boolean
+        required: false
+        default: false
+      full:
+        description: "Also push advice for the roster's current standing issues (skips first-run seeding)"
         type: boolean
         required: false
         default: false
@@ -51,7 +69,7 @@ jobs:
           node-version: 22
 
       # The only dependency this repo has, and it is never committed: --no-save leaves
-      # package.json and the lockfile untouched, so `git add data/alerts-state.json` stays clean.
+      # package.json and the lockfile untouched, so `git add data/*.json` stays clean.
       - name: Install web-push
         run: npm i --no-save web-push@3.6.7
 
@@ -61,12 +79,17 @@ jobs:
           PUSH_SUBSCRIPTIONS: ${{ secrets.PUSH_SUBSCRIPTIONS }}
           VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
           ALERT_TEST: ${{ inputs.test && '1' || '' }}
+          ALERT_FULL: ${{ inputs.full && '1' || '' }}
 
       - name: Commit alerts state if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/alerts-state.json
+          # data/advisor.json only appears once a run has advice to publish, and `git add` on a
+          # path that does not exist yet fails the step — so add whichever of the two is there.
+          for file in data/alerts-state.json data/advisor.json; do
+            if [ -f "$file" ]; then git add "$file"; fi
+          done
           if git diff --cached --quiet; then
             echo "No alert state changes."
           else

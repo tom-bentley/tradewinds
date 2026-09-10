@@ -93,6 +93,9 @@ test("buildPlayers maps the contract fields, including bye and injury", () => {
     pos: "RB",
     team: "DET",
     inj: null,
+    injPart: null,
+    injNotes: null,
+    newsAt: rawPlayers["9221"].news_updated,
     age: rawPlayers["9221"].age,
     exp: rawPlayers["9221"].years_exp,
     num: rawPlayers["9221"].number,
@@ -103,6 +106,70 @@ test("buildPlayers maps the contract fields, including bye and injury", () => {
   assert.equal(players.players["12529"].inj, "Out");
 });
 
+test("buildPlayers carries the v2.1 injury detail the advisor needs (design §12.3)", () => {
+  // "Out" alone cannot say how long; "Ankle" is what picks a row out of the duration table.
+  const henderson = players.players["12529"];
+  assert.equal(henderson.injPart, "Ankle");
+  assert.equal(henderson.injNotes, null);
+  assert.equal(henderson.newsAt, rawPlayers["12529"].news_updated);
+  assert.equal(typeof henderson.newsAt, "number");
+
+  // Empty strings are as common as nulls in the dump, and "" is not a body part.
+  const built = buildPlayers(
+    {
+      9999: {
+        player_id: "9999",
+        position: "WR",
+        active: true,
+        team: "DET",
+        full_name: "Blank Fields",
+        injury_status: "",
+        injury_body_part: "   ",
+        injury_notes: "",
+        news_updated: null,
+      },
+    },
+    byes,
+    { generatedAt: GENERATED_AT },
+  );
+  assert.deepEqual(
+    { ...built.players["9999"] },
+    {
+      id: "9999",
+      name: "Blank Fields",
+      pos: "WR",
+      team: "DET",
+      inj: null,
+      injPart: null,
+      injNotes: null,
+      newsAt: null,
+      age: null,
+      exp: null,
+      num: null,
+      dc: null,
+      fp: [],
+      bye: 6,
+    },
+  );
+  // key order is fixed, so a rerun on identical input is byte-identical
+  assert.deepEqual(Object.keys(built.players["9999"]), [
+    "id",
+    "name",
+    "pos",
+    "team",
+    "inj",
+    "injPart",
+    "injNotes",
+    "newsAt",
+    "age",
+    "exp",
+    "num",
+    "dc",
+    "fp",
+    "bye",
+  ]);
+});
+
 test("buildPlayers names team defenses <TEAM> D/ST with null bio fields", () => {
   assert.deepEqual(players.players.KC, {
     id: "KC",
@@ -110,6 +177,9 @@ test("buildPlayers names team defenses <TEAM> D/ST with null bio fields", () => 
     pos: "DEF",
     team: "KC",
     inj: null,
+    injPart: null,
+    injNotes: null,
+    newsAt: null,
     age: null,
     exp: null,
     num: null,

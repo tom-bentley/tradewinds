@@ -65,10 +65,25 @@ export const MIN_FILTERED_PROJECTION_ROWS = 1500;
 const BYE_WEEK_RANGE = [4, 15];
 
 /**
+ * players.json v2.1 (design §12.3). `injPart`/`injNotes`/`newsAt` were added for the advisor:
+ * "Doubtful" alone cannot say how long a player is out, but "Knee - Meniscus" + "Surgery" can,
+ * and `newsAt` is what the phone shows as "news 3 h ago". Additive — older files simply omit them.
  * @typedef {{ id: string, name: string, pos: string, team: string, inj: string|null,
+ *   injPart: string|null, injNotes: string|null, newsAt: number|null,
  *   age: number|null, exp: number|null, num: number|null, dc: number|null,
  *   fp: string[], bye: number|null }} ContractPlayer
  */
+
+/**
+ * A non-empty trimmed string, or null. Sleeper writes "" as often as it writes null.
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+export function textOrNull(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
 
 /** @returns {Promise<Record<string, any>>} */
 export async function fetchState() {
@@ -379,8 +394,9 @@ export function playerDisplayName(raw, teamCode) {
 }
 
 /**
- * data/players.json: the six fantasy positions, active and on a team.
+ * data/players.json (v2.1): the six fantasy positions, active and on a team.
  * Team defenses are always kept — their id is the team code.
+ * Key order is fixed here, not sorted, so a rerun on identical input is byte-identical.
  * @param {Record<string, any>} rawPlayers
  * @param {Record<string, number>} byes
  * @param {{ generatedAt: string }} meta
@@ -400,7 +416,10 @@ export function buildPlayers(rawPlayers, byes, meta) {
       name: playerDisplayName(raw, team),
       pos: raw.position,
       team,
-      inj: typeof raw.injury_status === "string" && raw.injury_status !== "" ? raw.injury_status : null,
+      inj: textOrNull(raw.injury_status),
+      injPart: textOrNull(raw.injury_body_part),
+      injNotes: textOrNull(raw.injury_notes),
+      newsAt: numOrNull(raw.news_updated),
       age: numOrNull(raw.age),
       exp: numOrNull(raw.years_exp),
       num: numOrNull(raw.number),

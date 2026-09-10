@@ -80,6 +80,15 @@ export function validatePlayers(obj) {
     if (player.inj !== null && typeof player.inj !== "string") {
       problems.push(`players["${id}"].inj must be a string or null`);
     }
+    // v2.1 (design §12.3): additive, so a file written before the advisor simply omits them.
+    for (const field of ["injPart", "injNotes"]) {
+      if (player[field] !== undefined && player[field] !== null && typeof player[field] !== "string") {
+        problems.push(`players["${id}"].${field} must be a string or null`);
+      }
+    }
+    if (player.newsAt !== undefined && player.newsAt !== null && !Number.isFinite(player.newsAt)) {
+      problems.push(`players["${id}"].newsAt must be a number or null`);
+    }
     if (player.bye !== null && typeof player.bye !== "number") {
       problems.push(`players["${id}"].bye must be a number or null`);
     }
@@ -388,6 +397,31 @@ function checkKeyList(problems, label, value) {
 }
 
 /**
+ * `leagues[id].status`: the per-player StatusKey snapshot the advisor diffs against (design §12.3).
+ * Absent is legal — a state file written before the advisor simply has not seeded one yet.
+ * @param {string[]} problems
+ * @param {string} label
+ * @param {unknown} value
+ */
+function checkStatusMap(problems, label, value) {
+  if (value === undefined) return;
+  if (!isPlainObject(value)) {
+    problems.push(`${label} must be an object`);
+    return;
+  }
+  for (const [id, key] of Object.entries(value)) {
+    if (id === "") {
+      problems.push(`${label} has an empty player id`);
+      return;
+    }
+    if (typeof key !== "string") {
+      problems.push(`${label}["${id}"] is not a status key string`);
+      return;
+    }
+  }
+}
+
+/**
  * Validate data/alerts-state.json (design §11.3). The alerts job rewrites the file from scratch,
  * so anything that fails here is treated as "start over" rather than a hard error.
  * @param {unknown} obj
@@ -413,6 +447,10 @@ export function validateAlertsState(obj) {
       if (entry.week !== null && (typeof entry.week !== "number" || !Number.isInteger(entry.week))) {
         problems.push(`${label}.week must be an integer or null`);
       }
+      checkStatusMap(problems, `${label}.status`, entry.status);
+      if (entry.statusAt !== null && entry.statusAt !== undefined) {
+        checkTimestamp(problems, entry.statusAt, `${label}.statusAt`);
+      }
     }
   }
   if (!isPlainObject(obj.devices)) {
@@ -427,11 +465,83 @@ export function validateAlertsState(obj) {
     }
     checkKeyList(problems, `${label}.seenDeals`, entry.seenDeals);
     checkKeyList(problems, `${label}.seenFa`, entry.seenFa);
+    if (entry.seenAdvice !== undefined) checkKeyList(problems, `${label}.seenAdvice`, entry.seenAdvice);
     if (entry.lastNotifiedAt !== null && entry.lastNotifiedAt !== undefined) {
       checkTimestamp(problems, entry.lastNotifiedAt, `${label}.lastNotifiedAt`);
     }
     if (entry.expired !== undefined && entry.expired !== true) {
       problems.push(`${label}.expired, when present, must be true`);
+    }
+  }
+  return problems;
+}
+
+/** Schema version data/advisor.json must declare (design §12.3). */
+export const ADVISOR_VERSION = 1;
+
+/** Advisories kept per league in the feed file — the app renders "recent news", not an archive. */
+export const ADVISOR_ITEM_LIMIT = 30;
+
+/** Severity ladder the advisor emits (design §12.2 step 8). */
+export const ADVISOR_SEVERITIES = new Set(["high", "med", "low"]);
+
+/**
+ * Validate data/advisor.json (design §12.3) — the feed the Advisor tab renders when the phone has
+ * not recomputed anything itself. Only the fields the app reads are enforced: the engine may add
+ * to an Advisory at any time, and an over-strict validator here would fail the job for it.
+ * @param {unknown} obj
+ * @returns {string[]} problems, empty when valid
+ */
+export function validateAdvisor(obj) {
+  /** @type {string[]} */
+  const problems = [];
+  if (!isPlainObject(obj)) return ["advisor: not an object"];
+  if (obj.v !== ADVISOR_VERSION) {
+    problems.push(`advisor.v must be ${ADVISOR_VERSION}, got ${JSON.stringify(obj.v)}`);
+  }
+  checkTimestamp(problems, obj.generated_at, "advisor.generated_at");
+  if (!isPlainObject(obj.leagues)) {
+    problems.push("advisor.leagues: not an object");
+    return problems;
+  }
+  for (const [leagueId, entry] of Object.entries(obj.leagues)) {
+    const label = `advisor.leagues["${leagueId}"]`;
+    if (!isPlainObject(entry)) {
+      problems.push(`${label}: not an object`);
+      continue;
+    }
+    if (entry.week !== null && (typeof entry.week !== "number" || !Number.isInteger(entry.week))) {
+      problems.push(`${label}.week must be an integer or null`);
+    }
+    if (!Array.isArray(entry.items)) {
+      problems.push(`${label}.items must be an array`);
+      continue;
+    }
+    if (entry.items.length > ADVISOR_ITEM_LIMIT) {
+      problems.push(`${label}.items holds ${entry.items.length} advisories (bounded to ${ADVISOR_ITEM_LIMIT})`);
+    }
+    /** @type {Set<string>} */
+    const keys = new Set();
+    for (const [index, item] of entry.items.entries()) {
+      const itemLabel = `${label}.items[${index}]`;
+      if (!isPlainObject(item)) {
+        problems.push(`${itemLabel}: not an object`);
+        continue;
+      }
+      for (const field of ["key", "id", "name", "headline", "summary"]) {
+        if (typeof item[field] !== "string" || item[field] === "") {
+          problems.push(`${itemLabel}.${field} is not a non-empty string`);
+        }
+      }
+      if (typeof item.severity !== "string" || !ADVISOR_SEVERITIES.has(item.severity)) {
+        problems.push(`${itemLabel}.severity is ${JSON.stringify(item.severity)}`);
+      }
+      if (!Array.isArray(item.moves)) problems.push(`${itemLabel}.moves must be an array`);
+      checkTimestamp(problems, item.at, `${itemLabel}.at`);
+      if (typeof item.key === "string" && item.key !== "") {
+        if (keys.has(item.key)) problems.push(`${label}.items repeats key ${JSON.stringify(item.key)}`);
+        keys.add(item.key);
+      }
     }
   }
   return problems;
