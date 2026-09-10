@@ -996,6 +996,25 @@ export function emptyAdvisor() {
  * @param {{ at: string }} meta
  * @returns {{ v: number, generated_at: string, leagues: Record<string, any> }}
  */
+/**
+ * Does a re-advised item still say what the stored one says? Compared on the words a reader sees
+ * (headline, summary, severity, move texts and timing) — not on the floating-point details behind
+ * them, which drift with every projections refresh without changing the advice.
+ * @param {object} stored
+ * @param {object} fresh
+ * @returns {boolean}
+ */
+export function sameAdvice(stored, fresh) {
+  const words = (item) =>
+    JSON.stringify([
+      item.headline ?? null,
+      item.summary ?? null,
+      item.severity ?? null,
+      (Array.isArray(item.moves) ? item.moves : []).map((m) => [m.type ?? null, m.text ?? null, m.when ?? null]),
+    ]);
+  return words(stored) === words(fresh);
+}
+
 export function mergeAdvisor(previous, updates, meta) {
   const source =
     previous && typeof previous === "object" && previous.leagues && typeof previous.leagues === "object"
@@ -1013,6 +1032,11 @@ export function mergeAdvisor(previous, updates, meta) {
     }
     for (const advisory of (fresh && fresh.items) || []) {
       if (!advisory || typeof advisory.key !== "string" || advisory.key === "") continue;
+      // A standing issue is re-advised on every run. If the advice still SAYS the same thing, the
+      // stored item (and its original `at`) stands — otherwise the feed would be rewritten, and
+      // committed, every ten minutes for news that has not changed. Fresh text replaces it.
+      const stored = byKey.get(advisory.key);
+      if (stored && sameAdvice(stored, advisory)) continue;
       byKey.set(advisory.key, { ...advisory, at: meta.at });
     }
     const items = [...byKey.values()]

@@ -705,9 +705,19 @@ test("mergeAdvisor merges every device in a league, newest first, bounded at 30"
   const second = mergeAdvisor(first, { L: { week: 1, items: [item("3:c")] } }, { at: "2026-09-10T14:10:00Z" });
   assert.deepEqual(second.leagues.L.items.map((i) => i.key), ["3:c", "1:a", "2:b"], "newest first");
 
-  // an advisory that is still open takes this run's timestamp and moves back to the top
-  const third = mergeAdvisor(second, { L: { week: 1, items: [item("1:a")] } }, { at: "2026-09-10T14:20:00Z" });
+  // an advisory that is still open and still SAYS the same thing keeps its place and its timestamp:
+  // a standing issue is re-advised every run, and re-stamping it would rewrite (and commit) the
+  // feed every ten minutes for news that has not changed
+  const same = mergeAdvisor(second, { L: { week: 1, items: [item("1:a")] } }, { at: "2026-09-10T14:20:00Z" });
+  assert.deepEqual(same.leagues.L.items.map((i) => i.key), ["3:c", "1:a", "2:b"], "unchanged advice stays put");
+  assert.equal(same.leagues.L.items.find((i) => i.key === "1:a").at, "2026-09-10T14:00:00Z");
+  assert.deepEqual(same.leagues, second.leagues, "a fixed point for the committed file");
+
+  // ...but advice whose words changed takes this run's timestamp and moves back to the top
+  const changed = { ...item("1:a"), summary: "IR now — 2 slots free." };
+  const third = mergeAdvisor(second, { L: { week: 1, items: [changed] } }, { at: "2026-09-10T14:20:00Z" });
   assert.deepEqual(third.leagues.L.items.map((i) => i.key), ["1:a", "3:c", "2:b"]);
+  assert.equal(third.leagues.L.items[0].at, "2026-09-10T14:20:00Z");
   assert.equal(third.leagues.L.items.length, 3, "deduped on key");
 
   // a league with nothing new this run keeps what it had
