@@ -288,6 +288,10 @@ test("enableAlerts: prefs and label override the defaults, viewer mode keeps nul
   );
 
   assert.deepEqual(pairing.prefs, {
+    // v1.3 (design §12.5) added `advice` and `rivalNews` to the payload; the schema is additive,
+    // so PAIRING_VERSION stays 1 and a device paired before them keeps working.
+    advice: true,
+    rivalNews: false,
     trades: true,
     deals: true,
     freeAgents: false,

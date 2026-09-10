@@ -143,9 +143,14 @@ async function loadLive() {
   let sleeper = null;
   try { sleeper = await import("../sleeper.js"); } catch { /* optional */ }
 
-  // §11.2 / §11.4 — shipped by B2 and B4 in parallel. Absent modules fall through to the
-  // stand-ins in `decorate()`; every real export takes precedence the moment it exists.
-  const [waiver, push] = await Promise.all([optional("../engine/waiver.js"), optional("../push.js")]);
+  // §11.2 / §11.4 / §12.2 — shipped by other agents in parallel. Absent modules fall through to
+  // the stand-ins in `decorate()`; every real export takes precedence the moment it exists.
+  const [waiver, push, advisor, injuries] = await Promise.all([
+    optional("../engine/waiver.js"),
+    optional("../push.js"),
+    optional("../engine/advisor.js"),
+    optional("../engine/injuries.js"),
+  ]);
 
   return {
     mode: "live",
@@ -172,6 +177,29 @@ async function loadLive() {
     getTransactionsWithNew: mods.data.getTransactionsWithNew || null,
     markTradesSeen: mods.data.markTradesSeen || null,
     attachTransactions: mods.data.attachTransactions || null,
+
+    // ---- src/engine/advisor.js + injuries.js (§12.2) -----------------------------------
+    // The decision layer. Until those two modules land the app still boots: `decorate()` fills
+    // every one of these with a stand-in that answers "nothing to advise" rather than throwing.
+    advise: (advisor && advisor.advise) || null,
+    adviseAll: (advisor && advisor.adviseAll) || null,
+    standingIssues: (advisor && advisor.standingIssues) || null,
+    diffStatuses: (advisor && advisor.diffStatuses) || null,
+    statusKey: (advisor && advisor.statusKey) || mods.data.statusKeyOf || null,
+    irEligibility: (advisor && advisor.irEligibility) || null,
+    // applyStatuses is the one the data layer cannot do without, so data.js carries the same
+    // contract locally (`applyStatusesLocal`) and hands it over until the engine ships.
+    applyStatuses: (advisor && advisor.applyStatuses) || mods.data.applyStatusesLocal || null,
+    applyWeekPoints: (advisor && advisor.applyWeekPoints) || null,
+    absenceOf: (injuries && injuries.absenceOf) || (advisor && advisor.absenceOf) || null,
+    availability: (injuries && injuries.availability) || null,
+
+    // ---- src/data.js live statuses + the advice ledger (§12.4) --------------------------
+    refreshStatuses: mods.data.refreshStatuses || null,
+    storedStatuses: mods.data.storedStatuses || null,
+    markAdviceSeen: mods.data.markAdviceSeen || null,
+    unseenAdviceKeys: mods.data.unseenAdviceKeys || null,
+    loadAdvisorFeed: mods.data.loadAdvisorFeed || null,
 
     // ---- src/data.js ------------------------------------------------------------------
     loadSettings: mods.data.loadSettings,
@@ -224,7 +252,8 @@ const VAPID_PUBLIC_KEY_FALLBACK =
 export const PUSH_KEY = "tradewinds.push.v1";
 const SEEN_TRADES_KEY = (leagueId) => "tradewinds.seenTrades." + leagueId;
 export const DEFAULT_PREFS = Object.freeze({
-  trades: true, deals: true, freeAgents: true, minDealScore: 2, minFaGain: 1,
+  trades: true, deals: true, freeAgents: true, advice: true, rivalNews: false,
+  minDealScore: 2, minFaGain: 1,
 });
 
 const vapidKey = () => CONFIG.VAPID_PUBLIC_KEY || VAPID_PUBLIC_KEY_FALLBACK;
@@ -489,6 +518,60 @@ export function gradeTransactionLocal(api, ctx, txn) {
   return { rosterId, add, drop, gainPerWeek };
 }
 
+/* ---------------------------------------------------------------- advisor (§12.2/§12.4) */
+
+/** The engine's StatusKey, restated here so the diff works before advisor.js ships. */
+export function statusKeyLocal(row) {
+  return `${row?.inj ?? ""}|${row?.injPart ?? ""}|${row?.injNotes ?? ""}`;
+}
+
+/**
+ * §12.2 `diffStatuses` stand-in over two `Record<id, StatusKey>` snapshots. An id missing from
+ * `prev` is a FIRST SIGHTING, not an event — otherwise a new device would alert on every
+ * injured player in the league the moment it was installed.
+ */
+export function diffStatusesLocal(prev, next) {
+  const before = prev && typeof prev === "object" ? prev : null;
+  if (!before) return [];
+  const out = [];
+  for (const [id, key] of Object.entries(next || {})) {
+    const was = before[id];
+    if (was === undefined || was === key) continue;
+    out.push({ id, kind: "status", before: parseStatusKey(was), after: parseStatusKey(key) });
+  }
+  return out;
+}
+
+/** StatusKey → `{ inj, injPart, injNotes }`, the shape `advise()` reads. */
+function parseStatusKey(key) {
+  const [inj = "", injPart = "", injNotes = ""] = String(key ?? "").split("|");
+  return { inj: inj || null, injPart: injPart || null, injNotes: injNotes || null };
+}
+
+const SEEN_ADVICE_KEY = (leagueId) => "tradewinds.seenAdvice." + leagueId;
+
+function readSeenAdvice(leagueId) {
+  try { return new Set(JSON.parse(localStorage.getItem(SEEN_ADVICE_KEY(leagueId)) || "[]")); }
+  catch { return new Set(); }
+}
+
+/** localStorage twin of data.js's IDB ledger — demo mode has no IndexedDB drawer of its own. */
+export function markAdviceSeenLocal(leagueId, keys = []) {
+  if (!leagueId) return [];
+  const seen = readSeenAdvice(leagueId);
+  for (const key of Array.isArray(keys) ? keys : [keys]) if (key) seen.add(String(key));
+  const merged = [...seen].slice(-200);
+  try { localStorage.setItem(SEEN_ADVICE_KEY(leagueId), JSON.stringify(merged)); } catch { /* private mode */ }
+  return merged;
+}
+
+export function unseenAdviceKeysLocal(leagueId, keys = []) {
+  if (!leagueId) return [];
+  const seen = readSeenAdvice(leagueId);
+  return [...new Set((Array.isArray(keys) ? keys : [keys]).filter(Boolean).map(String))]
+    .filter((key) => !seen.has(key));
+}
+
 /* ---------------------------------------------------------------- push (§11.4) */
 
 const isIOS = () =>
@@ -647,6 +730,21 @@ export function decorate(api) {
     return normalizeTxnResult(raw, ctx);
   };
   if (!has("markTradesSeen")) api.markTradesSeen = (leagueId, ids) => markTradesSeenLocal(leagueId, ids);
+
+  // §12.2 — the advisor engine. Every stand-in answers "nothing to advise": a build without
+  // src/engine/advisor.js shows an empty Advisor tab, which is honest, instead of a crash screen.
+  if (!has("applyStatuses")) api.applyStatuses = (ctx) => (ctx ? { ...ctx, memo: {} } : ctx);
+  if (!has("statusKey")) api.statusKey = statusKeyLocal;
+  if (!has("diffStatuses")) api.diffStatuses = diffStatusesLocal;
+  if (!has("standingIssues")) api.standingIssues = () => [];
+  if (!has("adviseAll")) api.adviseAll = () => [];
+  if (!has("advise")) api.advise = () => null;
+  if (!has("absenceOf")) api.absenceOf = () => null;
+  if (!has("refreshStatuses")) {
+    api.refreshStatuses = async (ctx) => ({ ctx, rows: [], failed: [], at: null, prev: null, next: {} });
+  }
+  if (!has("markAdviceSeen")) api.markAdviceSeen = markAdviceSeenLocal;
+  if (!has("unseenAdviceKeys")) api.unseenAdviceKeys = unseenAdviceKeysLocal;
 
   if (!has("alertsSupported")) api.alertsSupported = alertsSupportedLocal;
   if (!has("alertsStatus")) api.alertsStatus = alertsStatusLocal;

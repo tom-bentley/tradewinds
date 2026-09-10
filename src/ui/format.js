@@ -275,3 +275,151 @@ export function alertsStatusText(status) {
   const d = new Date(t);
   return `On · paired ${d.getMonth() + 1}/${d.getDate()}`;
 }
+
+/* ---------------------------------------------------------------- advisor (design §12.5) */
+
+/** How much of a branch's probability mass counts as "likely" in the absence phrase. */
+const LIKELY_MASS = 0.6;
+
+/** A branch at 99 games is the engine's "season over" marker, not a real game count. */
+const SEASON_GAMES = 99;
+
+const games = (n) => (n === 1 ? "1 game" : `${n} games`);
+
+/**
+ * Turn an engine `Absence` into the one line a manager actually needs: how many games this
+ * probably costs, and how bad the tail is. The branches are a distribution, so the phrase names
+ * the shortest run of outcomes carrying 60 % of the mass and then, separately, the worst case —
+ * "likely 1–2 games" and "could be 6+" are two different decisions and must not be averaged.
+ * @param {{branches?: Array<{games: number, p: number}>, mean?: number, seasonOver?: boolean}} absence
+ * @returns {string} "" when there is nothing to say
+ */
+export function absencePhrase(absence) {
+  const branches = (Array.isArray(absence?.branches) ? absence.branches : [])
+    .filter((b) => b && Number.isFinite(Number(b.games)) && Number.isFinite(Number(b.p)))
+    .map((b) => ({ games: Number(b.games), p: Number(b.p) }))
+    .sort((a, b) => a.games - b.games);
+  if (absence?.seasonOver) return "Out for the season";
+  if (!branches.length) return "";
+
+  const zero = branches.find((b) => b.games === 0);
+  if (zero && zero.p >= LIKELY_MASS) return "Probable to play";
+  if (branches.length === 1 && branches[0].games === 0) return "Probable to play";
+  if (branches[0].games >= SEASON_GAMES) return "Out for the season";
+
+  // Shortest contiguous run of outcomes that carries the likely mass.
+  let best = null;
+  for (let i = 0; i < branches.length; i += 1) {
+    let sum = 0;
+    for (let j = i; j < branches.length; j += 1) {
+      sum += branches[j].p;
+      if (sum >= LIKELY_MASS - 1e-9) {
+        if (!best || j - i < best.j - best.i) best = { i, j };
+        break;
+      }
+    }
+  }
+  const lo = branches[best ? best.i : 0].games;
+  const hi = branches[best ? best.j : branches.length - 1].games;
+  const worst = branches[branches.length - 1].games;
+
+  const core = lo === hi ? `Likely ${games(lo)}` : `Likely ${lo}–${hi} games`;
+  if (worst <= hi) return core;
+  return worst >= SEASON_GAMES ? `${core}, could be the season` : `${core}, tail to ${worst}+`;
+}
+
+/**
+ * The chip on a move that says WHEN it can be made. The engine writes `when` as prose ("when
+ * status = Out", "after waivers clear Wed"); the chip is narrow, so it keeps the fact and drops
+ * the grammar. An IR move that is not available yet is the whole reason this chip exists.
+ * @param {{when?: string|null, clearsAt?: string|number|null, status?: string}} move
+ * @param {number} [now]
+ * @returns {string}
+ */
+export function whenChipText(move = {}, now = Date.now()) {
+  const raw = String(move.when ?? "").trim();
+  if (!raw) {
+    if (move.status === "waivers") {
+      const clears = fmtClears(move.clearsAt, now);
+      return clears ? `after waivers ${clears}` : "after waivers";
+    }
+    return "now";
+  }
+  if (/^now$/i.test(raw)) return "now";
+  const status = raw.match(/^when\s+(?:his|her|their|the|its)?\s*status\s*(?:=|is|becomes|turns)\s*(.+)$/i);
+  if (status) return `when ${status[1].trim().replace(/[.!]$/, "")}`;
+  if (/^after\s+waivers/i.test(raw)) {
+    const clears = fmtClears(move.clearsAt, now);
+    if (clears) return `after waivers ${clears}`;
+    // "after waivers clear Wednesday" and "after waivers Wednesday" are the same chip.
+    return clip(raw.replace(/^after\s+waivers\s+clears?\s*/i, "after waivers ").trim(), 26);
+  }
+  return clip(raw, 26);
+}
+
+/**
+ * The meta line under an advisory headline: "Doubtful · Knee - Meniscus · Surgery · news 3h ago".
+ * Every part is optional — a bye-week advisory has no status at all — and an empty part is
+ * dropped rather than printed as a hanging separator.
+ * @param {{after?: object, inj?: string|null, injPart?: string|null, injNotes?: string|null,
+ *          newsAt?: number|string|null}} advisory
+ * @param {number} [now]
+ * @returns {string}
+ */
+export function statusMetaLine(advisory = {}, now = Date.now()) {
+  const s = advisory.after && typeof advisory.after === "object" ? advisory.after : advisory;
+  const bits = [];
+  const push = (value, max) => {
+    const text = String(value ?? "").trim();
+    if (text) bits.push(max ? clip(text, max) : text);
+  };
+  push(s.inj);
+  push(s.injPart, 28);
+  push(s.injNotes, 64);
+  const news = advisory.newsAt ?? s.newsAt;
+  if (toMs(news) !== null) bits.push("news " + relTime(news, now));
+  return bits.join(" · ");
+}
+
+/**
+ * The this-week line: "TE: Goedert 8.8 replaces Bowers · lineup −4.3".
+ * @param {{slot?: string, replacement?: {name?: string, pts?: number}|null, lineupDelta?: number,
+ *          wasStarter?: boolean}|null} thisWeek
+ * @param {string} [name] the player who is out
+ * @returns {string} "" when he was not starting this week
+ */
+export function thisWeekLine(thisWeek, name = "") {
+  if (!thisWeek) return "";
+  const slot = String(thisWeek.slot ?? "").trim();
+  const rep = thisWeek.replacement;
+  const delta = Number(thisWeek.lineupDelta);
+  const parts = [];
+  if (rep && rep.name) {
+    const pts = Number(rep.pts);
+    const who = Number.isFinite(pts) ? `${rep.name} ${fmtNum(pts)}` : String(rep.name);
+    parts.push(`${slot ? slot + ": " : ""}${who} replaces ${clip(name || "him", 18)}`);
+  } else if (slot) {
+    // No named replacement does NOT mean no cover: the engine may fill the hole by reshuffling
+    // the whole lineup, and move 1 will say so. State the fact and let the move do the talking.
+    parts.push(`${slot}: ${clip(name || "he", 18)} is out of your lineup`);
+  }
+  if (Number.isFinite(delta) && Math.abs(delta) >= 0.05) parts.push(`lineup ${fmtPts(delta)}`);
+  return parts.join(" · ");
+}
+
+/**
+ * Headlines are written by the engine to fit a push notification (≤ 60 chars, design §12.2).
+ * The card trusts that but never assumes it: a feed item written by an older job still has to
+ * fit on one line at 390 px.
+ * @param {string} text
+ * @param {number} [max]
+ * @returns {string}
+ */
+export function headline(text, max = 60) {
+  return clip(String(text ?? "").trim(), max);
+}
+
+/** "job ran 12m ago" — the honest freshness line under the League news section. */
+export function feedAgeLine(generatedAt, now = Date.now()) {
+  return toMs(generatedAt) === null ? "" : "job ran " + relTime(generatedAt, now);
+}

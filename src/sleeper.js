@@ -174,6 +174,20 @@ export function getTransactions(leagueId, round, options) {
 }
 
 /**
+ * One player's live Sleeper row — the only endpoint that carries a FRESH injury status without
+ * downloading the 15 MB player dump (design §12.1; verified live 2026-09-10: 200, ~1.2 KB,
+ * carrying `injury_status`, `injury_body_part`, `injury_notes`, `news_updated` and
+ * `depth_chart_order`). Sleeper's CDN caches it for ~600 s, so the cache-buster `requestJson`
+ * adds is load-bearing here rather than a nicety.
+ * @param {string|number} id Sleeper player id (e.g. "11604")
+ * @param {RequestOptions} [options]
+ * @returns {Promise<object|null>} the raw player row, or null when Sleeper has no such id
+ */
+export function getPlayer(id, options) {
+  return requestJson(`${SLEEPER.v1}/players/nfl/${encodeURIComponent(String(id))}`, options);
+}
+
+/**
  * NFL state — current week, season, season type.
  * @param {RequestOptions} [options]
  * @returns {Promise<object>}

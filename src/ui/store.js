@@ -19,9 +19,14 @@ export const store = {
   errors: [],
 
   // routing
-  tab: "deals",
+  tab: "advisor",
 
   // per-tab state (survives tab switches)
+  // advisor.items are the Advisory objects the engine produced for MY roster this session;
+  // advisor.unseen holds the keys the tab dot is lit for (cleared once the cards are on screen).
+  advisor: {
+    status: "idle", items: [], error: null, at: null, failed: [], unseen: [], ms: null,
+  },
   // deals.scope: "team" (offers for one roster) | "league" (whole-league scan).
   // deals.forRosterId is the team the offers are FOR — my roster by default, any roster in
   // viewer mode or when the picker is used.

@@ -24,6 +24,14 @@ const boom = () => {
   throw new TypeError("fetch failed");
 };
 
+/**
+ * How many of the five COMMITTED pipeline files a load downloaded. `data/advisor.json` (design
+ * §12.4) rides along on every load and is optional in both directions — present or not, it says
+ * nothing about whether the 250 KB pipeline payload was re-fetched — so it is counted out here.
+ */
+const pipelineUrls = (fetchImpl) => fetchImpl.urls("data/").filter((url) => !url.includes("advisor"));
+const pipelineHits = (fetchImpl) => pipelineUrls(fetchImpl).length;
+
 /** Build the standard route table; every layer can be swapped for a failure/short response. */
 function makeRoutes({ data, league, users, rosters, state, trending, fcRedraft, fcDynasty } = {}) {
   return [
@@ -186,7 +194,7 @@ test("loadAll: happy path builds ctx, live values, and a clean freshness report"
     assert.equal(call.cache, "no-store");
     assert.doesNotMatch(call.url, /cb=/);
   }
-  assert.equal(fetchImpl.count("data/"), 5);
+  assert.equal(pipelineHits(fetchImpl), 5);
   // Sleeper: cache-busted and no-store.
   for (const call of fetchImpl.calls.filter((c) => c.url.includes("api.sleeper.app"))) {
     assert.match(call.url, /[?&]cb=\d+/);
@@ -373,8 +381,8 @@ test("loadAll: an unchanged meta.json reuses the stored files and downloads noth
 
   const { freshness, errors } = await loadAll({ settings, deps });
 
-  assert.equal(fetchImpl.count("data/"), 1, "only meta.json was fetched");
-  assert.deepEqual(fetchImpl.urls("data/"), ["data/meta.json"]);
+  assert.equal(pipelineHits(fetchImpl), 1, "only meta.json was fetched");
+  assert.deepEqual(pipelineUrls(fetchImpl), ["data/meta.json"]);
   assert.equal(freshness.pipelineSource, "idb");
   assert.equal(freshness.pipeline, PIPELINE_AT, "the stamp still describes the data in play");
   assert.equal(freshness.offline, false, "reusing an unchanged build is not an offline fallback");
@@ -387,7 +395,7 @@ test("loadAll: a changed meta.json re-downloads all five files", async () => {
 
   const { freshness } = await loadAll({ settings, deps });
 
-  assert.equal(fetchImpl.count("data/"), 5);
+  assert.equal(pipelineHits(fetchImpl), 5);
   assert.equal(freshness.pipelineSource, "network");
   assert.equal(
     idb.store.get("pipeline:meta.json").payload.generated_at,
@@ -419,7 +427,7 @@ test("loadAll: meta.json unreachable falls back to the stored copy and still loa
 
   const { freshness, errors } = await loadAll({ settings, deps });
 
-  assert.equal(fetchImpl.count("data/"), 5, "meta was attempted, the other four downloaded");
+  assert.equal(pipelineHits(fetchImpl), 5, "meta was attempted, the other four downloaded");
   assert.equal(freshness.pipelineSource, "network");
   assert.equal(freshness.pipeline, PIPELINE_AT, "the stored meta still dates the build");
   assert.ok(errors.some((e) => e.source === "data/meta.json"));
@@ -429,7 +437,7 @@ test("loadAll: meta.json unreachable falls back to the stored copy and still loa
 test("loadAll: force re-downloads even when the stamp is unchanged", async () => {
   const { deps, fetchImpl } = harness({ seed: pipelineSeed() });
   const { freshness } = await loadAll({ settings, deps, force: true });
-  assert.equal(fetchImpl.count("data/"), 5);
+  assert.equal(pipelineHits(fetchImpl), 5);
   assert.equal(freshness.pipelineSource, "network");
 });
 
@@ -438,7 +446,7 @@ test("refreshLive: re-pulls the league, reuses an unchanged pipeline build", asy
 
   const { freshness } = await refreshLive(settings, { deps });
 
-  assert.equal(fetchImpl.count("data/"), 1, "no re-download of the 250 KB pipeline payload");
+  assert.equal(pipelineHits(fetchImpl), 1, "no re-download of the 250 KB pipeline payload");
   assert.equal(
     fetchImpl.count("api.sleeper.app"),
     5,
@@ -458,7 +466,7 @@ test("refreshLive: a fresh copy does not bypass a changed stamp", async () => {
 
   const { freshness } = await refreshLive(settings, { deps });
 
-  assert.equal(fetchImpl.count("data/"), 5, "the cron rebuilt: take the new files");
+  assert.equal(pipelineHits(fetchImpl), 5, "the cron rebuilt: take the new files");
   assert.equal(freshness.pipelineSource, "network");
 });
 

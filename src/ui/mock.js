@@ -244,6 +244,8 @@ export async function loadAll({ settings, onProgress } = {}) {
   await sleep(120);
   onProgress && onProgress({ step: "Building the trade context", pct: 94 });
   const ctx = buildContext(input, s);
+  // §12.4: the real data layer fetches `data/advisor.json`; the demo synthesizes the same shape.
+  ctx.advisorFeed = advisorFeed(ctx);
   return {
     ctx,
     freshness: {
@@ -799,6 +801,261 @@ export async function listLeagues(userId, season) {
   }];
 }
 
+/* ============================================================ advisor.js (§12.2, mock)
+   Demo mode has no live Sleeper read and no injury engine, so the one advisory it serves is the
+   real 2026-09-09 case hand-built from the committed fixtures: Bowers ruled Doubtful with a
+   trimmed meniscus, Goedert already on the bench, two IR slots free and nothing on the wire
+   worth the roster spot. Every number below was computed from live data on 2026-09-10 and is
+   frozen here so the demo tab is populated and the layout can be reviewed; it is NOT the engine
+   of record — src/engine/advisor.js is. */
+
+const BOWERS = "11604";
+
+/** The status the demo pretends Sleeper is reporting for Bowers. */
+const BOWERS_STATUS = Object.freeze({
+  inj: "Doubtful",
+  injPart: "Knee - Meniscus",
+  injNotes: "Surgery",
+});
+
+/** design §12.2 `meniscus` row: mean 2.55 games, a real tail at six. */
+const MENISCUS = Object.freeze({
+  key: "meniscus",
+  branches: [
+    { games: 1, p: 0.3 }, { games: 2, p: 0.3 }, { games: 3, p: 0.15 },
+    { games: 4, p: 0.15 }, { games: 6, p: 0.1 },
+  ],
+  mean: 2.55,
+  seasonOver: false,
+});
+
+export function statusKey(row) {
+  return `${row?.inj ?? ""}|${row?.injPart ?? ""}|${row?.injNotes ?? ""}`;
+}
+
+/** The §12.2 contract: a NEW ctx, patched players map, empty memo, input untouched. */
+export function applyStatuses(ctx, rows = []) {
+  const players = new Map(ctx?.players ?? []);
+  for (const row of rows) {
+    const p = row && row.id != null ? players.get(String(row.id)) : null;
+    if (!p) continue;
+    players.set(String(row.id), {
+      ...p,
+      inj: row.inj ?? null,
+      injPart: row.injPart ?? null,
+      injNotes: row.injNotes ?? null,
+      newsAt: row.newsAt ?? null,
+      dc: row.dc ?? p.dc ?? null,
+    });
+  }
+  return { ...ctx, players, memo: {} };
+}
+
+export function diffStatuses(prev, next) {
+  if (!prev || typeof prev !== "object") return [];
+  const out = [];
+  for (const [id, key] of Object.entries(next || {})) {
+    if (prev[id] === undefined || prev[id] === key) continue;
+    out.push({ id, kind: "status", before: null, after: BOWERS_STATUS });
+  }
+  return out;
+}
+
+/** Demo mode has exactly one standing issue: the man with the knee. */
+export function standingIssues(ctx, rosterId) {
+  const roster = (ctx?.rosters || []).find((r) => r.rosterId === rosterId);
+  if (!roster || !roster.players.includes(BOWERS)) return [];
+  return [{ id: BOWERS, kind: "status", before: null, after: BOWERS_STATUS }];
+}
+
+export function absenceOf(_ctx, row) {
+  return row && row.inj ? MENISCUS : { key: "healthy", branches: [{ games: 0, p: 1 }], mean: 0, seasonOver: false };
+}
+
+/**
+ * The demo watch set read: every id comes back healthy except Bowers, who carries the status
+ * that started all this. Returns a NEW ctx exactly like the real `data.refreshStatuses`.
+ */
+export async function refreshStatuses(ctx, ids = []) {
+  await sleep(220);
+  const watch = [...new Set((ids || []).map(String))];
+  const newsAt = Date.now() - 3.2 * 3600 * 1000;
+  const rows = watch.map((id) => (id === BOWERS
+    ? { id, ...BOWERS_STATUS, newsAt, dc: 1 }
+    : { id, inj: ctx.players.get(id)?.inj ?? null, injPart: null, injNotes: null, newsAt: null, dc: null }));
+  const next = {};
+  for (const row of rows) next[row.id] = statusKey(row);
+  return {
+    ctx: applyStatuses(ctx, rows),
+    rows,
+    failed: [],
+    at: new Date().toISOString(),
+    // A demo always looks like a device that has been here before, so the diff has something to
+    // compare against — otherwise every advisory would read as a "first sighting" and vanish.
+    prev: Object.fromEntries(watch.map((id) => [id, "||"])),
+    next,
+  };
+}
+
+/** The alternatives table: same position, best current-week points, ownership named. */
+const TE_ALTERNATIVES = Object.freeze([
+  { id: "5022", name: "Dallas Goedert", team: "PHI", thisWeek: 8.8, next4: 8.4, ros: 8.1, owner: "mine" },
+  { id: "7002", name: "Juwan Johnson", team: "NO", thisWeek: 8.2, next4: 7.6, ros: 7.4, owner: "free" },
+  { id: "3214", name: "Hunter Henry", team: "NE", thisWeek: 7.6, next4: 7.1, ros: 7.0, owner: "free" },
+  { id: "9482", name: "Michael Mayer", team: "LV", thisWeek: 6.4, next4: 7.9, ros: 7.2, owner: "free" },
+]);
+
+/** The frozen Bowers advisory, stamped with whichever roster is "mine" in this demo. */
+export function bowersAdvisory(ctx, rosterId) {
+  const p = ctx.players.get(BOWERS) || { name: "Brock Bowers", pos: "TE", team: "LV" };
+  return {
+    key: `${BOWERS}:${statusKey(BOWERS_STATUS)}`,
+    kind: "status",
+    id: BOWERS,
+    name: p.name,
+    pos: p.pos || "TE",
+    team: p.team || "LV",
+    owner: rosterId ?? null,
+    before: { inj: null, injPart: null, injNotes: null },
+    after: { ...BOWERS_STATUS },
+    newsAt: Date.now() - 3.2 * 3600 * 1000,
+    severity: "high",
+    absence: MENISCUS,
+    thisWeek: {
+      wasStarter: true,
+      slot: "TE",
+      replacement: { id: "5022", name: "Dallas Goedert", pts: 8.8 },
+      lineupDelta: -4.3,
+    },
+    ir: {
+      eligibleNow: false,
+      slotsFree: 2,
+      opensWhen: "Out",
+      text: "Boyball allows Out on IR but not Doubtful — the slot opens the moment Sleeper flips him.",
+    },
+    moves: [
+      {
+        type: "start",
+        text: "Start Dallas Goedert at TE",
+        why: "Goedert is the best tight end left on your roster this week: 8.8 projected against Bowers' 0.",
+        deltaPerWeek: 8.8, valueDelta: 0, add: null, drop: null,
+        status: null, clearsAt: null, bid: null, when: "now",
+      },
+      {
+        type: "ir",
+        text: "Move Bowers to IR the moment he is ruled Out",
+        why: "Doubtful cannot be stashed in this league; Out can, and 2 IR slots are free. The bench spot it frees takes the best free agent of any position.",
+        deltaPerWeek: 0, valueDelta: 0, add: null, drop: null,
+        status: null, clearsAt: null, bid: null, when: "when status = Out",
+      },
+      {
+        type: "hold",
+        text: "Hold — no free tight end beats Goedert",
+        why: "Juwan Johnson is the best TE on the wire at 8.2 pts/wk, behind Goedert's 8.8. Nothing here is worth a roster spot.",
+        deltaPerWeek: 0, valueDelta: 0, add: null, drop: null,
+        status: "free", clearsAt: null, bid: null, when: "now",
+      },
+    ],
+    alternatives: TE_ALTERNATIVES.map((row) => ({ ...row })),
+    headline: "Brock Bowers → Doubtful (knee · meniscus)",
+    summary: "Start Goedert at TE (8.8). IR opens when his status becomes Out — 2 slots free. "
+      + "Hold: no free TE beats Goedert (best: Juwan Johnson 8.2/wk).",
+    url: "#advisor",
+  };
+}
+
+/** One advisory, so the demo tab is populated. Viewer mode (no roster) advises nothing. */
+export function adviseAll(ctx, { rosterId } = {}) {
+  if (rosterId == null) return [];
+  const roster = (ctx?.rosters || []).find((r) => r.rosterId === rosterId);
+  if (!roster || !roster.players.includes(BOWERS)) return [];
+  return [bowersAdvisory(ctx, rosterId)];
+}
+
+export function advise(ctx, { rosterId } = {}) {
+  return adviseAll(ctx, { rosterId })[0] ?? null;
+}
+
+/**
+ * The league feed the alerts job would have committed: my advisory plus one rival's, so the
+ * dimmed-rival treatment in the League news section has something to render.
+ */
+export function advisorFeed(ctx) {
+  const items = [];
+  const mine = ctx.myRosterId != null && ctx.rosters.some(
+    (r) => r.rosterId === ctx.myRosterId && r.players.includes(BOWERS));
+  if (mine) items.push({ ...bowersAdvisory(ctx, ctx.myRosterId), at: new Date(Date.now() - 3.2 * 3600 * 1000).toISOString() });
+
+  const rival = rivalNewsItem(ctx);
+  if (rival) items.push(rival);
+  if (!items.length) return null;
+  return {
+    v: 1,
+    generated_at: new Date(Date.now() - 18 * 60000).toISOString(),
+    leagues: { [ctx.league.id]: { week: ctx.week, items } },
+  };
+}
+
+/** A rival's running back with a soft-tissue knock — severity "low", so the card renders dim. */
+function rivalNewsItem(ctx) {
+  const rival = ctx.rosters.find((r) => r.rosterId !== ctx.myRosterId && (r.starters || []).length);
+  if (!rival) return null;
+  const id = (rival.starters || []).find((x) => ctx.players.get(x)?.pos === "RB");
+  const p = id ? ctx.players.get(id) : null;
+  if (!p) return null;
+  const after = { inj: "Questionable", injPart: "Hamstring", injNotes: "Limited Wednesday" };
+  return {
+    key: `${id}:${statusKey(after)}`,
+    kind: "status",
+    id, name: p.name, pos: p.pos, team: p.team,
+    owner: rival.rosterId,
+    before: { inj: null, injPart: null, injNotes: null },
+    after,
+    newsAt: Date.now() - 9 * 3600 * 1000,
+    severity: "low",
+    absence: { key: "softTissue", branches: [{ games: 0, p: 0.6 }, { games: 1, p: 0.4 }], mean: 0.4, seasonOver: false },
+    thisWeek: null,
+    ir: { eligibleNow: false, slotsFree: 0, opensWhen: null, text: "" },
+    moves: [{
+      type: "note",
+      text: `${rival.displayName} may be without ${p.name} on Sunday`,
+      why: "A hamstring that limits a back on Wednesday usually clears by Sunday — worth watching, not worth a move.",
+      deltaPerWeek: 0, valueDelta: 0, add: null, drop: null,
+      status: null, clearsAt: null, bid: null, when: "now",
+    }],
+    alternatives: [],
+    headline: `${p.name} → Questionable (hamstring)`,
+    summary: `${rival.displayName}'s starting back was limited on Wednesday. Nothing to do — watch the Sunday inactives.`,
+    url: "#advisor",
+    at: new Date(Date.now() - 9 * 3600 * 1000).toISOString(),
+  };
+}
+
+/* ---- the seen-advice ledger: localStorage here, IndexedDB in the real data layer ---- */
+
+const SEEN_ADVICE = (leagueId) => "tradewinds.seenAdvice." + leagueId;
+
+function readSeenAdvice(leagueId) {
+  try { return new Set(JSON.parse(localStorage.getItem(SEEN_ADVICE(leagueId)) || "[]")); }
+  catch { return new Set(); }
+}
+
+export async function markAdviceSeen(leagueId, keys = []) {
+  if (!leagueId) return [];
+  const seen = readSeenAdvice(leagueId);
+  for (const key of Array.isArray(keys) ? keys : [keys]) if (key) seen.add(String(key));
+  const merged = [...seen].slice(-200);
+  try { localStorage.setItem(SEEN_ADVICE(leagueId), JSON.stringify(merged)); } catch { /* ignore */ }
+  return merged;
+}
+
+export async function unseenAdviceKeys(leagueId, keys = []) {
+  if (!leagueId) return [];
+  const seen = readSeenAdvice(leagueId);
+  return [...new Set((Array.isArray(keys) ? keys : [keys]).filter(Boolean).map(String))]
+    .filter((key) => !seen.has(key));
+}
+
 /* ============================================================ export surface */
 
 export const api = {
@@ -809,6 +1066,9 @@ export const api = {
   evaluateTrade, findTrades, findLeagueTrades, explain, sideNames,
   // §11.4 — demo mode is an iOS Safari tab, so alerts are "not installed" here on purpose.
   alertsSupported, alertsStatus, enableAlerts, disableAlerts, updatePrefs, pairingCode,
+  // §12.2/§12.4 — one hand-built advisory (the real Bowers case) so the tab is populated.
+  advise, adviseAll, standingIssues, diffStatuses, statusKey, applyStatuses, absenceOf,
+  refreshStatuses, markAdviceSeen, unseenAdviceKeys,
 };
 
 /* ============================================================ push.js (§11.4, mock)

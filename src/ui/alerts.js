@@ -32,7 +32,11 @@ const FALLBACK_REASON_TEXT = {
   insecure: "Alerts need a secure (https) connection.",
 };
 
+// Advice leads: it is the only alert that arrives because something HAPPENED to a player of
+// mine, and it is the one the job sends first when the per-run cap bites (design §12.1).
 const PREF_TOGGLES = [
+  { key: "advice", label: "Advice on my players' news", help: "A status change on someone you roster, with the move it calls for." },
+  { key: "rivalNews", label: "Rivals' injury news", help: "The same for players other teams roster. Interesting, rarely actionable." },
   { key: "trades", label: "New trades in the league", help: "Someone in the league completes a trade." },
   { key: "deals", label: "New deals worth proposing", help: "The finder turns up an offer above your score floor." },
   { key: "freeAgents", label: "Free agents worth a drop", help: "The wire beats a player you are rostering." },
@@ -43,7 +47,18 @@ const PREF_NUMBERS = [
   { key: "minFaGain", label: "Minimum free-agent gain", min: 0, max: 5, step: 0.1, unit: "pts/wk", help: "Below this a wire pickup stays quiet." },
 ];
 
-const DEFAULT_PREFS = { trades: true, deals: true, freeAgents: true, minDealScore: 2, minFaGain: 1 };
+const DEFAULT_PREFS = {
+  advice: true, rivalNews: false, trades: true, deals: true, freeAgents: true,
+  minDealScore: 2, minFaGain: 1,
+};
+
+/**
+ * How long an alert really takes, said plainly (design §12.1). GitHub runs `schedule` workflows
+ * when it has capacity — measured 120–309 minutes apart for a ten-minute cron on this repo —
+ * so a promise of "within 30 minutes" would be a promise the app cannot keep.
+ */
+export const CADENCE_NOTE =
+  "Alerts usually arrive within 10–30 minutes; GitHub can delay scheduled runs.";
 
 let env = null;
 
@@ -103,8 +118,8 @@ export function alertsCard() {
           min="${n.min}" max="${n.max}" step="${n.step}" value="${escapeHtml(fmtNum(Number(prefs[n.key]), n.step >= 1 ? 0 : 1))}">
           ${n.unit ? `<span class="nrow-u">${escapeHtml(n.unit)}</span>` : ""}</span>
       </label>`).join("")}
-      <p class="note">Changing these only changes the copy on this phone — re-paste the code into
-        GitHub for the alert job to honour them.</p>
+      <p class="note">${escapeHtml(CADENCE_NOTE)} Changing these only changes the copy on this
+        phone — re-paste the code into GitHub for the alert job to honour them.</p>
     </div>
 
     <div class="btn-col al-acts">
@@ -167,7 +182,7 @@ export function openPairingSheet(pairing, e) {
     <ol class="steps">${STEPS.map((t) => `<li>${escapeHtml(t)}</li>`).join("")}</ol>
 
     <a class="btn" href="${SECRETS_URL}" target="_blank" rel="noopener">Open the GitHub secret</a>
-    <p class="note">Alerts start within 30 minutes of pasting.</p>
+    <p class="note">${escapeHtml(CADENCE_NOTE)}</p>
   </div>`;
 
   openSheet({

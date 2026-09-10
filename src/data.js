@@ -53,6 +53,17 @@
 // `getTransactions` still returns a plain array (the ids ride along as a non-enumerable
 // `newTradeIds` property), so older callers are untouched. Push notifications for the same
 // trades are a separate path entirely — see `src/push.js` and `pipeline/alerts.mjs`.
+//
+// ── Live injury statuses, for the Advisor tab (design §12.4) ─────────────────────────────────
+//   const { ctx: fresh, rows, failed, prev, next } = await refreshStatuses(ctx, ids);
+// `ids` is the watch set (my roster + reserve). Each id is read from Sleeper's per-player
+// endpoint — the only cheap source of a FRESH `injury_status` — with bounded concurrency; one
+// dead id lands in `failed` and never throws. The rows are applied to a NEW context (the input
+// `ctx` is never mutated) and stored under IDB `status:<leagueId>` so the next visit can diff
+// against them: `prev` is the snapshot that was in the drawer, `next` is the one just written,
+// and both are `Record<playerId, StatusKey>` ready for the engine's `diffStatuses`.
+// The advisories the app has already shown live under IDB `seenAdvice:<leagueId>` —
+// `unseenAdviceKeys()` drives the Advisor tab dot, `markAdviceSeen()` clears it.
 
 import { DEFAULTS, STORAGE_KEY } from "./config.js";
 import * as sleeper from "./sleeper.js";
@@ -66,6 +77,13 @@ export const PIPELINE_FILES = Object.freeze([
   "schedule.json",
   "meta.json",
 ]);
+
+/**
+ * The advisor feed (design §12.3/§12.4) — written by the alerts job, NOT part of `PIPELINE_FILES`
+ * because the app must open perfectly well without it: a repo that has never run the job simply
+ * has no such file, and `ctx.advisorFeed` is then null.
+ */
+export const ADVISOR_FILE = "advisor.json";
 
 /** The heavy four. `meta.json` is fetched first and decides whether these are downloaded at all. */
 const PIPELINE_DATA_FILES = Object.freeze(PIPELINE_FILES.filter((file) => file !== "meta.json"));
@@ -473,6 +491,29 @@ async function loadPipelineFiles({ fetchImpl, idb, force, errors }) {
 }
 
 /**
+ * The optional advisor feed (design §12.4). Network-first with an IndexedDB copy behind it, and
+ * a total failure is not an error: a repo whose alerts job has never run has no `data/advisor.
+ * json` at all, so "absent" is the ordinary case and resolves `null`. Never throws, never
+ * contributes to `errors`, and never keeps `loadAll` from finishing.
+ * @param {{fetchImpl: Function, idb: object}} deps
+ * @returns {Promise<object|null>} the parsed feed, or null when there is none
+ */
+export async function loadAdvisorFeed({ fetchImpl = globalThis.fetch, idb = defaultIdb } = {}) {
+  const key = `pipeline:${ADVISOR_FILE}`;
+  try {
+    const payload = await fetchDataFile(ADVISOR_FILE, fetchImpl);
+    // A GitHub Pages 404 is served as HTML, so a body that is not a feed is treated as absent
+    // rather than cached over a good copy.
+    if (!isPlainObject(payload) || !isPlainObject(payload.leagues)) return null;
+    await idb.set(key, payload);
+    return payload;
+  } catch {
+    const cached = await idb.get(key);
+    return isPlainObject(cached?.payload) ? cached.payload : null;
+  }
+}
+
+/**
  * @typedef {object} LoadDeps
  * @property {typeof fetch} [fetchImpl] Fetch used for both data files and APIs.
  * @property {{get: Function, set: Function, del: Function, keys: Function}} [idb] Cache backend.
@@ -547,6 +588,10 @@ export async function loadAll(options = {}) {
     isoOrNull(files["meta.json"]?.generated_at) || isoOrNull(files["players.json"]?.generated_at);
   const pipelineMs = Date.parse(pipelineAt ?? "");
   const stale = Number.isFinite(pipelineMs) ? nowMs() - pipelineMs > STALE_AFTER_MS : true;
+
+  // The advisor feed rides along with the live layer rather than adding a round trip of its own;
+  // it is awaited at step 4 and resolves null when the job has never written one.
+  const advisorJob = loadAdvisorFeed({ fetchImpl, idb });
 
   // ── 2. Live Sleeper layer ───────────────────────────────────────────────────────────────────
   progress("league", "Fetching live league state", 1);
@@ -693,6 +738,9 @@ export async function loadAll(options = {}) {
     },
     settings,
   );
+  // Optional and additive: the engine knows nothing about the feed, so it is hung on the context
+  // here. `null` is the normal value in a repo whose alerts job has not run yet (design §12.4).
+  if (ctx && typeof ctx === "object") ctx.advisorFeed = await advisorJob;
   progress("done", "Ready", PROGRESS_TOTAL);
 
   return {
@@ -901,6 +949,263 @@ export async function attachTransactions(ctx, options = {}) {
     if (!Number.isFinite(ctx.now)) ctx.now = Number(options.now) || Date.now();
   }
   return { txns, newTradeIds };
+}
+
+/* ═══════════════════════════════════════════════ live statuses + advice (design §12.4) ══════ */
+
+/** How many per-player reads run at once. Six keeps a 17-player roster under two seconds on
+ *  cellular without ever looking like a scraper to Sleeper. */
+export const STATUS_CONCURRENCY = 6;
+
+/** IDB key holding the last status snapshot this device pulled for a league. */
+const statusKeyFor = (leagueId) => `status:${leagueId}`;
+
+/** IDB key holding the advisory keys this device has already shown (design §12.4). */
+const seenAdviceKeyFor = (leagueId) => `seenAdvice:${leagueId}`;
+
+/** Same bound the alerts job keeps per device (design §12.3). */
+const SEEN_ADVICE_MAX = 200;
+
+const nullableString = (value) => {
+  const text = value === null || value === undefined ? "" : String(value).trim();
+  return text ? text : null;
+};
+
+const finiteOrNull = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * One raw Sleeper player row → the status row shape the engine's `applyStatuses` takes.
+ * Sleeper reports a healthy player as `injury_status: null` (sometimes `""`), so every empty
+ * string normalizes to null — "" and null must not read as two different statuses when the
+ * snapshot is diffed.
+ * @param {string|number} id Sleeper player id
+ * @param {object|null} raw row from `sleeper.getPlayer`
+ * @returns {{id: string, inj: string|null, injPart: string|null, injNotes: string|null,
+ *            newsAt: number|null, dc: number|null}}
+ */
+export function statusRowFrom(id, raw) {
+  return {
+    id: String(id),
+    inj: nullableString(raw?.injury_status),
+    injPart: nullableString(raw?.injury_body_part),
+    injNotes: nullableString(raw?.injury_notes),
+    newsAt: finiteOrNull(raw?.news_updated),
+    dc: finiteOrNull(raw?.depth_chart_order),
+  };
+}
+
+/**
+ * The stable identity of a status (design §12.2). `news_updated` is deliberately NOT part of it:
+ * Sleeper ticks that field for every headline, and a re-run of the same news is not a new event.
+ * @param {{inj?: string|null, injPart?: string|null, injNotes?: string|null}} row
+ * @returns {string}
+ */
+export function statusKeyOf(row) {
+  return `${row?.inj ?? ""}|${row?.injPart ?? ""}|${row?.injNotes ?? ""}`;
+}
+
+/** `Record<id, StatusKey>` for a list of rows — the snapshot shape `diffStatuses` compares. */
+export function snapshotOf(rows) {
+  const out = {};
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || row.id == null) continue;
+    out[String(row.id)] = statusKeyOf(row);
+  }
+  return out;
+}
+
+/**
+ * `applyStatuses` as the engine defines it (design §12.2), implemented here so the data layer
+ * can be used — and tested — before `src/engine/advisor.js` lands. The real export always wins
+ * (see `statusApplier`); this is the same contract: a NEW context whose players map carries the
+ * patched rows and whose memo is empty, with the input context untouched.
+ * @param {object} ctx engine context
+ * @param {Array<object>} rows status rows (unknown ids are ignored)
+ * @returns {object} a new context
+ */
+export function applyStatusesLocal(ctx, rows = []) {
+  const players = new Map(ctx?.players ?? []);
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || row.id == null) continue;
+    const id = String(row.id);
+    const player = players.get(id);
+    if (!player) continue;
+    players.set(id, {
+      ...player,
+      // null is meaningful here — it is how "cleared, he is healthy again" arrives.
+      inj: row.inj ?? null,
+      injPart: row.injPart ?? null,
+      injNotes: row.injNotes ?? null,
+      newsAt: row.newsAt ?? null,
+      // Depth-chart order is not part of the status event, so a row that omits it keeps
+      // whatever players.json already knew.
+      dc: row.dc ?? player.dc ?? null,
+    });
+  }
+  return { ...ctx, players, memo: {} };
+}
+
+/** @type {Promise<Function>|null} memoized resolution of the engine's own `applyStatuses`. */
+let statusApplierPromise = null;
+
+/** The engine's `applyStatuses` when the module exists, otherwise the local contract copy. */
+function statusApplier() {
+  if (!statusApplierPromise) {
+    statusApplierPromise = (async () => {
+      for (const path of ["./engine/advisor.js", "./engine/index.js"]) {
+        try {
+          const module = await import(path);
+          if (typeof module.applyStatuses === "function") return module.applyStatuses;
+        } catch {
+          /* not shipped yet — try the next one */
+        }
+      }
+      return applyStatusesLocal;
+    })();
+  }
+  return statusApplierPromise;
+}
+
+/** Run `job` over `items` with at most `limit` in flight. Order of results follows `items`. */
+async function pooled(items, limit, job) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      out[index] = await job(items[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return out;
+}
+
+/**
+ * Pull live injury statuses for a watch set and fold them into the context (design §12.4).
+ *
+ * Sleeper's per-player endpoint is the only cheap source of a status that is minutes old, so the
+ * phone reads exactly the ids it cares about (my roster + reserve — seventeen, not fifteen
+ * thousand). One dead id is a `failed` entry, never an exception: an advisory built from sixteen
+ * fresh rows beats no advisory at all.
+ *
+ * @param {object} ctx engine context (never mutated)
+ * @param {Array<string|number>} ids watch set
+ * @param {{fetchImpl?: Function, idb?: object, concurrency?: number, now?: Function|number,
+ *          applyStatuses?: Function, signal?: AbortSignal, request?: object,
+ *          deps?: LoadDeps}} [options]
+ * @returns {Promise<{ctx: object, rows: Array<object>, failed: string[], at: string,
+ *                    prev: Record<string, string>|null, next: Record<string, string>}>}
+ *   `ctx` is a NEW context; `prev` is the snapshot that was in the drawer before this call
+ *   (null on a device's first visit — the engine treats a first sighting as "not an event").
+ */
+export async function refreshStatuses(ctx, ids, options = {}) {
+  const deps = options.deps ?? {};
+  const fetchImpl = options.fetchImpl ?? deps.fetchImpl ?? globalThis.fetch;
+  const idb = options.idb ?? deps.idb ?? defaultIdb;
+  const concurrency = Number(options.concurrency) > 0 ? Number(options.concurrency) : STATUS_CONCURRENCY;
+  const clock = options.now ?? deps.now ?? Date.now;
+  const nowMs = typeof clock === "function" ? Number(clock()) : Number(clock);
+  const request = { fetchImpl, signal: options.signal, ...(options.request ?? deps.request ?? {}) };
+
+  const watch = [...new Set((Array.isArray(ids) ? ids : []).filter((id) => id != null).map(String))];
+  const leagueId = String(ctx?.league?.id ?? ctx?.leagueId ?? "");
+  const at = new Date(Number.isFinite(nowMs) ? nowMs : Date.now()).toISOString();
+
+  /** @type {string[]} */
+  const failed = [];
+  const settled = await pooled(watch, concurrency, async (id) => {
+    try {
+      const raw = await sleeper.getPlayer(id, request);
+      if (!raw || typeof raw !== "object") throw new Error("empty response");
+      return statusRowFrom(id, raw);
+    } catch (error) {
+      console.warn(`Tradewinds: live status for ${id} unavailable —`, message(error));
+      failed.push(String(id));
+      return null;
+    }
+  });
+  const rows = settled.filter(Boolean);
+
+  const apply = options.applyStatuses ?? deps.applyStatuses ?? (await statusApplier());
+  const nextCtx = apply(ctx, rows);
+
+  // The previous snapshot is read BEFORE the new one lands: it is the whole basis of "what
+  // changed since I last looked", which is what the Advisor tab turns into events.
+  let prev = null;
+  let next = snapshotOf(rows);
+  if (leagueId) {
+    const stored = await idb.get(statusKeyFor(leagueId));
+    const storedKeys = stored?.payload?.keys;
+    if (isPlainObject(storedKeys)) prev = storedKeys;
+    // Ids that failed this round keep their last known key, so a flaky request can never read
+    // as "his status was cleared".
+    if (prev) for (const id of failed) if (prev[id] !== undefined && next[id] === undefined) next[id] = prev[id];
+    await idb.set(statusKeyFor(leagueId), { at, week: ctx?.week ?? null, rows, keys: next });
+  }
+
+  return { ctx: nextCtx, rows, failed, at, prev, next };
+}
+
+/**
+ * The status snapshot this device last stored for a league, without touching the network.
+ * @param {string} leagueId
+ * @param {{deps?: LoadDeps, idb?: object}} [options]
+ * @returns {Promise<{at: string|null, rows: Array<object>, keys: Record<string, string>}|null>}
+ */
+export async function storedStatuses(leagueId, options = {}) {
+  const idb = options.idb ?? options.deps?.idb ?? defaultIdb;
+  const league = trimmed(leagueId);
+  if (!league) return null;
+  const record = await idb.get(statusKeyFor(league));
+  const payload = record?.payload;
+  if (!isPlainObject(payload)) return null;
+  return {
+    at: isoOrNull(payload.at),
+    rows: Array.isArray(payload.rows) ? payload.rows : [],
+    keys: isPlainObject(payload.keys) ? payload.keys : {},
+  };
+}
+
+/**
+ * Which advisory keys this device has not shown yet — the Advisor tab dot, in one call.
+ * @param {string} leagueId
+ * @param {string[]} keys `Advisory.key` values
+ * @param {{deps?: LoadDeps, idb?: object}} [options]
+ * @returns {Promise<string[]>} the subset that is new, in the order given
+ */
+export async function unseenAdviceKeys(leagueId, keys, options = {}) {
+  const idb = options.idb ?? options.deps?.idb ?? defaultIdb;
+  const league = trimmed(leagueId);
+  const incoming = (Array.isArray(keys) ? keys : [keys]).filter(Boolean).map(String);
+  if (!league || !incoming.length) return [];
+  const record = await idb.get(seenAdviceKeyFor(league));
+  const seen = new Set((Array.isArray(record?.payload) ? record.payload : []).map(String));
+  return [...new Set(incoming)].filter((key) => !seen.has(key));
+}
+
+/**
+ * Mark advisories as shown. Called by the Advisor view once the cards are on screen — the same
+ * rule the League tab uses for trades: seen means *displayed*, not *fetched*.
+ * @param {string} leagueId
+ * @param {string[]|string} keys
+ * @param {{deps?: LoadDeps, idb?: object}} [options]
+ * @returns {Promise<string[]>} the keys now remembered for this league (newest first, ≤ 200)
+ */
+export async function markAdviceSeen(leagueId, keys, options = {}) {
+  const idb = options.idb ?? options.deps?.idb ?? defaultIdb;
+  const league = trimmed(leagueId);
+  const incoming = (Array.isArray(keys) ? keys : [keys]).filter(Boolean).map(String);
+  if (!league) return [];
+  const record = await idb.get(seenAdviceKeyFor(league));
+  const previous = (Array.isArray(record?.payload) ? record.payload : []).map(String);
+  const merged = [...new Set([...incoming, ...previous])].slice(0, SEEN_ADVICE_MAX);
+  await idb.set(seenAdviceKeyFor(league), merged);
+  return merged;
 }
 
 /**

@@ -6,6 +6,7 @@ import { toast, closeTopSheet, closeAllSheets, syncThemeColor } from "./componen
 import { escapeHtml, clockTime, relTime, clip } from "./format.js";
 import { APP_NAME } from "../config.js";
 
+import * as advisor from "./advisor.js";
 import * as deals from "./deals.js";
 import * as analyze from "./analyze.js";
 import * as league from "./league.js";
@@ -13,7 +14,9 @@ import * as players from "./players.js";
 import * as settings from "./settings.js";
 import * as setup from "./setup.js";
 
-const VIEWS = { deals, analyze, league, players, settings };
+// Advisor is first, and therefore the default route: the reason to open the app at all is
+// usually a status change, and that is the only tab that says what to do about one (design §12.5).
+const VIEWS = { advisor, deals, analyze, league, players, settings };
 const TABS = Object.keys(VIEWS);
 
 let svc = null;
@@ -69,6 +72,9 @@ async function boot() {
     syncThemeColor();
     // New-trade awareness runs after first paint: it is a background read, never a boot gate.
     setTimeout(() => transactions(), 0);
+    // The advice dot is read off the feed `loadAll` already downloaded, so it costs nothing and
+    // is right even when the user opens some other tab first (design §12.5).
+    setTimeout(() => adviceDot(), 0);
   } catch (err) {
     // data.js signals "no league configured" with SetupRequiredError, not a crash screen.
     if (isSetupRequired(err)) { showSetup(); return; }
@@ -136,6 +142,7 @@ async function reload({ hard = false } = {}) {
       fa: { status: "idle", results: [], pos: "", error: null, ms: null },
     };
     store.league = { txns: null, txnStatus: "idle", newTradeIds: [] };
+    store.advisor = { status: "idle", items: [], error: null, at: null, failed: [], unseen: [], ms: null };
     store.analyze = { theirRosterId: null, give: [], get: [], q: "", result: null, expanded: false, error: null };
   } else {
     store.deals = { ...store.deals, status: "idle", results: [], fa: { ...store.deals.fa, status: "idle", results: [] } };
@@ -162,6 +169,8 @@ async function refresh({ silent = false } = {}) {
     txnsPending = null;
     store.deals = { ...store.deals, status: "idle", results: [], fa: { ...store.deals.fa, status: "idle", results: [] } };
     store.league = { ...store.league, txns: null, txnStatus: "idle" };
+    // A pull-to-refresh re-reads Sleeper, so the advisories have to be recomputed on top of it.
+    store.advisor = { ...store.advisor, status: "idle", items: [], error: null };
     set({ ctx: out.ctx, freshness: out.freshness || {}, errors: out.errors || [] }, "refresh");
     store.lastLiveAt = Date.now();
     renderView(true);
@@ -266,11 +275,56 @@ function paintTradeDot() {
   else tab.removeAttribute("aria-description");
 }
 
+/* ---------------------------------------------------------------- advice dot (§12.5) */
+
+/** Which advisory keys in the committed feed concern MY roster (or, in viewer mode, all of them). */
+function feedKeys() {
+  const ctx = store.ctx;
+  const bucket = ctx?.advisorFeed?.leagues?.[ctx?.league?.id];
+  const items = Array.isArray(bucket?.items) ? bucket.items : [];
+  const me = ctx?.myRosterId ?? null;
+  return items
+    .filter((item) => item && item.key && (me == null || item.owner == null || item.owner === me))
+    .map((item) => String(item.key));
+}
+
+async function adviceDot() {
+  const ctx = store.ctx;
+  const leagueId = ctx?.league?.id;
+  if (!svc || !leagueId || !svc.unseenAdviceKeys) return;
+  try {
+    const unseen = await svc.unseenAdviceKeys(leagueId, feedKeys());
+    setIn("advisor", { unseen: unseen || [] });
+    paintAdviceDot();
+  } catch (err) {
+    console.warn("[app] advice dot skipped", err);
+  }
+}
+
+/** The Advisor tab's unread dot. The view clears it once the cards are on screen. */
+function paintAdviceDot() {
+  const tab = document.querySelector('#tabs a[data-tab="advisor"]');
+  if (!tab) return;
+  const on = (store.advisor.unseen || []).length > 0;
+  tab.classList.toggle("has-dot", on);
+  const dot = tab.querySelector(".tab-dot");
+  if (dot) dot.hidden = !on;
+  if (on) tab.setAttribute("aria-description", "new advice");
+  else tab.removeAttribute("aria-description");
+}
+
+/** The Advisor view calls this once it has marked its advisories seen. */
+function clearAdviceDot() {
+  if (!(store.advisor.unseen || []).length) return;
+  setIn("advisor", { unseen: [] });
+  paintAdviceDot();
+}
+
 /* ================================================================== router */
 
 function tabFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
-  return TABS.includes(h) ? h : "deals";
+  return TABS.includes(h) ? h : "advisor";
 }
 
 /**
@@ -302,7 +356,7 @@ function startRouter() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") closeTopSheet();
   });
-  if (!TABS.includes((location.hash || "").replace(/^#/, ""))) location.replace("#deals");
+  if (!TABS.includes((location.hash || "").replace(/^#/, ""))) location.replace("#advisor");
   renderView();
 }
 
@@ -316,6 +370,7 @@ const env = {
   go, refresh, reload, boot,
   transactions,
   clearTradeDot,
+  clearAdviceDot,
   rerender: () => renderView(true),
 };
 

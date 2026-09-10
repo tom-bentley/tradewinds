@@ -56,11 +56,19 @@ export const VAPID_PUBLIC_KEY =
     ? config.VAPID_PUBLIC_KEY
     : VAPID_FALLBACK;
 
-/** Alert preferences the pairing payload carries (design §11.4). */
+/**
+ * Alert preferences the pairing payload carries (design §11.4, extended in §12.5).
+ * `advice` (my players' status changes) outranks every other kind in the job's per-run cap, so
+ * it defaults on; `rivalNews` is interesting rather than actionable and defaults off.
+ * The pairing schema itself is unchanged — new keys are additive, so `PAIRING_VERSION` stays 1
+ * and a device paired before v1.3 keeps working (the job's `normalizePrefs` fills the defaults).
+ */
 export const DEFAULT_PREFS = Object.freeze({
   trades: true,
   deals: true,
   freeAgents: true,
+  advice: true,
+  rivalNews: false,
   minDealScore: 2,
   minFaGain: 1,
 });

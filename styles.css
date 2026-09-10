@@ -748,3 +748,106 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .tside-v { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 2px 0 4px; }
 .tside-v .verdict-word { font-size: 15px; }
 .tside-d { font-size: 14px; color: var(--ink-3); }
+
+/* ================================================================== v1.3 — advisor */
+
+/* Six tabs at 390 px leave 65 px each: the icons stay 21 px and only the labels give ground. */
+#tabs { grid-template-columns: repeat(6, 1fr); }
+#tabs a { font-size: 13px; }
+#tabs span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.ad-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 14px; }
+.ad-title { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.ad-as { font-size: 14px; color: var(--ink-3); white-space: nowrap; }
+
+.adv-list { display: grid; gap: 10px; margin-top: 10px; }
+
+/* Severity is the one thing the eye should catch before reading a word: a starter who is out is
+   a loss (rose), a bench problem is caution (amber), a rival's news is neither (grey). */
+.adv {
+  --accent: var(--ink-3);
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--accent); border-radius: var(--r-card); overflow: hidden;
+}
+.adv[data-sev="high"] { --accent: var(--loss); }
+.adv[data-sev="med"] { --accent: var(--theirs); }
+.adv[data-sev="low"] { --accent: var(--ink-3); }
+.adv-body { padding: 11px 11px 12px; }
+.adv-sheet { border: 0; border-left-width: 3px; background: none; }
+
+.adv-h { display: flex; align-items: flex-start; gap: 9px; }
+.adv-hb { min-width: 0; flex: 1; }
+.adv-t { font-size: 16px; font-weight: 700; letter-spacing: -.015em; }
+.adv-m { margin-top: 2px; font-size: 14px; color: var(--ink-2); overflow-wrap: anywhere; }
+.adv-abs { margin-top: 8px; font-size: 14px; font-weight: 650; color: var(--accent); }
+.adv-week { margin-top: 3px; font-size: 14px; color: var(--ink-2); }
+.adv-ir { margin-top: 3px; font-size: 14px; color: var(--ink-3); }
+
+.adv-moves { display: grid; gap: 9px; margin-top: 11px; padding-top: 9px; border-top: 1px solid var(--line-soft); }
+/* The number is a fixed gutter; the move text and its `when` chip share the column beside it as
+   inline flow, so a long move wraps under itself instead of pushing the number onto its own row. */
+.adv-mv-h { display: flex; align-items: baseline; gap: 7px; }
+.adv-mv-x { min-width: 0; flex: 1; }
+.adv-mv-n {
+  flex: none; display: inline-grid; place-items: center; width: 19px; height: 19px;
+  border-radius: 50%; background: var(--surface2); color: var(--ink-2); font-size: 13px; font-weight: 700;
+}
+.adv-mv-t { font-size: 15px; font-weight: 650; letter-spacing: -.012em; }
+.adv-move[data-type="hold"] .adv-mv-t, .adv-move[data-type="note"] .adv-mv-t { font-weight: 600; color: var(--ink-2); }
+.adv-why { margin-top: 3px; padding-left: 26px; font-size: 14px; color: var(--ink-2); }
+.adv-move .deal-stats { margin-top: 5px; padding-left: 26px; }
+
+/* When a move can be made is as load-bearing as the move: an IR stash that is not legal yet
+   must never read like something to do now. */
+.wchip {
+  display: inline-block; padding: 2px 8px; border-radius: var(--r-pill);
+  background: var(--surface2); border: 1px solid var(--line);
+  font-size: 13px; font-weight: 650; color: var(--ink-3); white-space: nowrap;
+}
+
+.adv-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; padding-left: 26px; }
+.mchip {
+  min-height: 32px; padding: 0 11px; border-radius: var(--r-pill);
+  background: var(--surface2); border: 1px solid var(--line); color: var(--ink);
+  font-size: 14px; font-weight: 600; cursor: pointer;
+}
+.mchip:active { background: var(--raised); }
+
+.adv-alts { margin-top: 10px; border-top: 1px solid var(--line-soft); padding-top: 8px; }
+.adv-alts > summary {
+  min-height: 36px; display: flex; align-items: center; gap: 6px;
+  font-size: 14px; font-weight: 650; color: var(--ink-2); cursor: pointer;
+}
+.adv-alt-t { margin-top: 4px; }
+.adv-alt-t th[scope="col"] { font-size: 13px; color: var(--ink-3); text-align: right; }
+.adv-alt-t thead th:first-child { text-align: left; }
+.adv-alt-t tbody th { font-weight: 600; color: var(--ink); }
+.adv-alt-t .schip { margin-left: 6px; padding: 1px 7px; font-size: 13px; }
+
+/* ---- league news ---- */
+
+.ad-feed { display: grid; gap: 8px; }
+.fitem {
+  --accent: var(--ink-3);
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--accent); border-radius: var(--r-row); overflow: hidden;
+}
+.fitem[data-sev="high"] { --accent: var(--loss); }
+.fitem[data-sev="med"] { --accent: var(--theirs); }
+/* Someone else's injury is news, not a decision — it reads one step back. */
+.fitem.is-rival { opacity: .62; }
+.fitem-hit {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  min-height: 52px; padding: 8px 10px; background: none; border: 0; text-align: left; cursor: pointer;
+}
+.fitem-hit:active { background: var(--surface2); }
+.fitem-b { min-width: 0; flex: 1; display: grid; }
+.fitem-h { font-size: 15px; font-weight: 650; letter-spacing: -.012em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fitem-m { font-size: 14px; color: var(--ink-3); }
+.fitem-go { flex: none; color: var(--ink-3); }
+.fitem-go .ic { width: 16px; height: 16px; }
+
+@media (max-width: 360px) {
+  #tabs a { font-size: 12px; }
+  .adv-why, .adv-acts, .adv-move .deal-stats { padding-left: 0; }
+}

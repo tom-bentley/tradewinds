@@ -4,7 +4,7 @@
 // public through Sleeper's read-only API.
 
 export const APP_NAME = "Tradewinds";
-export const APP_VERSION = "0.2.0";
+export const APP_VERSION = "0.3.0";
 export const STORAGE_KEY = "tradewinds.settings.v1";
 
 /**
@@ -60,9 +60,20 @@ export const DEFAULTS = Object.freeze({
     trades: true,
     deals: true,
     freeAgents: true,
+    // v1.3 (design §12.5). Advice on MY players is the whole point of the release, so it ships
+    // on; a rival's injury is interesting, not actionable, so it ships off and is opt-in.
+    advice: true,
+    rivalNews: false,
     minDealScore: 2, // FinderScore floor for "a new deal worth proposing"
     minFaGain: 1, // pts/week floor for "a free agent worth a drop"
   }),
+
+  // --- Injury duration table (design §12.2) -------------------------------------------------
+  // How long a player is out is the one judgement call in the advisor, so it is a setting rather
+  // than a constant. `null` means "use the engine's built-in INJURY_RULES" (src/engine/
+  // injuries.js) — a future Settings screen can write a replacement table here without any
+  // change to the engine.
+  injuryTable: null,
 
   // --- Trade finder (R3 §f) --------------------------------------------------------------
   finder: Object.freeze({
