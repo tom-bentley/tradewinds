@@ -4,6 +4,9 @@ On-the-spot trade analyzer for a Sleeper fantasy-football league. Runs entirely 
 browser, installs to the iPhone home screen like an app, costs nothing to host, and refreshes its
 market data on a schedule.
 
+- **Advisor** turns news into a decision: when a player you roster changes injury status, your
+  phone gets one push that says who starts, whether (and when) he can go to IR, the best add and
+  the exact drop with the points math — or "hold". The tab shows the same advice on demand.
 - **Analyze** any offer in seconds: pick the rival, tap the players on each side, read the
   verdict (Edge %, starting-lineup points per week, playoff-weeks impact, flags, reasons).
 - **Deals** ranks the trades worth proposing to every rival right now, filtered to offers the
@@ -64,8 +67,13 @@ iPhone (PWA on GitHub Pages) ──live──► api.sleeper.app · api.fantasyc
   no dependencies.
 - `pipeline/refresh.mjs` (Node ≥ 20, no dependencies) regenerates `data/*.json` every three hours
   and the workflow in `.github/workflows/refresh-data.yml` commits the result when it changed.
-- `pipeline/alerts.mjs` runs every 30 minutes, grades new completed trades, re-runs the deal and
-  free-agent finders for each paired phone, and sends push notifications (see Alerts).
+- `pipeline/alerts.mjs` is scheduled every 10 minutes: it reads live injury statuses for every
+  rostered player (one current-week projections call — the rows carry Sleeper's `injury_*` fields
+  and fresh points), diffs them against the last run, composes the advice, grades new completed
+  trades, re-runs the deal and free-agent finders for each paired phone, sends the push
+  notifications, and commits `data/advisor.json` (the feed the Advisor tab shows). GitHub runs
+  cron schedules best-effort (gaps of 2–5 hours were measured), so the workflow also accepts
+  `workflow_dispatch` and `repository_dispatch` from any external pinger (see News advisor).
 - The engine under `src/engine/` is pure and unit-tested against fixtures snapshotted on
   2026-09-09 (`test/fixtures/`).
 
@@ -89,14 +97,49 @@ Action can read it: a repository secret.
 3. On github.com open the repo → Settings → Secrets and variables → Actions and create (or edit)
    the secret `PUSH_SUBSCRIPTIONS`. Its value is a JSON array: `[<pairing code>]`, or several codes
    separated by commas for more than one phone.
-4. Alerts begin within about 30 minutes. To test immediately, run the **Alerts** workflow from the
-   Actions tab with `test` checked.
+4. Alerts usually begin within 10–30 minutes (GitHub can delay scheduled runs). To test
+   immediately, run the **Alerts** workflow from the Actions tab with `test` checked.
 
-You will be alerted when a trade completes in the league, when a new deal for your team clears
-your score threshold, and when a free agent is worth a drop. Thresholds and the three switches are
-in Settings → Alerts; after changing them, copy and paste the code again so the job sees the new
-preferences. The endpoint and keys in the pairing code let a sender push to your phone, which is
-why they live in a secret and never in the repository.
+You will be alerted when a player you roster changes injury status (with the recommended
+course of action), when a trade completes in the league, when a new deal for your team clears
+your score threshold, and when a free agent is worth a drop. Thresholds and the switches
+(including "Rivals' injury news", off by default) are in Settings → Alerts; after changing them,
+copy and paste the code again so the job sees the new preferences. The endpoint and keys in the
+pairing code let a sender push to your phone, which is why they live in a secret and never in
+the repository.
+
+## News advisor
+
+The Sleeper app tells you *what happened*; the advisor tells you *what to do*. It is deterministic
+— no language model, no API key — and every number comes from the same engine the trade verdicts
+use:
+
+1. **Statuses** come from Sleeper's current-week projections rows (the job) and from
+   `GET /v1/players/nfl/{id}` for your own roster (the phone), never from a 15 MB dump on a timer.
+2. **How long is he out** is an editable table keyed on the status, body part and notes Sleeper
+   publishes ("Doubtful · Knee - Meniscus · Surgery" → likely 1–2 games with a tail to 4+). The
+   injured player's future weeks are scaled by that probability when moves are graded, because
+   Sleeper's own projections lag fresh news by days.
+3. **Moves** are ranked: who starts in his place this week → whether he can go to IR *now* under
+   your league's `reserve_allow_*` settings (and if not, which status opens the window) → the best
+   free agent to add and the exact drop, or the freed IR spot → a trade angle when the hole lasts
+   → "hold" when nothing on the wire beats your roster.
+4. **Delivery**: one push per status transition (title = what happened, body = the moves, tap →
+   Advisor tab). The Advisor tab recomputes the same advice on open, so a late push never means a
+   wrong decision.
+
+Dry run without any secret, printing what the job would send for one league and user:
+
+```bash
+ALERT_DRY=1 ALERT_DRY_LEAGUE=<leagueId> ALERT_DRY_USER=<userId> node pipeline/alerts.mjs
+```
+
+**Faster than GitHub's cron.** Any machine that is awake can fire the job to the minute:
+`gh workflow run alerts.yml -R <you>/tradewinds` from a scheduled task, or from a free pinger
+(cron-job.org, a Cloudflare Worker) with
+`POST https://api.github.com/repos/<you>/tradewinds/dispatches` and body
+`{"event_type":"alerts"}` using a fine-grained token (Contents: read, Actions: write). The job is
+state-diffed, so extra runs never double-notify.
 
 ## Use it for your own league
 
