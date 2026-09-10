@@ -108,6 +108,42 @@ export {
 } from "./waiver.js";
 
 export {
+  absenceOf,
+  availability,
+  withAbsence,
+  INJURY_RULES,
+  STATUS_BRANCHES,
+  IR_STATUSES,
+  QUESTIONABLE_SHIFT,
+  SEASON_GAMES,
+} from "./injuries.js";
+
+export {
+  applyStatuses,
+  applyWeekPoints,
+  statusKey,
+  diffStatuses,
+  standingIssues,
+  irEligible,
+  irEligibility,
+  advise,
+  adviseAll,
+  shortName,
+  SUMMARY_MAX,
+  HEADLINE_MAX,
+  MOVE_EPSILON,
+  TRADE_MEAN_GAMES,
+  TRADE_HOLE_PER_WEEK,
+  WIRE_RESULTS,
+  MAX_ALTERNATIVES,
+  NEXT_WEEKS,
+  ISSUE_STATUSES,
+  IR_ALWAYS,
+  STATUS_CHAIN,
+  SEVERITY_ORDER,
+} from "./advisor.js";
+
+export {
   explain,
   sideNames,
   defaultNames,

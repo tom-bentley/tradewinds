@@ -318,6 +318,17 @@ export function buildContext(input, settings) {
       // includes BN, excludes IR/taxi (Sleeper usually omits both from roster_positions)
       maxRoster: rosterPositions.filter((s) => s !== "IR" && s !== "TAXI").length,
       irSlots: Number(leagueSettings.reserve_slots) || 0,
+      // Which statuses this league lets a manager park on those slots (design.md §12.2). Read
+      // live, never assumed: Boyball stashes Out but not Doubtful, and the advisor's whole IR
+      // recommendation ("the window opens when Sleeper flips him to Out") turns on the difference.
+      reserveAllow: {
+        out: !!Number(leagueSettings.reserve_allow_out),
+        doubtful: !!Number(leagueSettings.reserve_allow_doubtful),
+        sus: !!Number(leagueSettings.reserve_allow_sus),
+        cov: !!Number(leagueSettings.reserve_allow_cov),
+        dnr: !!Number(leagueSettings.reserve_allow_dnr),
+        na: !!Number(leagueSettings.reserve_allow_na),
+      },
       taxiSlots: Number(leagueSettings.taxi_slots) || 0,
       tradeDeadlineWeek,
       // 0 means the commissioner reviews trades instead of the league voting on them
