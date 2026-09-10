@@ -375,7 +375,10 @@ function thisWeekOf(prior, scen, ids, id, starters) {
   return {
     started: starters.has(id),
     bye: isBye(scen, id, week),
-    slot: newcomer ? newcomer.slot : priorSlot ? priorSlot.slot : playerOf(scen, id).pos || null,
+    // a benched player has no slot to vacate — his position is the honest label for the card
+    slot: starters.has(id)
+      ? newcomer ? newcomer.slot : priorSlot ? priorSlot.slot : playerOf(scen, id).pos || null
+      : playerOf(scen, id).pos || null,
     was,
     now,
     replacement: newcomer ? newcomer.id : null,
@@ -581,8 +584,10 @@ export function advise(ctx, opts = {}) {
   const v = voice(names);
 
   if (mine) {
-    // 4 — the lineup fix comes first: it is free, it is this week, and it is the biggest number
-    if (thisWeek && thisWeek.replacement && thisWeek.gain > MOVE_EPSILON) {
+    // 4 — the lineup fix comes first: it is free, it is this week, and it is the biggest number.
+    // Only when the news opens a hole in the lineup the manager actually set: a player already
+    // benched needs no replacement, and an unrelated bench-vs-starter tweak is not this story.
+    if (thisWeek && thisWeek.started && thisWeek.replacement && thisWeek.gain > MOVE_EPSILON) {
       const who = shortName(nameOf(scen, thisWeek.replacement), playerOf(scen, thisWeek.replacement).pos);
       const why = [
         `${shortName(player.name, pos)} projects ${fmt1(thisWeek.now)} this week — the swap is worth ` +
