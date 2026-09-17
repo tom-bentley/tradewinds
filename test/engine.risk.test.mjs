@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 
 import { DEFAULTS } from "../src/config.js";
 import { activePlayers, buildContext, rosterById } from "../src/engine/context.js";
+import { evaluateTrade } from "../src/engine/trade.js";
 import { seasonLineup } from "../src/engine/lineup.js";
 import { marketValue } from "../src/engine/values.js";
 import {
@@ -21,6 +22,7 @@ import {
   playerRisk,
   rosterFragility,
   rosterRisk,
+  tradeRisk,
 } from "../src/engine/risk.js";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
@@ -295,4 +297,45 @@ test("consensusGap compares the tier sheet with the projection rank at the same 
   const gibbs = gaps.get("9509"); // Jahmyr Gibbs, RB1 by projection and tier 1 on the sheet
   if (gibbs) assert.equal(gibbs.gap, 0);
   assert.equal(consensusGaps(ctx), gaps, "memoized per ctx");
+});
+
+// ---------------------------------------------------------------------------------------------
+// tradeRisk — what the orchestrator hangs off result.risk at integration (§13.8)
+// ---------------------------------------------------------------------------------------------
+
+test("tradeRisk grades both sides of a real trade result and signs the deltas from my side", () => {
+  const mineRoster = rosterById(ctx, MINE);
+  const theirs = rosterById(ctx, 4);
+  const give = activePlayers(mineRoster).filter((id) => marketValue(ctx, id).m != null).slice(0, 2);
+  const get = activePlayers(theirs).filter((id) => marketValue(ctx, id).m != null).slice(0, 1);
+  const result = evaluateTrade(ctx, { myRosterId: MINE, theirRosterId: 4, give, get });
+
+  const risk = tradeRisk(ctx, result);
+  assert.ok(risk, "a graded trade always has a risk row");
+  for (const side of [risk.me, risk.them]) {
+    for (const phase of [side.before, side.after]) {
+      assert.ok(phase.weekly.mean > 0 && phase.weekly.sd > 0);
+      assert.ok(phase.certaintyEquivalent <= phase.weekly.mean);
+      assert.ok(["low", "moderate", "high", "severe"].includes(phase.band));
+    }
+  }
+  // the three headline deltas are MY side's, like every other number on a TradeResult
+  assert.ok(
+    Math.abs(risk.deltaCertaintyEquivalent - (risk.me.after.certaintyEquivalent - risk.me.before.certaintyEquivalent)) <
+      1e-9
+  );
+  assert.ok(
+    Math.abs(
+      risk.deltaStarterShare - (risk.me.after.concentration.starterShare - risk.me.before.concentration.starterShare)
+    ) < 1e-9
+  );
+  assert.ok(
+    Math.abs(
+      risk.deltaFragility -
+        (risk.me.after.fragility.expectedLossPerWeek - risk.me.before.fragility.expectedLossPerWeek)
+    ) < 1e-9
+  );
+  // a 2-for-1 concentrates value into fewer bodies: the starter share can only go up or stay put
+  assert.ok(risk.deltaStarterShare >= -1e-9, `starter share moved ${risk.deltaStarterShare}`);
+  assert.equal(tradeRisk(ctx, null), null, "an ungraded proposal is answered, not thrown at");
 });
