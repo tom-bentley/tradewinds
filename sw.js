@@ -17,7 +17,7 @@
  * subscription is `userVisibleOnly`, and a silent push costs the app its push permission.
  */
 
-const CACHE = "tradewinds-v0.3.0"; // keep equal to "tradewinds-v" + APP_VERSION (src/config.js) — bump both on every app deploy
+const CACHE = "tradewinds-v0.4.0"; // keep equal to "tradewinds-v" + APP_VERSION (src/config.js) — bump both on every app deploy
 const CACHE_PREFIX = "tradewinds-";
 
 const PRECACHE = [
@@ -39,6 +39,7 @@ const PRECACHE = [
   "./src/engine/waiver.js",
   "./src/engine/advisor.js",
   "./src/engine/injuries.js",
+  "./src/engine/risk.js",
   "./src/ui/app.js",
   "./src/ui/advisor.js",
   "./src/ui/deals.js",
