@@ -64,6 +64,12 @@
 // and both are `Record<playerId, StatusKey>` ready for the engine's `diffStatuses`.
 // The advisories the app has already shown live under IDB `seenAdvice:<leagueId>` —
 // `unseenAdviceKeys()` drives the Advisor tab dot, `markAdviceSeen()` clears it.
+//
+// ── Season history, for the risk model (design §13.6 F3) ─────────────────────────────────────
+// `data/history.json` is an OPTIONAL pipeline file: it is downloaded and cached exactly like the
+// heavy four, but absent, unreachable or malformed costs nothing — no error, no banner, no
+// retry — and `buildContext` is handed `input.history === null`. Treat it as a bonus the engine
+// asks for by name, never as something the app waits on.
 
 import { DEFAULTS, STORAGE_KEY } from "./config.js";
 import * as sleeper from "./sleeper.js";
@@ -85,8 +91,24 @@ export const PIPELINE_FILES = Object.freeze([
  */
 export const ADVISOR_FILE = "advisor.json";
 
-/** The heavy four. `meta.json` is fetched first and decides whether these are downloaded at all. */
-const PIPELINE_DATA_FILES = Object.freeze(PIPELINE_FILES.filter((file) => file !== "meta.json"));
+/**
+ * Pipeline files the app rides along with but never depends on (design §13.6 F3). They travel
+ * with the heavy four — same meta-stamp check, same IndexedDB drawer — but absent, unreachable or
+ * malformed is the ORDINARY case, not an error: the engine simply gets `null` and does without.
+ * `history.json` is only as old as the last cron run that managed to build it.
+ */
+export const OPTIONAL_PIPELINE_FILES = Object.freeze(["history.json"]);
+
+/**
+ * The heavy four plus the optional extras. `meta.json` is fetched first and decides whether any
+ * of these are downloaded at all.
+ */
+const PIPELINE_DATA_FILES = Object.freeze([
+  ...PIPELINE_FILES.filter((file) => file !== "meta.json"),
+  ...OPTIONAL_PIPELINE_FILES,
+]);
+
+const OPTIONAL_FILE_SET = new Set(OPTIONAL_PIPELINE_FILES);
 
 /** Without these three there is nothing to analyze. */
 const REQUIRED_FILES = Object.freeze(["players.json", "projections.json", "values.json"]);
@@ -303,6 +325,19 @@ async function fetchDataFile(file, fetchImpl) {
   return await response.json();
 }
 
+/**
+ * Shape gate for an optional pipeline file (design §13.6 F3). A file that fails it is treated as
+ * absent — never handed to the engine, never cached over a good copy.
+ * @param {string} file
+ * @param {unknown} payload
+ * @returns {boolean}
+ */
+function isUsableOptionalFile(file, payload) {
+  if (!isPlainObject(payload)) return false;
+  if (file === "history.json") return payload.version === 1 && isPlainObject(payload.seasons);
+  return true;
+}
+
 function makeProgress(onProgress) {
   if (typeof onProgress !== "function") return () => {};
   return (step, label, done) => {
@@ -448,10 +483,19 @@ async function loadPipelineFiles({ fetchImpl, idb, force, errors }) {
   const storedStamp = isoOrNull(storedMeta?.payload?.generated_at);
   if (!force && fileSource["meta.json"] === "network" && stamp && stamp === storedStamp) {
     const stored = await Promise.all(PIPELINE_DATA_FILES.map((file) => idb.get(`pipeline:${file}`)));
-    if (stored.every((record) => record?.payload !== undefined && record?.payload !== null)) {
+    // An optional file may legitimately be missing from the drawer — it must not cost the other
+    // 250 KB their fast path.
+    const complete = PIPELINE_DATA_FILES.every(
+      (file, index) =>
+        OPTIONAL_FILE_SET.has(file) ||
+        (stored[index]?.payload !== undefined && stored[index]?.payload !== null),
+    );
+    if (complete) {
       PIPELINE_DATA_FILES.forEach((file, index) => {
-        files[file] = stored[index].payload;
-        fileSource[file] = "idb";
+        const payload = stored[index]?.payload;
+        const present = payload !== undefined && payload !== null;
+        files[file] = present ? payload : null;
+        fileSource[file] = present ? "idb" : "absent";
       });
       return { files, fileSource, pipelineSource: "idb" };
     }
@@ -460,16 +504,30 @@ async function loadPipelineFiles({ fetchImpl, idb, force, errors }) {
   await Promise.all(
     PIPELINE_DATA_FILES.map(async (file) => {
       const key = `pipeline:${file}`;
+      const optional = OPTIONAL_FILE_SET.has(file);
       try {
-        files[file] = await fetchDataFile(file, fetchImpl);
+        const payload = await fetchDataFile(file, fetchImpl);
+        // A GitHub Pages 404 is served as HTML and a half-written file is worse than none, so an
+        // optional payload that is not the file it claims to be counts as absent — and is never
+        // written over a good cached copy.
+        if (optional && !isUsableOptionalFile(file, payload)) {
+          throw new Error(`data/${file} is not a ${file} payload`);
+        }
+        files[file] = payload;
         fileSource[file] = "network";
-        await idb.set(key, files[file]);
+        await idb.set(key, payload);
       } catch (error) {
         const cached = await idb.get(key);
-        if (cached) {
+        const usable = cached && (!optional || isUsableOptionalFile(file, cached.payload));
+        if (usable) {
           files[file] = cached.payload;
           fileSource[file] = "cache";
-          errors.push({ source: `data/${file}`, message: `${message(error)} — using cached copy` });
+          if (!optional) {
+            errors.push({ source: `data/${file}`, message: `${message(error)} — using cached copy` });
+          }
+        } else if (optional) {
+          files[file] = null;
+          fileSource[file] = "absent";
         } else {
           errors.push({ source: `data/${file}`, message: message(error) });
         }
@@ -478,10 +536,14 @@ async function loadPipelineFiles({ fetchImpl, idb, force, errors }) {
   );
 
   // Stamp the drawer with the new build only once its files are actually in it: storing a newer
-  // meta over half-downloaded data would make the next load trust yesterday's players.
+  // meta over half-downloaded data would make the next load trust yesterday's players. An optional
+  // file the repo does not publish counts as settled, so it never blocks the stamp.
   if (
     fileSource["meta.json"] === "network" &&
-    PIPELINE_DATA_FILES.every((file) => fileSource[file] === "network")
+    PIPELINE_DATA_FILES.every(
+      (file) =>
+        fileSource[file] === "network" || (OPTIONAL_FILE_SET.has(file) && fileSource[file] === "absent"),
+    )
   ) {
     await idb.set("pipeline:meta.json", files["meta.json"]);
   }
@@ -731,6 +793,10 @@ export async function loadAll(options = {}) {
       values,
       schedule: files["schedule.json"],
       meta: files["meta.json"],
+      // Design §13.6 F3: last season's and this season's actuals, behind the risk model. Optional
+      // in every direction — `null` whenever the pipeline has not published a usable file, and
+      // `buildContext` turns it into an empty `ctx.history` Map (§13.4 C1).
+      history: isPlainObject(files["history.json"]) ? files["history.json"] : null,
       // Design §11.2: the engine never calls Date.now(), so the clock is an input. Both keys are
       // optional on the engine side — nothing breaks if buildContext ignores them.
       trending,

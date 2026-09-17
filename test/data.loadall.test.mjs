@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   FC_FLOORS,
+  OPTIONAL_PIPELINE_FILES,
   PIPELINE_FILES,
   fcParamsFromLeague,
   fcTableNames,
@@ -26,16 +27,20 @@ const boom = () => {
 
 /**
  * How many of the five COMMITTED pipeline files a load downloaded. `data/advisor.json` (design
- * §12.4) rides along on every load and is optional in both directions — present or not, it says
- * nothing about whether the 250 KB pipeline payload was re-fetched — so it is counted out here.
+ * §12.4) and the OPTIONAL files of §13.6 F3 ride along on every load and say nothing about
+ * whether the 250 KB pipeline payload was re-fetched, so they are counted out here.
  */
-const pipelineUrls = (fetchImpl) => fetchImpl.urls("data/").filter((url) => !url.includes("advisor"));
+const rideAlongs = ["advisor.json", ...OPTIONAL_PIPELINE_FILES];
+const pipelineUrls = (fetchImpl) =>
+  fetchImpl.urls("data/").filter((url) => !rideAlongs.some((file) => url.includes(file)));
 const pipelineHits = (fetchImpl) => pipelineUrls(fetchImpl).length;
 
 /** Build the standard route table; every layer can be swapped for a failure/short response. */
-function makeRoutes({ data, league, users, rosters, state, trending, fcRedraft, fcDynasty } = {}) {
+function makeRoutes({ data, history, league, users, rosters, state, trending, fcRedraft, fcDynasty } = {}) {
   return [
     ...PIPELINE_FILES.map((file) => ({ match: `data/${file}`, respond: data ?? (() => fixture(file)) })),
+    // The optional feeds of design §13.6 F3. A test drops one by passing `history: boom`.
+    { match: "data/history.json", respond: history ?? data ?? (() => fixture("history.json")) },
     { match: "/trending/add", respond: trending ?? (() => fixture("trending_add.json")) },
     { match: /\/league\/[^/?]+\/users/, respond: users ?? (() => fixture("users.json")) },
     { match: /\/league\/[^/?]+\/rosters/, respond: rosters ?? (() => fixture("rosters.json")) },
@@ -152,6 +157,7 @@ test("loadAll: happy path builds ctx, live values, and a clean freshness report"
   assert.equal(buildContext.seen.length, 1);
   const { input, settings: applied } = buildContext.seen[0];
   assert.deepEqual(Object.keys(input).sort(), [
+    "history",
     "league",
     "meta",
     "now",
@@ -206,6 +212,7 @@ test("loadAll: happy path builds ctx, live values, and a clean freshness report"
   assert.deepEqual(keys, [
     "fc:fc_dynasty:1:8:0.5",
     "fc:fc_redraft:1:8:0.5",
+    "pipeline:history.json",
     "pipeline:meta.json",
     "pipeline:players.json",
     "pipeline:projections.json",
@@ -545,4 +552,127 @@ test("loadAll: a league with no user loads in viewer mode, settings passed throu
   assert.deepEqual(Object.keys(viewer).sort(), ["leagueId", "season"], "and never written to");
   assert.equal(freshness.season, "2026");
   assert.equal(buildContext.seen[0].input.rosters.length, 8, "the whole league is still readable");
+});
+
+// ── data/history.json, the optional pipeline file (design §13.6 F3) ─────────────────────────
+
+/** The engine's view of the history feed after one load. */
+const historyOf = (buildContext) => buildContext.seen[0].input.history;
+
+test("loadAll: history.json rides along, reaches buildContext and lands in the drawer", async () => {
+  const { deps, fetchImpl, idb, buildContext } = harness();
+
+  const { errors } = await loadAll({ settings, deps });
+
+  const history = historyOf(buildContext);
+  assert.equal(history.version, 1);
+  assert.deepEqual(history.scoring, { std: "pts_std", rec: "rec" });
+  assert.deepEqual(Object.keys(history.seasons), ["2025", "2026"]);
+  assert.deepEqual(history.seasons["2025"].players["4866"].w[0], [14.4, 4], "Saquon wk1 2025");
+  assert.equal(history.seasons["2025"].players["11604"].gp, 12, "Bowers played 12 of 2025");
+  assert.deepEqual(errors, [], "an optional file never contributes an error");
+
+  assert.equal(idb.store.get("pipeline:history.json").payload.version, 1);
+  assert.equal(pipelineHits(fetchImpl), 5, "it is not counted against the five committed files");
+  const [call] = fetchImpl.calls.filter((c) => c.url.includes("data/history.json"));
+  assert.equal(call.cache, "no-store");
+  assert.doesNotMatch(call.url, /cb=/, "a stable URL keeps the service worker able to serve it");
+});
+
+test("loadAll: a repo with no history.json loads with history null and no error", async () => {
+  // 404 on GitHub Pages arrives as a body that is not JSON; `boom` is the same shape of failure.
+  const { deps, buildContext } = harness({ routes: makeRoutes({ history: boom }) });
+
+  const { errors, freshness } = await loadAll({ settings, deps });
+
+  assert.equal(historyOf(buildContext), null);
+  assert.deepEqual(errors, []);
+  assert.equal(freshness.offline, false, "a missing optional file is not an offline fallback");
+  assert.equal(freshness.pipelineSource, "network");
+});
+
+test("loadAll: an invalid history.json is treated as absent and never cached", async () => {
+  for (const bad of [
+    () => "<!DOCTYPE html><title>404</title>", // a Pages 404 page
+    () => ({ version: 2, seasons: {} }), // a schema this app does not know
+    () => ({ version: 1 }), // half-written
+    () => [],
+  ]) {
+    const { deps, idb, buildContext } = harness({ routes: makeRoutes({ history: bad }) });
+    const { errors } = await loadAll({ settings, deps });
+    assert.equal(historyOf(buildContext), null, `${JSON.stringify(bad())} should read as absent`);
+    assert.deepEqual(errors, []);
+    assert.equal(idb.store.get("pipeline:history.json"), undefined, "nothing bad in the drawer");
+  }
+});
+
+test("loadAll: an unreachable history.json falls back to the cached copy, quietly", async () => {
+  const { deps, buildContext } = harness({
+    routes: makeRoutes({ history: boom }),
+    seed: { "pipeline:history.json": fixture("history.json") },
+  });
+
+  const { errors } = await loadAll({ settings, deps });
+
+  assert.equal(historyOf(buildContext).seasons["2025"].players["4866"].gp, 16);
+  assert.deepEqual(errors, [], "still not worth an error line");
+});
+
+test("loadAll: a cached history.json that no longer matches the contract is dropped", async () => {
+  const { deps, buildContext } = harness({
+    routes: makeRoutes({ history: boom }),
+    seed: { "pipeline:history.json": { version: 0, seasons: {} } },
+  });
+
+  await loadAll({ settings, deps });
+
+  assert.equal(historyOf(buildContext), null, "a v0 file from an older app is not a v1 file");
+});
+
+test("loadAll: history.json missing does not block the unchanged-build fast path", async () => {
+  // pipelineSeed() holds the five committed files and no history — the 250 KB must still be reused.
+  const { deps, fetchImpl, buildContext } = harness({ seed: pipelineSeed() });
+
+  const { freshness, errors } = await loadAll({ settings, deps });
+
+  assert.equal(freshness.pipelineSource, "idb");
+  assert.deepEqual(pipelineUrls(fetchImpl), ["data/meta.json"]);
+  assert.equal(fetchImpl.count("data/history.json"), 0, "the fast path downloads nothing");
+  assert.equal(historyOf(buildContext), null);
+  assert.deepEqual(errors, []);
+});
+
+test("loadAll: the fast path serves a stored history.json from the drawer", async () => {
+  const { deps, fetchImpl, buildContext } = harness({
+    seed: { ...pipelineSeed(), "pipeline:history.json": fixture("history.json") },
+  });
+
+  await loadAll({ settings, deps });
+
+  assert.deepEqual(pipelineUrls(fetchImpl), ["data/meta.json"]);
+  assert.equal(historyOf(buildContext).seasons["2026"].weeks, 1);
+});
+
+test("loadAll: a missing history.json still lets the build stamp be written", async () => {
+  // Otherwise every load would re-download the 250 KB until the cron published one.
+  const { deps, idb } = harness({
+    routes: makeRoutes({ history: boom }),
+    seed: olderPipelineSeed(),
+  });
+
+  await loadAll({ settings, deps });
+
+  assert.equal(idb.store.get("pipeline:meta.json").payload.generated_at, PIPELINE_AT);
+});
+
+test("loadAll: a half-downloaded build still refuses the stamp when a required file failed", async () => {
+  const stale = "2026-09-09T09:59:31Z";
+  const routes = makeRoutes().map((route) =>
+    route.match === "data/values.json" ? { ...route, respond: boom } : route,
+  );
+  const { deps, idb } = harness({ routes, seed: olderPipelineSeed(stale) });
+
+  await loadAll({ settings, deps });
+
+  assert.equal(idb.store.get("pipeline:meta.json").payload.generated_at, stale);
 });

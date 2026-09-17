@@ -351,20 +351,136 @@ export function validateMeta(obj) {
   return problems;
 }
 
+/** Schema version data/history.json must declare (design §13.6 F1). */
+export const HISTORY_VERSION = 1;
+
+/** Longest season this file may describe. A `weeks` above it means the plan went wrong. */
+export const MAX_HISTORY_WEEKS = 18;
+
+const SEASON_YEAR = /^\d{4}$/;
+
 /**
- * Run every validator over a full pipeline output.
+ * One `seasons[<year>].players[<id>]` row.
+ * @param {string[]} problems
+ * @param {string} label
+ * @param {unknown} row
+ * @param {number} weeks
+ */
+function checkHistoryPlayer(problems, label, row, weeks) {
+  if (!isPlainObject(row)) {
+    problems.push(`${label}: not an object`);
+    return;
+  }
+  if (!Number.isFinite(row.gp) || Number(row.gp) < 0) {
+    problems.push(`${label}.gp must be a non-negative number, got ${JSON.stringify(row.gp)}`);
+  }
+  if (row.ga !== null && (!Number.isFinite(row.ga) || Number(row.ga) < 0)) {
+    problems.push(`${label}.ga must be a non-negative number or null, got ${JSON.stringify(row.ga)}`);
+  }
+  if (!Array.isArray(row.w)) {
+    problems.push(`${label}.w must be an array`);
+    return;
+  }
+  if (row.w.length !== weeks) {
+    problems.push(`${label}.w holds ${row.w.length} entries, expected ${weeks}`);
+    return;
+  }
+  for (const [index, cell] of row.w.entries()) {
+    if (cell === null) continue;
+    if (!Array.isArray(cell) || cell.length !== 2) {
+      problems.push(`${label}.w[${index}] must be null or [pts_std, rec], got ${JSON.stringify(cell)}`);
+      return;
+    }
+    for (const value of cell) {
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        problems.push(`${label}.w[${index}] holds a non-finite number: ${JSON.stringify(cell)}`);
+        return;
+      }
+    }
+  }
+  if (!row.w.some((cell) => cell !== null)) {
+    problems.push(`${label} has no active week — the row should have been dropped`);
+  }
+}
+
+/**
+ * Validate data/history.json (design §13.6 F1) — last season's and this season's ACTUALS, the
+ * input to the risk model's durability and volatility terms. Row-count floors deliberately live
+ * in pipeline/lastgood.mjs (`HISTORY_FLOORS`), not here: a short season is a last-good decision,
+ * a malformed one is a contract failure.
+ * @param {unknown} obj
+ * @returns {string[]} problems, empty when valid
+ */
+export function validateHistory(obj) {
+  /** @type {string[]} */
+  const problems = [];
+  if (!isPlainObject(obj)) return ["history: not an object"];
+  if (obj.version !== HISTORY_VERSION) {
+    problems.push(`history.version must be ${HISTORY_VERSION}, got ${JSON.stringify(obj.version)}`);
+  }
+  checkTimestamp(problems, obj.generated_at, "history.generated_at");
+  if (!isPlainObject(obj.scoring)) {
+    problems.push("history.scoring must name the raw stat keys, e.g. {\"std\":\"pts_std\",\"rec\":\"rec\"}");
+  } else {
+    for (const field of ["std", "rec"]) {
+      if (typeof obj.scoring[field] !== "string" || obj.scoring[field] === "") {
+        problems.push(`history.scoring.${field} is not a stat key`);
+      }
+    }
+  }
+  if (!isPlainObject(obj.seasons)) {
+    problems.push("history.seasons: not an object");
+    return problems;
+  }
+  const seasons = Object.entries(obj.seasons);
+  if (seasons.length === 0) problems.push("history.seasons: no seasons");
+  for (const [year, season] of seasons) {
+    const label = `history.seasons["${year}"]`;
+    if (!SEASON_YEAR.test(year)) problems.push(`${label}: key is not a four-digit season`);
+    if (!isPlainObject(season)) {
+      problems.push(`${label}: not an object`);
+      continue;
+    }
+    if (!Number.isInteger(season.weeks) || season.weeks < 0 || season.weeks > MAX_HISTORY_WEEKS) {
+      problems.push(`${label}.weeks must be an integer 0..${MAX_HISTORY_WEEKS}, got ${JSON.stringify(season.weeks)}`);
+      continue;
+    }
+    if (!isPlainObject(season.players)) {
+      problems.push(`${label}.players: not an object`);
+      continue;
+    }
+    if (season.weeks === 0 && Object.keys(season.players).length > 0) {
+      problems.push(`${label}: 0 weeks but ${Object.keys(season.players).length} player rows`);
+      continue;
+    }
+    for (const [id, row] of Object.entries(season.players)) {
+      checkHistoryPlayer(problems, `${label}.players["${id}"]`, row, season.weeks);
+    }
+  }
+  return problems;
+}
+
+/**
+ * Run every validator over a full pipeline output. `history` is optional in both directions: it
+ * is validated when the run produced one, and left out of the report when it did not, so a repo
+ * whose pipeline predates design §13.6 still validates clean.
  * @param {{ players: unknown, projections: unknown, values: unknown, schedule: unknown,
- *   meta: unknown }} files
+ *   meta: unknown, history?: unknown }} files
  * @returns {Record<string, string[]>} file name -> problems
  */
 export function validateAll(files) {
-  return {
+  /** @type {Record<string, string[]>} */
+  const report = {
     players: validatePlayers(files.players),
     projections: validateProjections(files.projections),
     values: validateValues(files.values),
     schedule: validateSchedule(files.schedule),
     meta: validateMeta(files.meta),
   };
+  if (files.history !== undefined && files.history !== null) {
+    report.history = validateHistory(files.history);
+  }
+  return report;
 }
 
 /** Schema version data/alerts-state.json must declare (design §11.3). */
