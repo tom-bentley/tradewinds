@@ -99,12 +99,17 @@ export function diagnose(input) {
   if (!state) {
     lines.push("State         data/alerts-state.json could not be read");
     problems.push("Without the state file nothing can be said about which devices the job knows.");
-    return { lines, problems, devices: [], runs: runs?.[0] ?? null };
+    return { lines, problems, devices: [], pairings: [], runs: runs?.[0] ?? null };
   }
 
   const stateDevices = state.devices && typeof state.devices === "object" ? state.devices : {};
   const ids = Object.keys(stateDevices);
-  lines.push(`State         ${ids.length} device entr${ids.length === 1 ? "y" : "ies"} · ${Object.keys(state.leagues ?? {}).length} league(s)`);
+  const pairings = state.pairings && typeof state.pairings === "object" ? state.pairings : {};
+  const live = Object.keys(pairings).filter((id) => !pairings[id].supersededBy);
+  lines.push(
+    `State         ${ids.length} device entr${ids.length === 1 ? "y" : "ies"} · ${Object.keys(state.leagues ?? {}).length} league(s)` +
+      (Object.keys(pairings).length ? ` · ${live.length} self-paired (${Object.keys(pairings).length - live.length} superseded)` : ""),
+  );
 
   /** @type {object[]} */
   const report = [];
@@ -158,6 +163,14 @@ export function diagnose(input) {
     }
   }
   for (const row of report) {
+    // A device that filed its own pairing (§13.3 B5) is reachable without ever appearing in the
+    // secret, so its absence there is not a fault.
+    if (pairings[row.id] && !pairings[row.id].supersededBy) {
+      row.paired = true;
+      row.label = row.label ?? pairings[row.id].label ?? null;
+      row.selfPaired = true;
+      continue;
+    }
     if (row.paired === null && devices.length) {
       row.paired = false;
       problems.push(
@@ -167,7 +180,29 @@ export function diagnose(input) {
     }
   }
 
-  return { lines, problems, devices: report, runs: runs?.[0] ?? null };
+  // --- self-filed pairings (§13.3 B5) ------------------------------------------------------------
+  /** @type {object[]} */
+  const pairingRows = [];
+  for (const id of Object.keys(pairings).sort()) {
+    const entry = pairings[id] || {};
+    pairingRows.push({
+      id,
+      label: entry.label ?? null,
+      userId: entry.userId ?? null,
+      leagueId: entry.leagueId ?? null,
+      createdAt: entry.createdAt ?? null,
+      supersededBy: entry.supersededBy ?? null,
+    });
+  }
+  for (const row of pairingRows) {
+    if (row.supersededBy || report.some((entry) => entry.id === row.id)) continue;
+    problems.push(
+      `Pairing ${row.label ?? row.id} (${row.id}) was filed by the phone but has never been sent to — ` +
+        "check that VAPID_PRIVATE_KEY can open it and that its league is reachable.",
+    );
+  }
+
+  return { lines, problems, devices: report, pairings: pairingRows, runs: runs?.[0] ?? null };
 }
 
 /** The printable report. */
@@ -179,7 +214,13 @@ export function render(result, { now, devicesKnown }) {
   }
   for (const device of result.devices) {
     const name = device.label ? `${device.label} (${device.id})` : device.id;
-    const paired = device.paired === true ? "in the secret" : device.paired === false ? "NOT in the secret" : "secret not supplied";
+    const paired = device.selfPaired
+      ? "self-paired by the phone"
+      : device.paired === true
+        ? "in the secret"
+        : device.paired === false
+          ? "NOT in the secret"
+          : "secret not supplied";
     out.push(`  ${name}`);
     out.push(`    pairing     ${paired}${device.expired ? " · marked expired" : ""}`);
     out.push(
@@ -192,6 +233,18 @@ export function render(result, { now, devicesKnown }) {
     if (device.lastKindAt) {
       const cooldowns = Object.entries(device.lastKindAt).map(([kind, at]) => `${kind} ${ago(at, now)}`);
       out.push(`    cooldowns   ${cooldowns.join(" · ")}`);
+    }
+  }
+
+  if ((result.pairings || []).length) {
+    out.push("");
+    out.push("Self-filed pairings (ciphertext in the state file; only VAPID_PRIVATE_KEY opens them)");
+    for (const row of result.pairings) {
+      out.push(
+        `  ${row.label ?? "(unlabelled)"} (${row.id})` +
+          `  league ${row.leagueId ?? "?"} · filed ${ago(row.createdAt, now)}` +
+          (row.supersededBy ? ` · superseded by ${row.supersededBy}` : ""),
+      );
     }
   }
 

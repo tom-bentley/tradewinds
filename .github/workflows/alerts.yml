@@ -21,6 +21,11 @@ name: Alerts
 #          -d '{"event_type":"alerts"}'
 #   The PAT is fine-grained on this repo only, with Contents: read and Actions: write. Task
 #   Scheduler on Tom's PC runs that curl every 10 minutes while the machine is awake.
+#   The same dispatch, with event_type "pair", is how the PHONE re-pairs itself after iOS rotates
+#   its push subscription (design 13.3 B5): the app posts its pairing payload encrypted to the
+#   VAPID public key, this job opens it with VAPID_PRIVATE_KEY and files the ciphertext in
+#   data/alerts-state.json. Nothing readable ever reaches the public repository. That token is a
+#   fine-grained PAT on this repository only, with Actions: read and write.
 # - The app recomputes the same advice on open, so a late push never means a wrong decision.
 # - refresh-data.yml commits the same repo, so both workflows pull --rebase before pushing.
 # - A 410/404 from a push service marks the device expired in data/alerts-state.json; the secret
@@ -40,7 +45,7 @@ on:
   schedule:
     - cron: "4-59/10 * * * *"
   repository_dispatch:
-    types: [alerts]
+    types: [alerts, pair]
   workflow_dispatch:
     inputs:
       test:
@@ -89,6 +94,11 @@ jobs:
           PUSH_SUBSCRIPTIONS: ${{ secrets.PUSH_SUBSCRIPTIONS }}
           VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
           ALERT_WEBHOOKS: ${{ secrets.ALERT_WEBHOOKS }}
+          # repository_dispatch payload: "{}" for schedule and workflow_dispatch. A `pair`
+          # event carries { v, blob, deviceId, label }, where blob is the phone's pairing
+          # payload sealed to the VAPID PUBLIC key — only VAPID_PRIVATE_KEY opens it.
+          # `{ test: true }` is the phone asking for one test push.
+          PAIR_PAYLOAD: ${{ toJson(github.event.client_payload) }}
           ALERT_TEST: ${{ inputs.test && '1' || '' }}
           ALERT_FULL: ${{ inputs.full && '1' || '' }}
 

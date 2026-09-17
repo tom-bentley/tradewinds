@@ -723,6 +723,244 @@ export async function testNotification(options = {}, deps = options.deps ?? {}) 
   }
 }
 
+/* ───────────────────── self-healing pairing (design §13.3 B5, research R5 §6.2) ─────────────────
+ *
+ * Why this exists: iOS does NOT reliably fire `pushsubscriptionchange`, subscriptions carry no
+ * `expirationTime`, and Safari clears service-worker state after a stretch of inactivity — so a
+ * subscription can simply vanish or rotate with no event at all (Apple Developer Forums 727372;
+ * R5 §6.2). The recovery the research recommends is an idempotent re-subscribe on every boot plus
+ * a re-sync with the sender (R5 §6.4 item 3). This section is that re-sync, made automatic.
+ *
+ * The pairing payload contains the endpoint and the two subscription secrets, so it may never be
+ * committed in the clear. It is sealed to the VAPID PUBLIC key — the one key the repository
+ * already publishes — with ECIES (ephemeral ECDH P-256 → HKDF-SHA256 → AES-256-GCM), so only the
+ * holder of `VAPID_PRIVATE_KEY` (the GitHub Action) can open it. The ciphertext is what lands in
+ * the public state file.
+ */
+
+/** localStorage key holding the fine-grained GitHub PAT that lets this phone re-pair itself. */
+export const GITHUB_TOKEN_KEY = "tradewinds.gh.v1";
+
+/** The repository the dispatch goes to. */
+export const REPO_SLUG = "tom-bentley/tradewinds";
+
+/** HKDF `info` — changing it changes the derived key, so it is versioned with the blob. */
+export const PAIR_INFO = "tradewinds-pair-v1";
+
+const b64urlFromBytes = (bytes) => {
+  let binary = "";
+  const view = new Uint8Array(bytes);
+  for (let i = 0; i < view.length; i += 1) binary += String.fromCharCode(view[i]);
+  return globalThis.btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+
+/**
+ * Seal a pairing payload to the VAPID public key. The result is one base64url string, safe to put
+ * in a public repository: without `VAPID_PRIVATE_KEY` it is noise.
+ *
+ * @param {object} pairing the payload `enableAlerts` produced
+ * @param {PushDeps & {randomBytes?: Function}} [deps]
+ * @returns {Promise<string>}
+ * @throws {Error} when WebCrypto is unavailable — the caller falls back to the manual paste.
+ */
+export async function pairingBlob(pairing, deps = {}) {
+  const d = resolve(deps);
+  const subtle = deps.subtle !== undefined ? deps.subtle : d.subtle;
+  const random =
+    deps.randomBytes ??
+    ((n) => (d.win?.crypto ?? globalThis.crypto).getRandomValues(new Uint8Array(n)));
+  if (!subtle?.deriveBits) throw new Error("This browser cannot encrypt the pairing code.");
+
+  const serverKey = await subtle.importKey(
+    "raw",
+    urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+    { name: "ECDH", namedCurve: "P-256" },
+    false,
+    [],
+  );
+  const ephemeral = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  // P-256 ECDH derives the 32-byte x coordinate — the same bytes node's `computeSecret` returns.
+  const shared = await subtle.deriveBits({ name: "ECDH", public: serverKey }, ephemeral.privateKey, 256);
+
+  const salt = random(16);
+  const hkdfKey = await subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+  const keyBits = await subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt, info: new TextEncoder().encode(PAIR_INFO) },
+    hkdfKey,
+    256,
+  );
+  const aesKey = await subtle.importKey("raw", keyBits, { name: "AES-GCM" }, false, ["encrypt"]);
+
+  const iv = random(12);
+  const ciphertext = await subtle.encrypt(
+    { name: "AES-GCM", iv },
+    aesKey,
+    new TextEncoder().encode(JSON.stringify(pairing)),
+  );
+  const epk = await subtle.exportKey("raw", ephemeral.publicKey);
+
+  const envelope = {
+    v: 1,
+    epk: b64urlFromBytes(epk),
+    salt: b64urlFromBytes(salt),
+    iv: b64urlFromBytes(iv),
+    ct: b64urlFromBytes(ciphertext),
+  };
+  return b64urlFromBytes(new TextEncoder().encode(JSON.stringify(envelope)));
+}
+
+/** The PAT saved on this device, or "". Never throws. */
+export function storedToken(deps = {}) {
+  const { storage } = resolve(deps);
+  try {
+    return String(storage?.getItem(GITHUB_TOKEN_KEY) ?? "");
+  } catch {
+    return "";
+  }
+}
+
+/** Save (or, with "", forget) the PAT. Returns false when storage refuses. */
+export function saveToken(token, deps = {}) {
+  const { storage } = resolve(deps);
+  try {
+    const value = String(token ?? "").trim();
+    if (value) storage?.setItem(GITHUB_TOKEN_KEY, value);
+    else storage?.removeItem(GITHUB_TOKEN_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `github_pat_…12345678` — never render a token in full, not even on the owner's own phone. */
+export function maskToken(token) {
+  const value = String(token ?? "");
+  if (!value) return "";
+  if (value.length <= 12) return `${value.slice(0, 2)}…${value.slice(-2)}`;
+  return `${value.slice(0, 8)}…${value.slice(-4)}`;
+}
+
+/** What a GitHub dispatch failure means, in words the card can print. */
+export const DISPATCH_REASON_TEXT = Object.freeze({
+  401: "GitHub rejected the token (401). Paste a fresh fine-grained token.",
+  403: "The token is missing the Actions: read and write permission (403).",
+  404: "GitHub could not find the repository for this token (404) — check that it is scoped to tom-bentley/tradewinds.",
+  422: "GitHub refused the payload (422).",
+});
+
+/**
+ * Ask GitHub to run the Alerts workflow with a payload, via `repository_dispatch`.
+ *
+ * The token never leaves this phone except as the `Authorization` header on this one request;
+ * api.github.com sends CORS headers, so the browser can call it directly.
+ *
+ * @param {{event?: string, payload?: object, token?: string, repo?: string, deps?: PushDeps}} options
+ * @returns {Promise<{ok: boolean, status: number|null, reason?: string}>}
+ */
+export async function dispatchToGithub(options = {}, deps = options.deps ?? {}) {
+  const d = resolve(deps);
+  const token = String(options.token ?? storedToken(deps)).trim();
+  if (!token) return { ok: false, status: null, reason: "No GitHub token saved on this phone." };
+  if (typeof d.fetchImpl !== "function") return { ok: false, status: null, reason: "This browser cannot reach GitHub." };
+  const repo = options.repo ?? REPO_SLUG;
+  try {
+    const response = await d.fetchImpl(`https://api.github.com/repos/${repo}/dispatches`, {
+      method: "POST",
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ event_type: options.event ?? "alerts", client_payload: options.payload ?? {} }),
+    });
+    const status = Number(response?.status ?? 0);
+    if (status === 204) return { ok: true, status };
+    return { ok: false, status, reason: DISPATCH_REASON_TEXT[status] ?? `GitHub replied ${status || "nothing"}.` };
+  } catch (error) {
+    return { ok: false, status: null, reason: `Could not reach GitHub: ${error?.message ?? error}` };
+  }
+}
+
+/**
+ * Seal this device's pairing and hand it to the Alerts workflow. One call replaces the whole
+ * copy-the-code-and-paste-it-into-a-secret dance — when a token is saved.
+ * @param {{pairing?: object, token?: string, repo?: string, deps?: PushDeps}} [options]
+ * @returns {Promise<{ok: boolean, status?: number|null, reason?: string, deviceId?: string|null}>}
+ */
+export async function sendPairing(options = {}, deps = options.deps ?? {}) {
+  const pairing = options.pairing ?? storedPairing(deps);
+  if (!pairing?.sub?.endpoint) return { ok: false, reason: "Nothing is paired on this phone yet." };
+  let blob;
+  try {
+    blob = await pairingBlob(pairing, deps);
+  } catch (error) {
+    return { ok: false, reason: String(error?.message ?? error) };
+  }
+  const deviceId = await deviceIdOf(pairing.sub.endpoint, deps);
+  const result = await dispatchToGithub(
+    {
+      event: "pair",
+      payload: { v: 1, blob, deviceId, label: pairing.label ?? null },
+      token: options.token,
+      repo: options.repo,
+    },
+    deps,
+  );
+  return { ...result, deviceId };
+}
+
+/**
+ * Make sure this device HAS a live subscription, re-creating it silently when iOS threw it away.
+ *
+ * No user gesture is needed here: the gesture requirement in Apple's own guidance is on
+ * `Notification.requestPermission()` (WebKit blog 13878 / WWDC22 10098, research R5 §6.1), and
+ * permission is already `granted` by the time this runs. If a browser disagrees, `subscribe()`
+ * rejects and the caller falls back to the "re-pair" banner — nothing is lost either way.
+ *
+ * @param {PushDeps} [deps]
+ * @returns {Promise<{subscription: object|null, resubscribed: boolean, rotated: boolean,
+ *   pairing: object|null, error: string|null}>} `rotated` means the stored pairing was rewritten
+ *   (a new subscription, or the same one at a new address) and the sender needs the new code.
+ */
+export async function ensureSubscription(deps = {}) {
+  const d = resolve(deps);
+  const pairing = storedPairing(deps);
+  const reg = await readyRegistration(d, SW_STATUS_TIMEOUT_MS);
+  if (!reg?.pushManager) return { subscription: null, resubscribed: false, pairing, error: "no-service-worker" };
+
+  const subJson = (subscription) =>
+    typeof subscription?.toJSON === "function" ? subscription.toJSON() : { endpoint: subscription?.endpoint };
+
+  const existing = await currentSubscription(reg);
+  if (existing) {
+    // The subscription is alive but at a NEW address. Refresh the stored pairing first, or "Show
+    // pairing code" would hand Tom a code for an endpoint nothing listens on any more.
+    if (pairing && pairing.sub?.endpoint && pairing.sub.endpoint !== existing.endpoint) {
+      const next = { ...pairing, sub: subJson(existing), createdAt: new Date(d.now()).toISOString() };
+      savePairing(next, deps);
+      return { subscription: existing, resubscribed: false, rotated: true, pairing: next, error: null };
+    }
+    return { subscription: existing, resubscribed: false, rotated: false, pairing, error: null };
+  }
+  // Nothing stored to restore, or no permission to restore it with: leave it to the user.
+  if (!pairing) return { subscription: null, resubscribed: false, rotated: false, pairing: null, error: null };
+  if (d.notification?.permission !== "granted") {
+    return { subscription: null, resubscribed: false, rotated: false, pairing, error: "permission" };
+  }
+
+  try {
+    const subscription = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+    });
+    const next = { ...pairing, sub: subJson(subscription), createdAt: new Date(d.now()).toISOString() };
+    savePairing(next, deps);
+    return { subscription, resubscribed: true, rotated: true, pairing: next, error: null };
+  } catch (error) {
+    return { subscription: null, resubscribed: false, rotated: false, pairing, error: String(error?.message ?? error) };
+  }
+}
+
 /**
  * What the Settings → Alerts card renders. **Async** — it asks the service worker whether a
  * subscription is actually live, which is the only honest answer (the stored pairing can

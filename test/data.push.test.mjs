@@ -16,17 +16,25 @@ import {
   PUSH_STORAGE_KEY,
   PushError,
   VAPID_PUBLIC_KEY,
+  GITHUB_TOKEN_KEY,
   alertsStatus,
   alertsSupported,
   clearProbeCache,
   deviceIdOf,
   deviceLabel,
   disableAlerts,
+  dispatchToGithub,
   enableAlerts,
+  ensureSubscription,
+  maskToken,
+  pairingBlob,
   pairingCode,
   pushReceipts,
   reasonText,
+  saveToken,
+  sendPairing,
   storedPairing,
+  storedToken,
   testNotification,
   updatePrefs,
   urlBase64ToUint8Array,
@@ -801,4 +809,168 @@ test("the server/Actions probes are cached so a repaint is not a request storm",
   clearProbeCache();
   await alertsStatus(h.deps);
   assert.equal(h.fetchImpl.calls.filter((c) => c.url === STATE_URL).length, 2, "…until the sheet asks again");
+});
+
+/* ───────────── B5: this phone re-pairs itself (design §13.3) ───────────── */
+
+test("pairingBlob seals the payload so only VAPID_PRIVATE_KEY can read it", async () => {
+  // The job's own `decryptPairingBlob` opens it — that round trip is asserted in
+  // test/pipeline.alerts.test.mjs. Here: the envelope is well formed and leaks nothing.
+  const { deps } = harness();
+  const pairing = { v: 1, sub: { endpoint: "https://web.push.apple.com/QF2c-token", keys: { p256dh: "BM9", auth: "aUtH" } }, leagueId: "1", userId: "2", label: "iPhone" };
+
+  const blob = await pairingBlob(pairing, { ...deps, subtle: webcrypto.subtle, randomBytes: (n) => webcrypto.getRandomValues(new Uint8Array(n)) });
+
+  assert.match(blob, /^[A-Za-z0-9_-]+$/, "base64url, safe in a JSON body and a URL");
+  const envelope = JSON.parse(Buffer.from(blob, "base64url").toString("utf8"));
+  assert.equal(envelope.v, 1);
+  assert.equal(Buffer.from(envelope.epk, "base64url").length, 65, "an uncompressed P-256 point");
+  assert.equal(Buffer.from(envelope.epk, "base64url")[0], 4);
+  assert.equal(Buffer.from(envelope.salt, "base64url").length, 16);
+  assert.equal(Buffer.from(envelope.iv, "base64url").length, 12);
+  assert.ok(!blob.includes("web.push"), "the endpoint never travels in the clear");
+  assert.ok(!Buffer.from(blob, "base64url").toString("utf8").includes("aUtH"));
+
+  // Two seals of the same payload differ: fresh ephemeral key, fresh salt, fresh iv.
+  const again = await pairingBlob(pairing, { ...deps, subtle: webcrypto.subtle, randomBytes: (n) => webcrypto.getRandomValues(new Uint8Array(n)) });
+  assert.notEqual(blob, again);
+
+  await assert.rejects(pairingBlob(pairing, { ...deps, subtle: null }), /cannot encrypt/);
+});
+
+test("the GitHub token lives on this phone, masked, and can be removed", () => {
+  const { deps, storage } = harness();
+  assert.equal(storedToken(deps), "");
+  assert.equal(saveToken("github_pat_11ABCDEFG0aaaaaaaaaaaa_ZZZZ", deps), true);
+  assert.equal(storage.map.get(GITHUB_TOKEN_KEY), "github_pat_11ABCDEFG0aaaaaaaaaaaa_ZZZZ");
+  assert.equal(storedToken(deps), "github_pat_11ABCDEFG0aaaaaaaaaaaa_ZZZZ");
+  assert.equal(maskToken(storedToken(deps)), "github_p…ZZZZ", "never rendered in full");
+  assert.equal(maskToken("short"), "sh…rt");
+  assert.equal(maskToken(""), "");
+  saveToken("", deps);
+  assert.equal(storedToken(deps), "");
+  // Safari private mode: storage throws, and nothing above does.
+  const broken = harness({ storage: brokenStorage() });
+  assert.equal(storedToken(broken.deps), "");
+  assert.equal(saveToken("x", broken.deps), false);
+});
+
+test("sendPairing posts a repository_dispatch and turns every failure into words", async () => {
+  const calls = [];
+  const respond = (status) => async (url, init) => {
+    calls.push({ url, init });
+    return { status };
+  };
+
+  const ok = diagnosticHarness();
+  await enableAlerts({ settings }, ok.deps);
+  saveToken("github_pat_TOKEN", ok.deps);
+  const sent = await sendPairing({}, { ...ok.deps, fetchImpl: respond(204) });
+
+  assert.equal(sent.ok, true);
+  assert.equal(sent.deviceId, SHARED_DEVICE_ID);
+  assert.equal(calls[0].url, "https://api.github.com/repos/tom-bentley/tradewinds/dispatches");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers.Authorization, "Bearer github_pat_TOKEN");
+  const body = JSON.parse(calls[0].init.body);
+  assert.equal(body.event_type, "pair");
+  assert.equal(body.client_payload.deviceId, SHARED_DEVICE_ID);
+  assert.equal(body.client_payload.label, "Edge on Windows");
+  assert.ok(body.client_payload.blob.length > 100);
+  assert.ok(!calls[0].init.body.includes("web.push.apple.com"), "the dispatch body carries ciphertext only");
+
+  for (const [status, pattern] of [[401, /rejected the token/], [403, /Actions: read and write/], [404, /could not find the repository/]]) {
+    const failed = await sendPairing({}, { ...ok.deps, fetchImpl: respond(status) });
+    assert.equal(failed.ok, false);
+    assert.match(failed.reason, pattern);
+  }
+
+  const noToken = harness({ storage: fakeStorage() });
+  assert.match((await sendPairing({}, noToken.deps)).reason, /Nothing is paired/);
+});
+
+test("dispatchToGithub is how the phone asks for a test push without leaving the app", async () => {
+  const calls = [];
+  const h = harness();
+  saveToken("github_pat_TOKEN", h.deps);
+  const result = await dispatchToGithub(
+    { event: "alerts", payload: { test: true } },
+    {
+      ...h.deps,
+      fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        return { status: 204 };
+      },
+    },
+  );
+  assert.deepEqual(result, { ok: true, status: 204 });
+  assert.deepEqual(JSON.parse(calls[0].init.body), { event_type: "alerts", client_payload: { test: true } });
+
+  const noToken = harness({ storage: fakeStorage() });
+  assert.match((await dispatchToGithub({}, noToken.deps)).reason, /No GitHub token/);
+});
+
+test("ensureSubscription re-creates a subscription iOS threw away, with no user gesture", async () => {
+  // iOS does not reliably fire pushsubscriptionchange and subscriptions carry no expiry (research
+  // R5 §6.2), so the subscription can be gone with no event at all. Permission is already granted,
+  // which is what makes a silent re-subscribe legal.
+  const { deps, serviceWorker, storage } = harness({ notification: fakeNotification({ permission: "granted" }) });
+  const pairing = await enableAlerts({ settings }, deps);
+  await serviceWorker.subscription.unsubscribe(); // the OS drops it behind the app's back
+
+  const healed = await ensureSubscription(deps);
+
+  assert.equal(healed.resubscribed, true);
+  assert.equal(healed.rotated, true);
+  assert.ok(healed.subscription);
+  assert.equal(serviceWorker.pushManager.subscribeCalls.length, 2);
+  assert.equal(healed.pairing.leagueId, pairing.leagueId, "the same pairing, a new subscription");
+  assert.deepEqual(JSON.parse(storage.map.get(PUSH_STORAGE_KEY)).sub, healed.pairing.sub, "…and it is what Show pairing code now shows");
+});
+
+test("ensureSubscription rewrites the stored pairing when the address merely rotated", async () => {
+  const { deps, serviceWorker, storage } = harness({ notification: fakeNotification({ permission: "granted" }) });
+  await enableAlerts({ settings }, deps);
+  const rotated = fakeSubscription("https://web.push.apple.com/QF2c-ROTATED");
+  serviceWorker.registration.pushManager.getSubscription = async () => rotated;
+
+  const healed = await ensureSubscription(deps);
+
+  assert.equal(healed.resubscribed, false, "there was nothing to re-create");
+  assert.equal(healed.rotated, true, "…but the sender is holding the wrong address");
+  assert.equal(JSON.parse(storage.map.get(PUSH_STORAGE_KEY)).sub.endpoint, "https://web.push.apple.com/QF2c-ROTATED");
+});
+
+test("ensureSubscription does nothing it is not entitled to do", async () => {
+  // Nothing paired → no silent subscribe (that would be a permission prompt out of nowhere).
+  const fresh = harness({ notification: fakeNotification({ permission: "granted" }) });
+  const none = await ensureSubscription(fresh.deps);
+  assert.deepEqual([none.resubscribed, none.rotated, none.pairing], [false, false, null]);
+  assert.equal(fresh.serviceWorker.pushManager.subscribeCalls.length, 0);
+
+  // Paired but permission revoked → say so, do not try.
+  const granted = harness({ notification: fakeNotification({ permission: "granted" }) });
+  await enableAlerts({ settings }, granted.deps);
+  const stored = storedPairing(granted.deps);
+  const revoked = harness({
+    notification: fakeNotification({ permission: "denied" }),
+    storage: fakeStorage({ [PUSH_STORAGE_KEY]: JSON.stringify(stored) }),
+  });
+  const blocked = await ensureSubscription(revoked.deps);
+  assert.equal(blocked.error, "permission");
+  assert.equal(revoked.serviceWorker.pushManager.subscribeCalls.length, 0);
+
+  // A subscribe that rejects is reported, never thrown.
+  const failing = harness({
+    notification: fakeNotification({ permission: "granted" }),
+    storage: fakeStorage({ [PUSH_STORAGE_KEY]: JSON.stringify(stored) }),
+    serviceWorker: fakeServiceWorker({
+      subscribe: () => {
+        throw new Error("subscription refused");
+      },
+    }),
+  });
+  const failed = await ensureSubscription(failing.deps);
+  assert.equal(failed.resubscribed, false);
+  assert.match(failed.error, /subscription refused/);
 });

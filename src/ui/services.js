@@ -176,6 +176,14 @@ async function loadLive() {
     pushReceipts: (push && push.pushReceipts) || null,
     testNotification: (push && push.testNotification) || null,
     clearProbeCache: (push && push.clearProbeCache) || null,
+    // §13.3 B5 — the self-healing pairing path. Absent push.js means the manual paste, which is
+    // what `decorate()` falls back to.
+    ensureSubscription: (push && push.ensureSubscription) || null,
+    sendPairing: (push && push.sendPairing) || null,
+    dispatchToGithub: (push && push.dispatchToGithub) || null,
+    storedToken: (push && push.storedToken) || null,
+    saveToken: (push && push.saveToken) || null,
+    maskToken: (push && push.maskToken) || null,
 
     // ---- src/data.js transactions (§11.4) ----------------------------------------------
     getTransactionsWithNew: mods.data.getTransactionsWithNew || null,
@@ -760,6 +768,32 @@ export function updatePrefsLocal(patch = {}) {
   return next;
 }
 
+/* §13.3 B5 — the token lives only in this browser's localStorage; the three helpers below are
+   the stand-ins for push.js's, so the Settings card renders the same either way. */
+
+export const GITHUB_TOKEN_KEY = "tradewinds.gh.v1";
+
+export function storedTokenLocal() {
+  try { return String(localStorage.getItem(GITHUB_TOKEN_KEY) || ""); } catch { return ""; }
+}
+
+export function saveTokenLocal(token) {
+  try {
+    const value = String(token || "").trim();
+    if (value) localStorage.setItem(GITHUB_TOKEN_KEY, value);
+    else localStorage.removeItem(GITHUB_TOKEN_KEY);
+    return true;
+  } catch { return false; }
+}
+
+/** Never render a token in full, not even on the owner's own phone. */
+export function maskTokenLocal(token) {
+  const value = String(token || "");
+  if (!value) return "";
+  if (value.length <= 12) return `${value.slice(0, 2)}…${value.slice(-2)}`;
+  return `${value.slice(0, 8)}…${value.slice(-4)}`;
+}
+
 /** Compact JSON — one line, no spaces: this string is pasted into a GitHub secret by hand. */
 export function pairingCodeLocal(pairing) {
   return pairing ? JSON.stringify(pairing) : "";
@@ -814,6 +848,16 @@ export function decorate(api) {
   if (!has("pushReceipts")) api.pushReceipts = pushReceiptsLocal;
   if (!has("testNotification")) api.testNotification = testNotificationLocal;
   if (!has("clearProbeCache")) api.clearProbeCache = () => {};
+  // §13.3 B5 — without push.js there is no crypto for the sealed pairing, so every stand-in says
+  // "not available here" and the card keeps showing the manual pairing code.
+  if (!has("ensureSubscription")) {
+    api.ensureSubscription = async () => ({ subscription: null, resubscribed: false, rotated: false, pairing: null, error: null });
+  }
+  if (!has("sendPairing")) api.sendPairing = async () => ({ ok: false, reason: "Automatic re-pairing is not available in this build." });
+  if (!has("dispatchToGithub")) api.dispatchToGithub = async () => ({ ok: false, status: null, reason: "Not available in this build." });
+  if (!has("storedToken")) api.storedToken = storedTokenLocal;
+  if (!has("saveToken")) api.saveToken = saveTokenLocal;
+  if (!has("maskToken")) api.maskToken = maskTokenLocal;
 
   return api;
 }

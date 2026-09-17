@@ -1066,8 +1066,9 @@ export const api = {
   evaluateTrade, findTrades, findLeagueTrades, explain, sideNames,
   // §11.4 — demo mode is an iOS Safari tab, so alerts are "not installed" here on purpose.
   alertsSupported, alertsStatus, enableAlerts, disableAlerts, updatePrefs, pairingCode,
-  // §13.3 B2 — the alerts diagnostics seam.
+  // §13.3 B2/B5 — the alerts diagnostics and self-pairing seam.
   deviceIdOf, pushReceipts, testNotification, clearProbeCache,
+  ensureSubscription, sendPairing, dispatchToGithub, storedToken, saveToken, maskToken,
   // §12.2/§12.4 — one hand-built advisory (the real Bowers case) so the tab is populated.
   advise, adviseAll, standingIssues, diffStatuses, statusKey, applyStatuses, absenceOf,
   refreshStatuses, markAdviceSeen, unseenAdviceKeys,
@@ -1124,6 +1125,32 @@ export async function testNotification() {
 }
 
 export function clearProbeCache() {}
+
+/* §13.3 B5 — demo mode never subscribes, so the self-healing path has nothing to heal. */
+export async function ensureSubscription() {
+  return { subscription: null, resubscribed: false, rotated: false, pairing: null, error: null };
+}
+
+export async function sendPairing() {
+  return { ok: false, reason: "Demo mode cannot pair a device." };
+}
+
+export async function dispatchToGithub() {
+  return { ok: false, status: null, reason: "Demo mode cannot talk to GitHub." };
+}
+
+export function storedToken() {
+  return "";
+}
+
+export function saveToken() {
+  return false;
+}
+
+export function maskToken(token) {
+  const value = String(token || "");
+  return value ? `${value.slice(0, 2)}…${value.slice(-2)}` : "";
+}
 
 export async function enableAlerts() {
   const err = new Error("Alerts only work from the Home Screen app. In Safari tap Share → Add to Home Screen, then open Tradewinds from the icon.");

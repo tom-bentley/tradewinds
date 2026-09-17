@@ -80,6 +80,57 @@ export const statusLine = alertsStatusText;
 
 const prefsOf = (status) => ({ ...DEFAULT_PREFS, ...(status?.pairing?.prefs || {}) });
 
+/* ------------------------------------------------- auto re-pair (design §13.3 B5) */
+
+/**
+ * The token that lets this phone re-pair itself. It is read through the service layer so tests and
+ * demo mode can stand it in; a missing helper simply means the feature is not available.
+ * @returns {string}
+ */
+function tokenOf() {
+  try {
+    return (env && env.svc.storedToken && env.svc.storedToken()) || "";
+  } catch {
+    return "";
+  }
+}
+
+export const PAT_HELP =
+  "Optional. With a fine-grained GitHub token (this repository only, Actions: read and write) " +
+  "this phone re-pairs itself whenever iOS changes its push address — no copying codes. " +
+  "The token is stored on this phone only and is sent to api.github.com and nowhere else.";
+
+export const PAT_URL = `${REPO}/settings/personal-access-tokens`;
+
+/** The "Auto re-pair" field: masked when set, an input when not. */
+function autoRepairBlock() {
+  const token = tokenOf();
+  const masked = (() => {
+    try {
+      return (env && env.svc.maskToken && env.svc.maskToken(token)) || "";
+    } catch {
+      return "";
+    }
+  })();
+
+  return `<div class="al-pat">
+    <p class="swrow-l">Auto re-pair</p>
+    ${token
+      ? `<div class="al-pat-set">
+          <code class="al-pat-mask">${escapeHtml(masked)}</code>
+          <button type="button" class="btn btn-sm btn-ghost" data-act="al-pat-clear">Remove</button>
+        </div>
+        <p class="note">This phone will re-pair itself when its alert address changes.</p>`
+      : `<div class="al-pat-set">
+          <input type="password" class="nin al-pat-in" id="al-pat" inputmode="text" autocomplete="off"
+            spellcheck="false" placeholder="github_pat_…">
+          <button type="button" class="btn btn-sm" data-act="al-pat-save">Save</button>
+        </div>
+        <p class="note">${escapeHtml(PAT_HELP)}
+          <a href="${PAT_URL}" target="_blank" rel="noopener">Create one</a>.</p>`}
+  </div>`;
+}
+
 /* ---------------------------------------------------------------- render */
 
 /** The whole card body. `store.alerts.status` is null until the async probe answers. */
@@ -126,11 +177,15 @@ export function alertsCard() {
         phone — re-paste the code into GitHub for the alert job to honour them.</p>
     </div>
 
+    ${autoRepairBlock()}
+
     <div class="btn-col al-acts">
       <button type="button" class="btn btn-ghost" data-act="al-test">Test this phone</button>
       <button type="button" class="btn btn-ghost" data-act="al-diagnose">Diagnose</button>
       <button type="button" class="btn btn-ghost" data-act="al-code">Show pairing code</button>
-      <a class="btn btn-ghost" href="${ACTIONS_URL}" target="_blank" rel="noopener">Send test alert</a>
+      ${tokenOf()
+        ? `<button type="button" class="btn btn-ghost" data-act="al-remote-test">Send test alert</button>`
+        : `<a class="btn btn-ghost" href="${ACTIONS_URL}" target="_blank" rel="noopener">Send test alert</a>`}
       <button type="button" class="btn btn-ghost" data-act="al-disable">Disable alerts</button>
     </div>
     <p class="note">“Test this phone” raises a notification locally — no GitHub, no network — so
@@ -183,15 +238,62 @@ export async function checkAlertsHealth(e) {
   env = e || env;
   if (!env || !env.svc || !env.svc.alertsStatus) return null;
   try {
+    // 1. Heal what can be healed without asking (design §13.3 B5). iOS does not reliably fire
+    //    `pushsubscriptionchange` and subscriptions carry no expiry, so a subscription can simply
+    //    disappear; an idempotent re-subscribe on boot is the recovery the research recommends
+    //    (research R5 §6.2/§6.4). Permission is already granted here, so no gesture is needed.
+    const healed = await ensureLiveSubscription();
+
+    // 2. Ask the sender what it believes, now that the local side is as good as it gets.
     const status = await Promise.resolve(env.svc.alertsStatus());
     const problem = alertsProblem(status);
     setIn("alerts", { status, problem });
     paintAlerts();
-    return problem;
+
+    // 3. If this phone's address moved, or the sender has never heard of it, hand over the new
+    //    pairing ourselves — when a token allows it. Otherwise the banner asks for the paste.
+    if (healed.rotated || status.endpointChanged || status.serverPaired === false) await autoRepair(status);
+    return store.alerts.problem ?? problem;
   } catch (err) {
     console.warn("[alerts] health check failed", err);
     return null;
   }
+}
+
+/** Re-create a subscription iOS threw away. Never throws; returns what changed. */
+async function ensureLiveSubscription() {
+  const none = { subscription: null, resubscribed: false, rotated: false, pairing: null, error: null };
+  if (!env.svc.ensureSubscription) return none;
+  try {
+    return (await Promise.resolve(env.svc.ensureSubscription())) || none;
+  } catch (err) {
+    console.warn("[alerts] ensureSubscription failed", err);
+    return none;
+  }
+}
+
+/**
+ * Push this phone's (new) pairing to the sender over `repository_dispatch`. Only possible with a
+ * saved token — without one this is a no-op and `store.alerts.problem` keeps asking for the paste.
+ * @returns {Promise<boolean>} true when the sender was told
+ */
+async function autoRepair(status) {
+  if (!tokenOf() || !env.svc.sendPairing) return false;
+  try {
+    const result = await Promise.resolve(env.svc.sendPairing({ pairing: status?.pairing }));
+    if (result && result.ok) {
+      setIn("alerts", { problem: null });
+      toast("Alerts re-paired — the sender updates within a minute.");
+      paintAlerts();
+      return true;
+    }
+    const reason = (result && result.reason) || "GitHub refused the re-pair.";
+    setIn("alerts", { problem: `${reason} Use “Show pairing code” and paste it into the secret instead.` });
+    paintAlerts();
+  } catch (err) {
+    console.warn("[alerts] auto re-pair failed", err);
+  }
+  return false;
 }
 
 /* ---------------------------------------------------------------- pairing sheet */
@@ -329,6 +431,7 @@ export function diagnoseBody(st, now = Date.now()) {
 
     <div class="btn-col">
       <button type="button" class="btn" data-act="al-test">Test this phone</button>
+      ${tokenOf() ? `<button type="button" class="btn btn-ghost" data-act="al-repair">Re-pair this phone now</button>` : ""}
       <button type="button" class="btn btn-ghost" data-act="al-code">Show pairing code</button>
       <button type="button" class="btn btn-ghost" data-act="dg-refresh">Check again</button>
     </div>
@@ -382,6 +485,7 @@ export function openDiagnoseSheet(e) {
         const b = ev.target.closest("[data-act]");
         if (!b) return;
         if (b.dataset.act === "al-test") { await testThisPhone(); return; }
+        if (b.dataset.act === "al-repair") { await repairNow(); return; }
         if (b.dataset.act === "al-code") {
           const p = store.alerts.status && store.alerts.status.pairing;
           if (p) openPairingSheet(p, env);
@@ -438,6 +542,10 @@ export function alertsClick(ev, e) {
   if (act === "al-disable") { disable(); return true; }
   if (act === "al-test") { testThisPhone(); return true; }
   if (act === "al-diagnose") { openDiagnoseSheet(env); return true; }
+  if (act === "al-pat-save") { saveTokenFromField(); return true; }
+  if (act === "al-pat-clear") { clearSavedToken(); return true; }
+  if (act === "al-remote-test") { remoteTest(); return true; }
+  if (act === "al-repair") { repairNow(); return true; }
   if (act === "al-code") {
     const p = store.alerts.status && store.alerts.status.pairing;
     if (p) openPairingSheet(p, env);
@@ -469,6 +577,66 @@ async function enable() {
     await refreshStatus(env);
     setIn("alerts", { error: text });
     paintAlerts();
+  }
+}
+
+/* ------------------------------------------------- auto re-pair actions (§13.3 B5) */
+
+function saveTokenFromField() {
+  const field = document.getElementById("al-pat");
+  const token = field ? String(field.value || "").trim() : "";
+  if (!token) return toast("Paste the token first.", { tone: "warn" });
+  if (!env.svc.saveToken || !env.svc.saveToken(token)) {
+    return toast("This phone would not store the token.", { tone: "warn" });
+  }
+  paintAlerts();
+  // Prove it works immediately rather than at the next rotation, which could be weeks away.
+  repairNow();
+}
+
+function clearSavedToken() {
+  try {
+    if (env.svc.saveToken) env.svc.saveToken("");
+  } catch (err) {
+    console.warn("[alerts] token remove failed", err);
+  }
+  toast("Token removed from this phone.");
+  paintAlerts();
+}
+
+/** Send the current pairing to the workflow now. */
+async function repairNow() {
+  if (!tokenOf()) return toast("Save a GitHub token first.", { tone: "warn" });
+  try {
+    const result = await Promise.resolve(env.svc.sendPairing({ pairing: store.alerts.status?.pairing }));
+    if (result && result.ok) {
+      setIn("alerts", { problem: null });
+      toast("Sent — the sender updates within a minute.");
+    } else {
+      toast((result && result.reason) || "GitHub refused the re-pair.", { tone: "warn" });
+    }
+  } catch (err) {
+    console.warn("[alerts] re-pair failed", err);
+    toast("Could not reach GitHub.", { tone: "warn" });
+  }
+  paintAlerts();
+}
+
+/** "Send test alert" without leaving the app — the workflow link stays for the tokenless case. */
+async function remoteTest() {
+  try {
+    const result = await Promise.resolve(
+      env.svc.dispatchToGithub({ event: "alerts", payload: { test: true } }),
+    );
+    toast(
+      result && result.ok
+        ? "Asked GitHub for a test push — it should arrive within a minute."
+        : (result && result.reason) || "GitHub refused the request.",
+      { tone: result && result.ok ? "" : "warn" },
+    );
+  } catch (err) {
+    console.warn("[alerts] remote test failed", err);
+    toast("Could not reach GitHub.", { tone: "warn" });
   }
 }
 

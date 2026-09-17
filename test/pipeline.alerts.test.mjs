@@ -7,6 +7,7 @@
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { generateKeyPairSync, webcrypto } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,11 +21,14 @@ import {
   MAX_PER_DEVICE,
   MAX_STATUS_FALLBACK,
   NOTIFICATION_ICON,
+  PAIR_INFO,
+  applyPairing,
   applyState,
   canonicalState,
   composeAlerts,
   cooldownState,
   dealKey,
+  decryptPairingBlob,
   deliveryOptions,
   deviceIdOf,
   deviceKey,
@@ -33,9 +37,12 @@ import {
   isGoneError,
   main,
   mergeAdvisor,
+  mergeDevices,
   nextStatusSnapshot,
   normalizePrefs,
   normalizeTransaction,
+  pairedDevices,
+  parseDispatchPayload,
   parseSubscriptions,
   parseWebhooks,
   payloadOf,
@@ -43,11 +50,17 @@ import {
   statusRowFromPlayer,
   statusRowsFromProjections,
   testPayload,
+  validatePairing,
   watchSet,
   webhookKind,
   webhookRequest,
   weekPointRows,
 } from "../pipeline/alerts.mjs";
+import {
+  diagnose as doctorDiagnose,
+  main as doctorMain,
+  render as doctorRender,
+} from "../scripts/alerts-doctor.mjs";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
 
@@ -1126,7 +1139,9 @@ test("main records what it sent per device, with the status code", async () => {
   assert.deepEqual(validateAlertsState(run.state), []);
 
   // …and the log names the status code, which is all the sender can honestly claim.
-  assert.ok(run.lines.some((line) => /\[ok {2}\] push .*· 201 · /.test(line)), run.lines.join("\n"));
+  // "accepted", not "delivered": web.push.apple.com answers 2xx for a subscription it has already
+  // discarded (Apple Developer Forums 719990; research R5 §6.2), so the log may not overclaim.
+  assert.ok(run.lines.some((line) => /\[ok {2}\] push .*· accepted 201 · /.test(line)), run.lines.join("\n"));
   clearStateFile();
   clearAdvisorFile();
 });
@@ -1303,4 +1318,413 @@ test("a webhook with no league and no phone to inherit one from is skipped, not 
   assert.ok(run.lines.some((line) => line.includes("no leagueId")));
   clearStateFile();
   clearAdvisorFile();
+});
+
+/* ───────────── B5: the phone re-pairs itself over repository_dispatch (design §13.3) ───────────── */
+
+/**
+ * A throwaway VAPID pair in exactly the format scripts/vapid.mjs prints: the public key is the
+ * 65-byte uncompressed point, the private key is the raw 32-byte scalar, both base64url.
+ */
+function vapidPair() {
+  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const pub = publicKey.export({ format: "jwk" });
+  const priv = privateKey.export({ format: "jwk" });
+  const raw = Buffer.concat([Buffer.from([4]), Buffer.from(pub.x, "base64url"), Buffer.from(pub.y, "base64url")]);
+  return { publicKey: raw.toString("base64url"), privateKey: priv.d };
+}
+
+/** `pairingBlob` reads the key from the module constant, so the test seals with its own copy. */
+async function sealWithWebCrypto(pairing, vapidPublicKey) {
+  const subtle = webcrypto.subtle;
+  const rawKey = Buffer.from(vapidPublicKey, "base64url");
+  const serverKey = await subtle.importKey("raw", rawKey, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const ephemeral = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const shared = await subtle.deriveBits({ name: "ECDH", public: serverKey }, ephemeral.privateKey, 256);
+  const salt = webcrypto.getRandomValues(new Uint8Array(16));
+  const hkdfKey = await subtle.importKey("raw", shared, "HKDF", false, ["deriveBits"]);
+  const keyBits = await subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt, info: new TextEncoder().encode(PAIR_INFO) },
+    hkdfKey,
+    256,
+  );
+  const aesKey = await subtle.importKey("raw", keyBits, { name: "AES-GCM" }, false, ["encrypt"]);
+  const iv = webcrypto.getRandomValues(new Uint8Array(12));
+  const ct = await subtle.encrypt({ name: "AES-GCM", iv }, aesKey, new TextEncoder().encode(JSON.stringify(pairing)));
+  const epk = await subtle.exportKey("raw", ephemeral.publicKey);
+  const b64 = (buffer) => Buffer.from(buffer).toString("base64url");
+  const envelope = { v: 1, epk: b64(epk), salt: b64(salt), iv: b64(iv), ct: b64(ct) };
+  return Buffer.from(JSON.stringify(envelope), "utf8").toString("base64url");
+}
+
+const samplePairing = (over = {}) => ({
+  v: 1,
+  sub: {
+    endpoint: "https://web.push.apple.com/QF2c-rotated-token",
+    expirationTime: null,
+    keys: { p256dh: "BM9-p256dh-key", auth: "aUtH-secret" },
+  },
+  leagueId: LEAGUE_ID,
+  userId: USER_ID,
+  label: "iPhone",
+  prefs: { ...DEFAULT_PREFS },
+  createdAt: "2026-09-17T13:00:00Z",
+  ...over,
+});
+
+test("a pairing sealed in the browser opens in node, and only with the right key", async () => {
+  // The whole self-healing path rests on these two implementations agreeing: WebCrypto ECDH →
+  // HKDF-SHA256 → AES-256-GCM on the phone, node:crypto on the runner.
+  const vapid = vapidPair();
+  const pairing = samplePairing();
+  const blob = await sealWithWebCrypto(pairing, vapid.publicKey);
+
+  assert.deepEqual(decryptPairingBlob(blob, vapid.privateKey), pairing);
+  assert.ok(!Buffer.from(blob, "base64url").toString("utf8").includes("web.push.apple.com"), "nothing leaks in the clear");
+
+  const other = vapidPair();
+  assert.throws(() => decryptPairingBlob(blob, other.privateKey), /Unsupported state|unable to authenticate|bad decrypt/i);
+});
+
+test("a tampered pairing blob is rejected, not half-read", async () => {
+  const vapid = vapidPair();
+  const blob = await sealWithWebCrypto(samplePairing(), vapid.publicKey);
+  const envelope = JSON.parse(Buffer.from(blob, "base64url").toString("utf8"));
+
+  const ct = Buffer.from(envelope.ct, "base64url");
+  ct[4] ^= 0xff; // one flipped byte inside the ciphertext
+  const tampered = Buffer.from(
+    JSON.stringify({ ...envelope, ct: ct.toString("base64url") }),
+    "utf8",
+  ).toString("base64url");
+  assert.throws(() => decryptPairingBlob(tampered, vapid.privateKey), /Unsupported state|unable to authenticate|bad decrypt/i);
+
+  // …and so is a malformed envelope, rather than crashing the run.
+  assert.throws(() => decryptPairingBlob("not-base64url-json", vapid.privateKey), /not an envelope/);
+  assert.throws(
+    () => decryptPairingBlob(Buffer.from(JSON.stringify({ v: 2 }), "utf8").toString("base64url"), vapid.privateKey),
+    /unsupported pairing blob version/,
+  );
+  assert.throws(
+    () =>
+      decryptPairingBlob(
+        Buffer.from(JSON.stringify({ ...envelope, epk: "AAAA" }), "utf8").toString("base64url"),
+        vapid.privateKey,
+      ),
+    /uncompressed P-256 point/,
+  );
+});
+
+test("validatePairing refuses anything it would not push to", () => {
+  assert.deepEqual(validatePairing(samplePairing()), []);
+  assert.match(validatePairing(samplePairing({ v: 2 }))[0], /pairing\.v/);
+  assert.match(validatePairing({ ...samplePairing(), sub: { endpoint: "http://insecure", keys: { p256dh: "a", auth: "b" } } })[0], /https url/);
+  assert.match(validatePairing({ ...samplePairing(), sub: { endpoint: "https://x", keys: { auth: "b" } } })[0], /p256dh/);
+  assert.match(validatePairing(samplePairing({ leagueId: "" })).join(" "), /leagueId/);
+  assert.deepEqual(validatePairing(null), ["pairing is not an object"]);
+});
+
+test("parseDispatchPayload survives every trigger the workflow has", () => {
+  assert.deepEqual(parseDispatchPayload("{}"), { blob: null, deviceId: null, label: null, test: false });
+  assert.deepEqual(parseDispatchPayload(undefined), { blob: null, deviceId: null, label: null, test: false });
+  assert.deepEqual(parseDispatchPayload("null"), { blob: null, deviceId: null, label: null, test: false });
+  assert.deepEqual(parseDispatchPayload("not json"), { blob: null, deviceId: null, label: null, test: false });
+  assert.deepEqual(parseDispatchPayload(JSON.stringify({ v: 1, blob: "abc", deviceId: "d1", label: "iPhone" })), {
+    blob: "abc",
+    deviceId: "d1",
+    label: "iPhone",
+    test: false,
+  });
+  assert.equal(parseDispatchPayload(JSON.stringify({ test: true })).test, true);
+});
+
+test("applyPairing stores ciphertext and retires the same phone's older entry", () => {
+  const first = applyPairing(emptyState(), {
+    id: "aaaa000000000001",
+    blob: "BLOB-1",
+    label: "iPhone",
+    userId: USER_ID,
+    leagueId: LEAGUE_ID,
+    createdAt: "2026-09-10T00:00:00Z",
+  });
+  assert.deepEqual(first.superseded, []);
+  assert.equal(first.state.pairings.aaaa000000000001.blob, "BLOB-1");
+
+  const second = applyPairing(first.state, {
+    id: "bbbb000000000002",
+    blob: "BLOB-2",
+    label: "iPhone",
+    userId: USER_ID,
+    leagueId: LEAGUE_ID,
+    createdAt: "2026-09-17T00:00:00Z",
+  });
+  assert.deepEqual(second.superseded, ["aaaa000000000001"]);
+  assert.equal(second.state.pairings.aaaa000000000001.supersededBy, "bbbb000000000002");
+  assert.equal(second.state.pairings.bbbb000000000002.supersededBy, undefined);
+
+  // A different device (another label) is left alone.
+  const third = applyPairing(second.state, { id: "cccc000000000003", blob: "BLOB-3", label: "iPad", userId: USER_ID, leagueId: LEAGUE_ID });
+  assert.deepEqual(third.superseded, []);
+  assert.equal(third.state.pairings.bbbb000000000002.supersededBy, undefined);
+
+  assert.deepEqual(validateAlertsState(canonicalState(third.state)), [], "the contract still accepts the file");
+  // Byte-stable, and absent entirely when nothing has self-paired.
+  assert.equal(JSON.stringify(canonicalState(third.state)), JSON.stringify(canonicalState(canonicalState(third.state))));
+  assert.equal(canonicalState(emptyState()).pairings, undefined, "no key, no diff, nothing to commit");
+});
+
+test("pairedDevices decrypts the live entries and skips the superseded ones", async () => {
+  const vapid = vapidPair();
+  const oldBlob = await sealWithWebCrypto(samplePairing({ sub: { endpoint: "https://web.push.apple.com/OLD", keys: { p256dh: "a", auth: "b" } } }), vapid.publicKey);
+  const newBlob = await sealWithWebCrypto(samplePairing(), vapid.publicKey);
+
+  let state = applyPairing(emptyState(), { id: deviceIdOf("https://web.push.apple.com/OLD"), blob: oldBlob, label: "iPhone", userId: USER_ID, leagueId: LEAGUE_ID }).state;
+  state = applyPairing(state, { id: deviceIdOf("https://web.push.apple.com/QF2c-rotated-token"), blob: newBlob, label: "iPhone", userId: USER_ID, leagueId: LEAGUE_ID }).state;
+
+  const problems = [];
+  const devices = pairedDevices(state, vapid.privateKey, (id, message) => problems.push(`${id}: ${message}`));
+  assert.equal(devices.length, 1, "only the live pairing is a destination");
+  assert.equal(devices[0].sub.endpoint, "https://web.push.apple.com/QF2c-rotated-token");
+  assert.equal(devices[0].id, deviceIdOf(devices[0].sub.endpoint));
+  assert.equal(devices[0].selfPaired, true);
+  assert.equal(devices[0].prefs.dealsCooldownHours, 6, "prefs are normalized like any other device");
+  assert.deepEqual(problems, []);
+
+  // A blob the private key cannot open is reported and skipped, never fatal.
+  const wrongKey = pairedDevices(state, vapidPair().privateKey, (id, message) => problems.push(`${id}: ${message}`));
+  assert.deepEqual(wrongKey, []);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /could not be decrypted/);
+  assert.deepEqual(pairedDevices(state, "", () => {}), [], "no private key, no self-paired devices");
+});
+
+test("mergeDevices lets a self-filed pairing supersede the pasted secret for the same phone", () => {
+  const secret = [{ id: "old0000000000001", userId: USER_ID, label: "iPhone", sub: { endpoint: "https://old" } }];
+  const paired = [{ id: "new0000000000002", userId: USER_ID, label: "iPhone", sub: { endpoint: "https://new" }, selfPaired: true }];
+
+  const merged = mergeDevices(secret, paired);
+  assert.deepEqual(merged.devices.map((d) => d.id), ["new0000000000002"], "the phone knows its own address");
+  assert.deepEqual(merged.superseded, [{ id: "old0000000000001", by: "new0000000000002", label: "iPhone" }]);
+
+  // A different phone in the secret is kept.
+  const both = mergeDevices([...secret, { id: "ipad000000000003", userId: USER_ID, label: "iPad", sub: {} }], paired);
+  assert.deepEqual(both.devices.map((d) => d.id).sort(), ["ipad000000000003", "new0000000000002"]);
+
+  // Nothing self-paired: the secret stands exactly as before.
+  assert.deepEqual(mergeDevices(secret, []).devices, secret);
+});
+
+test("main files an incoming pairing, uses it the same run, and never logs the plaintext", async () => {
+  clearStateFile();
+  clearAdvisorFile();
+  const vapid = vapidPair();
+  const endpoint = "https://web.push.apple.com/SELF-PAIRED-TOKEN";
+  const blob = await sealWithWebCrypto(samplePairing({ sub: { endpoint, keys: { p256dh: "BM9-x", auth: "aUtH-x" } } }), vapid.publicKey);
+
+  const { sender, sent } = recordingSender();
+  const run = await runMain({
+    env: {
+      // No PUSH_SUBSCRIPTIONS at all: the phone pairs itself.
+      VAPID_SUBJECT: SUBJECT,
+      VAPID_PRIVATE_KEY: vapid.privateKey,
+      PAIR_PAYLOAD: JSON.stringify({ v: 1, blob, deviceId: deviceIdOf(endpoint), label: "iPhone" }),
+      ALERT_FULL: "1",
+    },
+    sender,
+  });
+
+  assert.equal(run.code, 0);
+  const id = deviceIdOf(endpoint);
+  assert.ok(run.lines.some((line) => line.includes(`stored ${id}`)), run.lines.join("\n"));
+  assert.ok(sent.length > 0, "and it was sent to in the very same run");
+  assert.deepEqual([...new Set(sent.map((s) => s.endpoint))], [endpoint]);
+
+  // The state keeps the CIPHERTEXT, never the endpoint or its keys.
+  const raw = readFileSync(stateFilePath(), "utf8");
+  assert.equal(run.state.pairings[id].blob, blob);
+  assert.ok(!raw.includes(endpoint), "the public state file never carries the endpoint");
+  assert.ok(!raw.includes("aUtH-x"), "…nor the auth secret");
+  assert.ok(!run.lines.join("\n").includes(endpoint), "and neither does the log");
+  assert.deepEqual(validateAlertsState(run.state), []);
+
+  clearStateFile();
+  clearAdvisorFile();
+});
+
+test("a pairing that cannot be opened, or arrives with no key, is a warning and nothing more", async () => {
+  clearStateFile();
+  clearAdvisorFile();
+  const vapid = vapidPair();
+  const blob = await sealWithWebCrypto(samplePairing(), vapid.publicKey);
+
+  const noKey = await runMain({
+    env: { VAPID_SUBJECT: SUBJECT, PAIR_PAYLOAD: JSON.stringify({ v: 1, blob, label: "iPhone" }) },
+  });
+  assert.equal(noKey.code, 0);
+  assert.ok(noKey.lines.some((line) => line.includes("VAPID_PRIVATE_KEY is not set")));
+
+  const wrongKey = await runMain({
+    env: { VAPID_SUBJECT: SUBJECT, VAPID_PRIVATE_KEY: vapidPair().privateKey, PAIR_PAYLOAD: JSON.stringify({ v: 1, blob, label: "iPhone" }) },
+  });
+  assert.equal(wrongKey.code, 0);
+  assert.ok(wrongKey.lines.some((line) => line.includes("could not be opened")));
+  assert.ok(wrongKey.lines.some((line) => line.includes("nothing paired")));
+  clearStateFile();
+  clearAdvisorFile();
+});
+
+test("client_payload.test is the phone asking for a test push", async () => {
+  clearStateFile();
+  const { sender, sent } = recordingSender();
+  const run = await runMain({
+    env: {
+      PUSH_SUBSCRIPTIONS: subsEnv(phone()),
+      VAPID_SUBJECT: SUBJECT,
+      VAPID_PRIVATE_KEY: "test",
+      PAIR_PAYLOAD: JSON.stringify({ test: true }),
+    },
+    sender,
+    fetchJsonImpl: () => Promise.reject(new Error("a test push must not touch the network")),
+  });
+  assert.equal(run.code, 0);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].payload.title, "Tradewinds alerts are on");
+  assert.ok(run.lines.some((line) => line.includes("accepted by the push service")));
+  clearStateFile();
+});
+
+/* ───────────── scripts/alerts-doctor.mjs (design §13.3 B3) ───────────── */
+
+const DOCTOR_NOW = Date.parse("2026-09-17T13:00:00Z");
+const run = (at, conclusion = "success") => ({ run_started_at: at, conclusion, html_url: "https://x" });
+
+test("the doctor reads the sender's own view and never claims delivery", () => {
+  const result = doctorDiagnose({
+    now: DOCTOR_NOW,
+    runs: [run("2026-09-17T12:50:00Z")],
+    devices: [{ id: "11b2551101563b49", label: "iPhone" }],
+    state: {
+      v: 1,
+      leagues: { [LEAGUE_ID]: {} },
+      devices: {
+        "11b2551101563b49": {
+          seenDeals: ["a", "b"],
+          seenFa: [],
+          seenAdvice: [],
+          lastNotifiedAt: "2026-09-17T12:11:48Z",
+          lastSentAt: "2026-09-17T12:11:48Z",
+          sentCount: 80,
+          lastResult: { status: 201, at: "2026-09-17T12:11:48Z" },
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(result.problems, [], "a healthy sender raises nothing — the phone is the unknown");
+  assert.equal(result.devices[0].paired, true);
+  assert.equal(result.devices[0].sentCount, 80);
+
+  const text = doctorRender(result, { now: DOCTOR_NOW, devicesKnown: true });
+  assert.match(text, /accepted\s+80 push/);
+  assert.match(text, /CANNOT tell you/);
+  assert.match(text, /accepted by Apple/);
+  assert.match(text, /Settings . Alerts . Diagnose/);
+});
+
+test("the doctor names the three failures it CAN see from outside the phone", () => {
+  // 1. the secret and the state file disagree — the endpoint rotated.
+  const rotated = doctorDiagnose({
+    now: DOCTOR_NOW,
+    runs: [run("2026-09-17T12:50:00Z")],
+    devices: [{ id: "newnewnewnew0001", label: "iPhone" }],
+    state: { v: 1, leagues: {}, devices: { oldoldoldold0001: { seenDeals: [], seenFa: [], seenAdvice: [], lastNotifiedAt: "2026-09-10T00:00:00Z" } } },
+  });
+  assert.ok(rotated.problems.some((p) => /NOT in PUSH_SUBSCRIPTIONS/.test(p)));
+  assert.ok(rotated.problems.some((p) => /has no entry in the state file/.test(p)));
+
+  // 2. an expired device.
+  const expired = doctorDiagnose({
+    now: DOCTOR_NOW,
+    runs: [run("2026-09-17T12:50:00Z")],
+    devices: [],
+    state: { v: 1, leagues: {}, devices: { d1: { seenDeals: [], seenFa: [], seenAdvice: [], lastNotifiedAt: "2026-09-17T12:00:00Z", expired: true } } },
+  });
+  assert.ok(expired.problems.some((p) => /marked expired/.test(p)));
+
+  // 3. the workflow itself stopped, or is failing.
+  const stalled = doctorDiagnose({ now: DOCTOR_NOW, runs: [run("2026-09-16T00:00:00Z")], devices: [], state: { v: 1, leagues: {}, devices: {} } });
+  assert.ok(stalled.problems.some((p) => /has not run for/.test(p)));
+  const failing = doctorDiagnose({
+    now: DOCTOR_NOW,
+    runs: [run("2026-09-17T12:50:00Z", "failure"), run("2026-09-17T12:40:00Z")],
+    devices: [],
+    state: { v: 1, leagues: {}, devices: {} },
+  });
+  assert.ok(failing.problems.some((p) => /did not succeed/.test(p)));
+});
+
+test("the doctor lists self-filed pairings and does not mistake them for stale devices", () => {
+  const result = doctorDiagnose({
+    now: DOCTOR_NOW,
+    runs: [run("2026-09-17T12:50:00Z")],
+    devices: [], // the secret was not supplied
+    state: {
+      v: 1,
+      leagues: {},
+      devices: { newnewnewnew0001: { seenDeals: [], seenFa: [], seenAdvice: [], lastNotifiedAt: "2026-09-17T12:00:00Z" } },
+      pairings: {
+        oldoldoldold0001: { blob: "X", label: "iPhone", userId: USER_ID, leagueId: LEAGUE_ID, createdAt: "2026-09-10T00:00:00Z", supersededBy: "newnewnewnew0001" },
+        newnewnewnew0001: { blob: "Y", label: "iPhone", userId: USER_ID, leagueId: LEAGUE_ID, createdAt: "2026-09-17T11:00:00Z" },
+      },
+    },
+  });
+
+  assert.equal(result.pairings.length, 2);
+  assert.equal(result.devices[0].selfPaired, true);
+  assert.deepEqual(result.problems, [], "a phone that pairs itself is not missing from the secret");
+
+  const text = doctorRender(result, { now: DOCTOR_NOW, devicesKnown: false });
+  assert.match(text, /self-paired by the phone/);
+  assert.match(text, /superseded by newnewnewnew0001/);
+  assert.match(text, /only VAPID_PRIVATE_KEY opens them/);
+});
+
+test("the doctor survives an unreachable state file", () => {
+  const result = doctorDiagnose({ now: DOCTOR_NOW, runs: null, devices: [], state: null });
+  assert.match(result.lines[0], /could not read the Actions API/);
+  assert.ok(result.problems.some((p) => /Without the state file/.test(p)));
+  assert.deepEqual(result.devices, []);
+  assert.doesNotThrow(() => doctorRender(result, { now: DOCTOR_NOW, devicesKnown: false }));
+});
+
+test("the doctor's main() reads the public state file and returns a non-zero code for problems", async () => {
+  const lines = [];
+  const code = await doctorMain({
+    argv: [],
+    env: {},
+    now: DOCTOR_NOW,
+    log: (line) => lines.push(line),
+    fetchImpl: async (url) => {
+      if (url.includes("alerts-state.json")) {
+        return { ok: true, json: async () => ({ v: 1, leagues: {}, devices: { d1: { seenDeals: [], seenFa: [], seenAdvice: [], lastNotifiedAt: "2026-09-17T12:00:00Z", expired: true } } }) };
+      }
+      return { ok: true, json: async () => ({ workflow_runs: [run("2026-09-17T12:50:00Z")] }) };
+    },
+  });
+  assert.equal(code, 1, "an expired device is a problem worth an exit code");
+  assert.match(lines.join("\n"), /marked expired/);
+
+  // Everything offline: it still prints, and still refuses to claim health.
+  const offlineLines = [];
+  const offline = await doctorMain({
+    argv: [],
+    env: {},
+    now: DOCTOR_NOW,
+    log: (line) => offlineLines.push(line),
+    fetchImpl: async () => {
+      throw new Error("offline");
+    },
+  });
+  assert.equal(offline, 1);
+  assert.match(offlineLines.join("\n"), /could not be read/);
 });

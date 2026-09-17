@@ -108,6 +108,96 @@ copy and paste the code again so the job sees the new preferences. The endpoint 
 pairing code let a sender push to your phone, which is why they live in a secret and never in
 the repository.
 
+### If alerts stop
+
+The most common failure is invisible from the sending side. Apple's push service answers `201` even
+for a subscription it has already thrown away, so the GitHub job can log `3/3 sent` for days while
+the phone shows nothing. Since v1.4 the app keeps its own evidence: the service worker writes a
+receipt for every push it handles, and **Settings → Alerts** reads it back.
+
+Open the app and read the status line. It says one of:
+
+| Status line | What it means | What to do |
+|---|---|---|
+| `On · paired · last alert 8:11 AM` | Working. The phone displayed that one. | nothing |
+| `On · paired · nothing sent yet` | Paired, the sender simply has no news. | nothing |
+| `This phone's alert address changed … — re-pair` | iOS gave the app a new push address. The sender is pushing to the old one. | **Show pairing code** → paste into `PUSH_SUBSCRIPTIONS` (or set up auto re-pair, below) |
+| `Subscribed, but NOT paired with the sender — re-pair` | The sender's device list does not contain this phone. | same |
+| `The sender marked this phone dead — re-pair` | A push came back 404/410. | same |
+| `Paired · sender delivered N alerts, none shown on this phone — check iOS notification settings` | Delivery is being suppressed on the phone. | tap **Test this phone**; see the checklist below |
+| `On · paired · N alerts arrived but could not be shown` | The pushes land but the notification fails. | reopen from the Home Screen icon, then **Test this phone** |
+| `On · paired 9/9 · sender not reachable` | The state file could not be read (offline). | try again online |
+
+**Diagnose** opens the whole picture: this phone's device id, permission, whether it is installed to
+the Home Screen, its iOS version, what the sender believes (paired? last sent? how many? last status
+code?), when the Alerts workflow last ran, and the last ten pushes this phone actually received.
+
+When notifications are being suppressed rather than lost, work down this list (in order of how
+often it is the answer):
+
+1. **Do Not Disturb / a Focus mode** — the single most common cause.
+2. iOS Settings → Notifications → Tradewinds: Allow Notifications, Lock Screen, Banners, Sounds.
+3. iOS Settings → Notifications → **Scheduled Summary**: Tradewinds must not be in a summary.
+4. iOS 18.4+: per-app Apple Intelligence notification settings can delay or summarise them.
+5. Re-pair (above).
+6. Delete the Home Screen icon and add it again — this recreates the service worker.
+
+`node scripts/alerts-doctor.mjs` prints the same diagnosis from a terminal, using only the public
+state file and the Actions API. Add `PUSH_SUBSCRIPTIONS='<the secret>'` to have it cross-check the
+paired devices (that is how a rotated endpoint shows up without touching the phone), `--local` to
+read this clone's `data/alerts-state.json`, and `--json` for a machine-readable version. It cannot
+see the phone, so it always ends by saying what it does **not** know.
+
+### Auto re-pair (optional, no more copying codes)
+
+iOS rotates a push subscription on its own schedule and does not reliably tell the page when it
+happens, so a manual re-paste is a chore that recurs. If you give the app a GitHub token, the phone
+re-pairs itself:
+
+1. github.com → Settings → Developer settings → **Fine-grained tokens** → Generate new token.
+   Repository access: **only** `tom-bentley/tradewinds`. Permissions: **Actions: Read and write**
+   (Metadata: Read is added automatically). Nothing else.
+2. In the app: Settings → Alerts → **Auto re-pair** → paste the token → **Save**.
+
+From then on, every time the app opens it checks its own subscription, silently re-creates it if iOS
+threw it away, and — when the address has changed — sends the new pairing to the Alerts workflow
+through a `repository_dispatch`. The pairing is **encrypted to the VAPID public key** before it
+leaves the phone (ephemeral ECDH P-256 → HKDF-SHA256 → AES-256-GCM), the workflow opens it with
+`VAPID_PRIVATE_KEY`, and only the ciphertext is stored in `data/alerts-state.json`. Nothing readable
+ever reaches the public repository, and the token itself never leaves the phone except as the
+`Authorization` header on that one request to api.github.com.
+
+The token also powers **Send test alert** without leaving the app. Removing it (the **Remove**
+button) puts you back to the manual paste, which never stopped working.
+
+### Fallback channels
+
+Web Push to one phone is a single point of failure that nobody can see fail. The optional repository
+secret `ALERT_WEBHOOKS` adds channels that report their own failures — each is treated as another
+device, sharing the same composition, the same de-duplication and the same state entry:
+
+```json
+["https://ntfy.sh/your-private-topic"]
+[{"url":"https://discord.com/api/webhooks/…/…","label":"Discord","prefs":{"deals":false}}]
+```
+
+Discord webhooks, Slack incoming webhooks, ntfy topics and any plain JSON endpoint are recognised by
+host (a plain endpoint receives `{title, body, url, tag, kind}`). A channel can carry its own
+`prefs`, and inherits the league of the first paired phone unless it names `leagueId`/`userId`. No
+secret means no channels and no change in behaviour.
+
+### How noisy it is
+
+Advice about your own players and completed trades are never throttled — they expire at kickoff.
+Deal and free-agent suggestions are: at most one push per kind per 6 hours per device, and more than
+one new deal in a run becomes a single digest ("3 new deals — best: …"). Those defaults
+(`dealsCooldownHours`, `faCooldownHours`, `maxDealsPerPush`) are applied by the job, so a phone
+paired before v1.4 is throttled without re-pasting anything.
+
+*Future option:* Safari 18.4 / iOS 18.4 added **Declarative Web Push**, where the payload itself
+describes the notification and the browser shows it with no service worker involved — which makes
+the silent-push penalty structurally impossible. Tradewinds does not emit it yet.
+
 ## News advisor
 
 The Sleeper app tells you *what happened*; the advisor tells you *what to do*. It is deterministic
@@ -132,6 +222,7 @@ Dry run without any secret, printing what the job would send for one league and 
 
 ```bash
 ALERT_DRY=1 ALERT_DRY_LEAGUE=<leagueId> ALERT_DRY_USER=<userId> node pipeline/alerts.mjs
+node scripts/alerts-doctor.mjs              # is the sender healthy, and who does it think it knows?
 ```
 
 **Faster than GitHub's cron.** Any machine that is awake can fire the job to the minute:

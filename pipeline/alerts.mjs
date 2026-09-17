@@ -29,7 +29,7 @@
 // applyState(state, update) decides what to remember, and main() only wires
 // env -> fetch -> engine -> sender -> data/alerts-state.json + data/advisor.json.
 
-import { createHash } from "node:crypto";
+import { createDecipheriv, createECDH, createHash, hkdfSync } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -220,6 +220,219 @@ export function normalizePrefs(prefs) {
   };
 }
 
+/* --- self-healing pairing (design §13.3 B5) ---------------------------------------------------
+ *
+ * The phone cannot edit a repository secret, but it CAN fire a `repository_dispatch` with a
+ * fine-grained PAT. It sends its pairing payload sealed to the VAPID PUBLIC key (ECIES: ephemeral
+ * ECDH P-256 → HKDF-SHA256 → AES-256-GCM, see `pairingBlob` in src/push.js); this job opens it
+ * with `VAPID_PRIVATE_KEY` and files the CIPHERTEXT in data/alerts-state.json. The state file is
+ * public, so what lands there has to be unreadable without the private key — and it is.
+ *
+ * Why it matters (research R5 §6.2): iOS does not reliably fire `pushsubscriptionchange`, there is
+ * no `expirationTime`, and web.push.apple.com answers 201 for a subscription it has already
+ * discarded. A phone whose endpoint rotates is therefore invisible to the sender forever. This is
+ * the path that lets the phone say "I moved" without a human copying a code at all.
+ */
+
+/** HKDF `info`; must match `PAIR_INFO` in src/push.js byte for byte. */
+export const PAIR_INFO = "tradewinds-pair-v1";
+
+/** AES-GCM authentication tag length, in bytes. */
+const GCM_TAG_BYTES = 16;
+
+const fromB64Url = (value) => Buffer.from(String(value ?? ""), "base64url");
+
+/**
+ * Open a sealed pairing blob. Throws on anything that is not exactly what `pairingBlob` produced —
+ * a tampered ciphertext fails the GCM tag, which is the point of using GCM.
+ *
+ * @param {string} blob base64url of the JSON envelope `{v, epk, salt, iv, ct}`
+ * @param {string} vapidPrivateKey base64url of the 32-byte P-256 scalar (the GitHub secret)
+ * @returns {object} the pairing payload
+ */
+export function decryptPairingBlob(blob, vapidPrivateKey) {
+  const text = fromB64Url(blob).toString("utf8");
+  let envelope;
+  try {
+    envelope = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`pairing blob is not an envelope: ${error.message}`);
+  }
+  if (!envelope || envelope.v !== 1) throw new Error(`unsupported pairing blob version ${envelope?.v}`);
+
+  const epk = fromB64Url(envelope.epk);
+  if (epk.length !== 65 || epk[0] !== 4) throw new Error("pairing blob: ephemeral key is not an uncompressed P-256 point");
+  const salt = fromB64Url(envelope.salt);
+  const iv = fromB64Url(envelope.iv);
+  const ct = fromB64Url(envelope.ct);
+  if (iv.length !== 12) throw new Error("pairing blob: iv must be 12 bytes");
+  if (ct.length <= GCM_TAG_BYTES) throw new Error("pairing blob: ciphertext too short");
+
+  const ecdh = createECDH("prime256v1");
+  ecdh.setPrivateKey(fromB64Url(vapidPrivateKey));
+  // P-256 ECDH yields the 32-byte x coordinate — the same bytes WebCrypto's deriveBits returns.
+  const shared = ecdh.computeSecret(epk);
+  const key = Buffer.from(hkdfSync("sha256", shared, salt, Buffer.from(PAIR_INFO, "utf8"), 32));
+
+  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(ct.subarray(ct.length - GCM_TAG_BYTES));
+  const plain = Buffer.concat([decipher.update(ct.subarray(0, ct.length - GCM_TAG_BYTES)), decipher.final()]);
+  return JSON.parse(plain.toString("utf8"));
+}
+
+/**
+ * `github.event.client_payload`, as the workflow hands it over (`toJson`, so "{}" for every other
+ * trigger). Never throws.
+ * @param {unknown} raw
+ * @returns {{ blob: string|null, deviceId: string|null, label: string|null, test: boolean }}
+ */
+export function parseDispatchPayload(raw) {
+  const text = raw == null ? "" : String(raw).trim();
+  if (!text || text === "null") return { blob: null, deviceId: null, label: null, test: false };
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { blob: null, deviceId: null, label: null, test: false };
+  }
+  if (!parsed || typeof parsed !== "object") return { blob: null, deviceId: null, label: null, test: false };
+  return {
+    blob: typeof parsed.blob === "string" && parsed.blob ? parsed.blob : null,
+    deviceId: typeof parsed.deviceId === "string" && parsed.deviceId ? parsed.deviceId : null,
+    label: typeof parsed.label === "string" && parsed.label ? parsed.label : null,
+    test: parsed.test === true || parsed.test === "true",
+  };
+}
+
+/**
+ * Is this decrypted payload something we are willing to push to? Same bar as a pasted pairing.
+ * @param {unknown} pairing
+ * @returns {string[]} problems; empty means good
+ */
+export function validatePairing(pairing) {
+  /** @type {string[]} */
+  const problems = [];
+  if (!pairing || typeof pairing !== "object") return ["pairing is not an object"];
+  if (pairing.v !== 1) problems.push(`pairing.v must be 1, got ${JSON.stringify(pairing.v)}`);
+  const sub = pairing.sub && typeof pairing.sub === "object" ? pairing.sub : null;
+  const endpoint = sub && typeof sub.endpoint === "string" ? sub.endpoint.trim() : "";
+  if (!/^https:\/\//i.test(endpoint)) problems.push("pairing.sub.endpoint must be an https url");
+  const keys = sub?.keys && typeof sub.keys === "object" ? sub.keys : {};
+  if (typeof keys.p256dh !== "string" || !keys.p256dh) problems.push("pairing.sub.keys.p256dh is missing");
+  if (typeof keys.auth !== "string" || !keys.auth) problems.push("pairing.sub.keys.auth is missing");
+  if (!String(pairing.leagueId ?? "").trim()) problems.push("pairing.leagueId is missing");
+  return problems;
+}
+
+/**
+ * File a new pairing (ciphertext only) and retire whatever it replaces.
+ *
+ * "Replaces" is (userId, label): the same phone, re-subscribed. Its old entry is not deleted —
+ * marking it `supersededBy` keeps the history readable in the doctor and in git, and one line in
+ * the log says which id took over.
+ *
+ * @param {object} state
+ * @param {{ id: string, blob: string, label?: string|null, userId?: string|null,
+ *   leagueId?: string|null, createdAt?: string|null }} pairing
+ * @returns {{ state: object, superseded: string[] }}
+ */
+export function applyPairing(state, pairing) {
+  const next = canonicalState(state);
+  const pairings = { ...(next.pairings || {}) };
+  /** @type {string[]} */
+  const superseded = [];
+  const sameDevice = (entry) =>
+    String(entry?.userId ?? "") === String(pairing.userId ?? "") &&
+    String(entry?.label ?? "") === String(pairing.label ?? "");
+
+  for (const [id, entry] of Object.entries(pairings)) {
+    if (id === pairing.id || !sameDevice(entry)) continue;
+    pairings[id] = { ...entry, supersededBy: pairing.id };
+    superseded.push(id);
+  }
+  pairings[pairing.id] = {
+    blob: String(pairing.blob),
+    label: pairing.label ?? null,
+    userId: pairing.userId ?? null,
+    leagueId: pairing.leagueId ?? null,
+    createdAt: pairing.createdAt ?? null,
+  };
+  return { state: canonicalState({ ...next, pairings }), superseded };
+}
+
+/**
+ * The devices the state file's own pairings describe. A superseded entry is skipped: it is history,
+ * not a destination.
+ * @param {object} state
+ * @param {string} vapidPrivateKey
+ * @param {(id: string, message: string) => void} [onProblem]
+ * @returns {object[]} devices in the shape `parseSubscriptions` produces
+ */
+export function pairedDevices(state, vapidPrivateKey, onProblem) {
+  /** @type {object[]} */
+  const devices = [];
+  const pairings = (state && state.pairings) || {};
+  if (!vapidPrivateKey) return devices;
+  for (const id of Object.keys(pairings).sort()) {
+    const entry = pairings[id] || {};
+    if (entry.supersededBy) continue;
+    let pairing;
+    try {
+      pairing = decryptPairingBlob(entry.blob, vapidPrivateKey);
+    } catch (error) {
+      if (onProblem) onProblem(id, `could not be decrypted (${error.message})`);
+      continue;
+    }
+    const problems = validatePairing(pairing);
+    if (problems.length) {
+      if (onProblem) onProblem(id, problems[0]);
+      continue;
+    }
+    const endpoint = String(pairing.sub.endpoint).trim();
+    devices.push({
+      id: deviceIdOf(endpoint),
+      sub: { endpoint, keys: { p256dh: pairing.sub.keys.p256dh, auth: pairing.sub.keys.auth } },
+      endpoint,
+      leagueId: String(pairing.leagueId),
+      userId: pairing.userId == null ? null : String(pairing.userId),
+      label: String(entry.label || pairing.label || `device ${id.slice(0, 6)}`),
+      prefs: normalizePrefs(pairing.prefs),
+      createdAt: pairing.createdAt ?? entry.createdAt ?? null,
+      selfPaired: true,
+    });
+  }
+  return devices;
+}
+
+/**
+ * One device list from the two sources. A pairing the phone filed itself WINS over the pasted
+ * secret for the same (userId, label): the phone knows its current endpoint, the secret does not.
+ * @param {object[]} fromSecret
+ * @param {object[]} fromPairings
+ * @returns {{ devices: object[], superseded: { id: string, by: string, label: string }[] }}
+ */
+export function mergeDevices(fromSecret, fromPairings) {
+  const byId = new Map();
+  /** @type {{ id: string, by: string, label: string }[]} */
+  const superseded = [];
+  for (const device of fromPairings) byId.set(device.id, device);
+
+  for (const device of fromSecret) {
+    if (byId.has(device.id)) continue;
+    const newer = fromPairings.find(
+      (paired) =>
+        String(paired.userId ?? "") === String(device.userId ?? "") &&
+        String(paired.label ?? "") === String(device.label ?? ""),
+    );
+    if (newer) {
+      superseded.push({ id: device.id, by: newer.id, label: device.label });
+      continue;
+    }
+    byId.set(device.id, device);
+  }
+  return { devices: [...byId.values()], superseded };
+}
+
 /**
  * Parse PUSH_SUBSCRIPTIONS. Never throws: a malformed row is reported and skipped so one bad paste
  * cannot silence every other device.
@@ -364,7 +577,29 @@ export function canonicalState(state) {
     if (entry.expired === true) device.expired = true;
     devices[deviceId] = device;
   }
-  return { v: 1, leagues, devices };
+
+  // §13.3 B5 — pairings the phones filed themselves, ciphertext only. The key is omitted entirely
+  // when there are none, so a state file written before v1.4 serializes exactly as it did.
+  /** @type {Record<string, any>} */
+  const pairings = {};
+  for (const id of Object.keys(source.pairings || {}).sort()) {
+    const entry = source.pairings[id] || {};
+    if (typeof entry.blob !== "string" || !entry.blob) continue;
+    /** @type {Record<string, any>} */
+    const row = {
+      blob: entry.blob,
+      label: entry.label ?? null,
+      userId: entry.userId == null ? null : String(entry.userId),
+      leagueId: entry.leagueId == null ? null : String(entry.leagueId),
+      createdAt: entry.createdAt ?? null,
+    };
+    if (entry.supersededBy) row.supersededBy = String(entry.supersededBy);
+    pairings[id] = row;
+  }
+
+  const canonical = { v: 1, leagues, devices };
+  if (Object.keys(pairings).length) canonical.pairings = pairings;
+  return canonical;
 }
 
 /**
@@ -1549,6 +1784,24 @@ export async function main(options = {}) {
   const dry = isEnabled(env.ALERT_DRY);
   log(`tradewinds alerts${dry ? " (dry run)" : ""} — ${isoTimestamp(new Date(now))} — ${subject}`);
 
+  // The state is read FIRST now: since §13.3 B5 it also holds the pairings phones filed for
+  // themselves, and those are part of the device list.
+  const stateFile = join(root, "data", "alerts-state.json");
+  const stateIn = loadState(stateFile, status);
+  let stateOut = stateIn;
+  /** Write only when something actually changed — the workflow commits whatever this touches. */
+  const writeStateIfChanged = () => {
+    if (dry) return;
+    const before = JSON.stringify(canonicalState(stateIn));
+    const after = JSON.stringify(canonicalState(stateOut));
+    if (before === after) {
+      status("ok", "state", "data/alerts-state.json unchanged");
+      return;
+    }
+    const size = writeJsonFile(stateFile, canonicalState(stateOut));
+    status("ok", "state", `data/alerts-state.json written (${size.bytes} B)`);
+  };
+
   /** @type {object[]} */
   let devices = [];
   if (dry) {
@@ -1560,9 +1813,55 @@ export async function main(options = {}) {
     devices = [synthetic.device];
     status("ok", "dry", `league ${synthetic.device.leagueId} · user ${synthetic.device.userId ?? "(none)"}`);
   } else {
+    // A phone that re-subscribed sends its new pairing here, sealed to the VAPID public key
+    // (§13.3 B5). File it before anything else so THIS run already uses the new endpoint.
+    const dispatch = parseDispatchPayload(env.PAIR_PAYLOAD);
+    if (dispatch.blob) {
+      if (!privateKey) {
+        status("warn", "pairing", "a pairing arrived but VAPID_PRIVATE_KEY is not set — cannot open it");
+      } else {
+        try {
+          const pairing = decryptPairingBlob(dispatch.blob, privateKey);
+          const problems = validatePairing(pairing);
+          if (problems.length) {
+            status("warn", "pairing", `rejected: ${problems[0]}`);
+          } else {
+            const id = deviceIdOf(pairing.sub.endpoint);
+            const label = dispatch.label ?? pairing.label ?? null;
+            const applied = applyPairing(stateOut, {
+              id,
+              blob: dispatch.blob,
+              label,
+              userId: pairing.userId ?? null,
+              leagueId: pairing.leagueId ?? null,
+              createdAt: pairing.createdAt ?? isoTimestamp(new Date(now)),
+            });
+            stateOut = applied.state;
+            status(
+              "ok",
+              "pairing",
+              `${label ?? "device"} · stored ${id}${applied.superseded.length ? ` · supersedes ${applied.superseded.join(", ")}` : ""}`,
+            );
+          }
+        } catch (error) {
+          // Never log the blob or anything it decrypts to — the endpoint and its keys are secrets.
+          status("warn", "pairing", `could not be opened (${error.message})`);
+        }
+      }
+    }
+
     const parsed = parseSubscriptions(env.PUSH_SUBSCRIPTIONS);
     for (const problem of parsed.problems) status("warn", "subscriptions", problem);
-    devices = parsed.devices;
+
+    const selfPaired = pairedDevices(stateOut, privateKey, (id, message) =>
+      status("warn", "pairing", `${id}: ${message}`),
+    );
+    const merged = mergeDevices(parsed.devices, selfPaired);
+    devices = merged.devices;
+    for (const row of merged.superseded) {
+      status("ok", "pairing", `${row.label} (${row.id}) in PUSH_SUBSCRIPTIONS is superseded by ${row.by} — skipping the stale one`);
+    }
+    if (selfPaired.length) status("ok", "pairings", `${selfPaired.length} self-paired device(s)`);
     if (devices.length) {
       status("ok", "subscriptions", `${devices.length} device(s): ${devices.map((d) => d.label).join(", ")}`);
     }
@@ -1587,6 +1886,7 @@ export async function main(options = {}) {
 
     if (!devices.length) {
       status("ok", "subscriptions", "nothing paired");
+      writeStateIfChanged();
       return 0;
     }
   }
@@ -1617,8 +1917,11 @@ export async function main(options = {}) {
     return sender(device.sub, JSON.stringify(payloadOf(notification)), deliveryOptions(notification.kind));
   };
 
-  // --- ALERT_TEST: one push per device, state untouched ------------------------------------------
-  if (!dry && isEnabled(env.ALERT_TEST)) {
+  // --- ALERT_TEST: one push per device, state otherwise untouched --------------------------------
+  // `client_payload.test` is the same request made from the phone (§13.3 B5), so "Send test alert"
+  // needs no trip to github.com when a token is saved.
+  const testRequested = isEnabled(env.ALERT_TEST) || parseDispatchPayload(env.PAIR_PAYLOAD).test;
+  if (!dry && testRequested) {
     const notification = { ...testPayload(subject), kind: "test" };
     let sent = 0;
     for (const device of devices) {
@@ -1630,7 +1933,9 @@ export async function main(options = {}) {
         status("warn", "test push", `${device.label}: ${statusCodeOf(error) ?? ""} ${error.message}`.trim());
       }
     }
-    status("ok", "test", `${sent}/${devices.length} delivered · state untouched`);
+    status("ok", "test", `${sent}/${devices.length} accepted by the push service`);
+    // A pairing that arrived in the same dispatch still has to be kept; nothing else is written.
+    writeStateIfChanged();
     return 0;
   }
 
@@ -1647,10 +1952,6 @@ export async function main(options = {}) {
     files[name] = parsed;
   }
   status("ok", "data", `players/projections/values/schedule/meta from ${files.meta.generated_at ?? "?"}`);
-
-  const stateFile = join(root, "data", "alerts-state.json");
-  const stateIn = loadState(stateFile, status);
-  let stateOut = stateIn;
 
   /** @type {any} */
   let nflState = null;
@@ -1829,7 +2130,7 @@ export async function main(options = {}) {
           status(
             "ok",
             "push",
-            `${device.label} · ${code ?? "?"} · ${notification.title} — ${notification.body}${receiptId ? ` · ${receiptId}` : ""}`,
+            `${device.label} · accepted ${code ?? "?"} · ${notification.title} — ${notification.body}${receiptId ? ` · ${receiptId}` : ""}`,
           );
         } catch (error) {
           const code = statusCodeOf(error);
@@ -1902,6 +2203,8 @@ export async function main(options = {}) {
 
   if (!leaguesOk) {
     status("fail", "leagues", `no league could be fetched (${leagueIds.length} tried)`);
+    // A pairing filed at the top of this run is not lost because Sleeper was down.
+    writeStateIfChanged();
     return 1;
   }
 
@@ -1913,14 +2216,7 @@ export async function main(options = {}) {
     return 0;
   }
 
-  const before = JSON.stringify(canonicalState(stateIn));
-  const after = JSON.stringify(canonicalState(stateOut));
-  if (before === after) {
-    status("ok", "state", "data/alerts-state.json unchanged");
-  } else {
-    const size = writeJsonFile(stateFile, canonicalState(stateOut));
-    status("ok", "state", `data/alerts-state.json written (${size.bytes} B)`);
-  }
+  writeStateIfChanged();
 
   // --- data/advisor.json: the feed the Advisor tab reads (§12.3) ---------------------------------
   const advisorFile = join(root, "data", "advisor.json");
