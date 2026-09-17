@@ -3,6 +3,7 @@
 
 import {
   escapeHtml, fmtValue, fmtFull, fmtPct, fmtPts, initials, clip, posRankLabel, fmtRosterPct,
+  acceptPhrase,
 } from "./format.js";
 import { SLEEPER } from "../config.js";
 
@@ -65,10 +66,24 @@ export function injuryTag(inj) {
 }
 
 /**
+ * The roster list a player is parked in, when it is not the active one. The group heading
+ * already names it, but the row says so too so a selected IR player still reads as IR in a
+ * screenshot or a screen reader's row-by-row pass (design §13.2 A3).
+ * A reserve player whose injury status is literally "IR" would print the chip twice, so the
+ * grey slot chip stands down for that one case and the red status chip carries it.
+ */
+export function slotTag(slot, inj) {
+  if (!slot) return "";
+  if (slot === "IR" && inj === "IR") return "";
+  return `<span class="tag tag-mute">${escapeHtml(slot)}</span>`;
+}
+
+/**
  * A selectable roster row for the Analyze columns.
  * mv may be null (K/DEF or unpriced) — the row then reads "no market value".
+ * `slot` marks a player parked on IR or the taxi squad.
  */
-export function playerRow(ctx, id, { side, selected, mv, compact = false }) {
+export function playerRow(ctx, id, { side, selected, mv, compact = false, slot = "" }) {
   const p = ctx.players.get(id) || { id, name: id, pos: "", team: "" };
   const val = mv && mv.m != null ? fmtValue(mv.m) : "—";
   const bye = ctx.byes && p.team ? ctx.byes[p.team] : null;
@@ -77,7 +92,7 @@ export function playerRow(ctx, id, { side, selected, mv, compact = false }) {
     aria-pressed="${selected ? "true" : "false"}">
     <span class="prow-main">
       <span class="prow-name">${escapeHtml(clip(p.name, compact ? 15 : 20))}</span>
-      <span class="prow-meta">${escapeHtml(p.pos || "")}<span class="dim">${escapeHtml(p.team ? " " + p.team : "")}</span>${injuryTag(p.inj)}${compact ? "" : byeTag}</span>
+      <span class="prow-meta">${escapeHtml(p.pos || "")}<span class="dim">${escapeHtml(p.team ? " " + p.team : "")}</span>${injuryTag(p.inj)}${slotTag(slot, p.inj)}${compact ? "" : byeTag}</span>
     </span>
     <span class="prow-val num">${val}</span>
   </button>`;
@@ -126,6 +141,42 @@ export function verdictWord(v) {
   // lines — and so a third-party trade's headline never leaks a second-person label.
   const label = VERDICT_LABEL[code] || v?.label || "Fair";
   return `<span class="verdict-word" data-tone="${verdictTone(code)}">${escapeHtml(label)}</span>`;
+}
+
+/**
+ * The one-row verdict bar's text (design §13.2 A2). Pure: every string the bar prints comes
+ * out of here so it can be checked without a browser, and so the bar and the details sheet
+ * can never disagree about the same verdict.
+ *
+ * An `invalid` result has no numbers worth printing — every field of it is zero — so the bar
+ * trades the stats for the reason the engine refused.
+ *
+ * @returns {{code:string, word:string, tone:string, invalid:boolean, edge:string,
+ *   edgeTone:string, delta:string, deltaTone:string, unit:string, accept:string,
+ *   acceptCls:string, reason:string}}
+ */
+export function verdictBarText(verdict, names = null) {
+  const v = verdict || {};
+  const code = v.code || "fair";
+  const invalid = code === "invalid";
+  const acc = acceptPhrase(v, names);
+  const reason = invalid
+    ? String((v.labelParts && v.labelParts.text) || v.label || "").replace(/^Invalid\s*[—-]\s*/, "")
+    : "";
+  return {
+    code,
+    word: VERDICT_LABEL[code] || v.label || "Fair",
+    tone: verdictTone(code),
+    invalid,
+    edge: invalid ? "" : fmtPct(v.edgePct),
+    edgeTone: invalid ? "even" : signTone(v.edgePct, 0.5),
+    delta: invalid ? "" : fmtPts(v.deltaPerWeek),
+    deltaTone: invalid ? "even" : signTone(v.deltaPerWeek),
+    unit: "pts/wk",
+    accept: invalid ? "" : acc.short,
+    acceptCls: invalid ? "" : acc.cls,
+    reason: invalid ? clip(reason, 46) : "",
+  };
 }
 
 /**
@@ -343,6 +394,28 @@ export async function copyText(text) {
   }
 }
 
+/* ------------------------------------------------------------------ viewport */
+
+/**
+ * Is the on-screen keyboard (or any other interactive widget) covering the app?
+ *
+ * iOS never says so directly: the only signal is that `visualViewport.height` drops well below
+ * the layout viewport while the layout viewport itself does not move. The 0.75 threshold is
+ * loose enough to ignore the Safari toolbar shrinking the visual viewport (~12 %) and tight
+ * enough to catch the smallest iPhone keyboard (~44 % of a 667 px screen). Pure so it can be
+ * tested without a browser — app.js only ever feeds it the two live numbers (design §13.2 A1).
+ *
+ * @param {number} vvHeight     visualViewport.height (falls back to innerHeight when absent)
+ * @param {number} innerHeight  window.innerHeight — the layout viewport
+ * @param {number} [ratio=0.75] fraction of the layout viewport below which we call it open
+ */
+export function keyboardState(vvHeight, innerHeight, ratio = 0.75) {
+  const vv = Number(vvHeight);
+  const inner = Number(innerHeight);
+  if (!Number.isFinite(vv) || !Number.isFinite(inner) || vv <= 0 || inner <= 0) return false;
+  return vv < inner * ratio;
+}
+
 /* ------------------------------------------------------------------ theme */
 
 export const THEMES = ["dark", "system", "light"];
@@ -370,10 +443,14 @@ export function syncThemeColor() {
   if (meta) meta.setAttribute("content", resolvedTheme() === "light" ? "#F3F6FC" : "#0B1220");
 }
 
-matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
-  if (currentTheme() === "system") syncThemeColor();
-});
-syncThemeColor();
+// Guarded so the pure helpers above (verdictBarText, keyboardState, slotTag …) can be imported
+// by `node --test`, which has no document and no matchMedia.
+if (typeof document !== "undefined" && typeof matchMedia === "function") {
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+    if (currentTheme() === "system") syncThemeColor();
+  });
+  syncThemeColor();
+}
 
 /* ------------------------------------------------------------------ team picker */
 
