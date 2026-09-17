@@ -12,14 +12,27 @@
 
 import { readFileSync } from "node:fs";
 
-import { SAMPLE_LEAGUE, SLEEPER } from "../src/config.js";
-import { buildContext } from "../src/engine/context.js";
-import { curveFit, tableFor, waiverReplacement } from "../src/engine/values.js";
-import { seasonLineup } from "../src/engine/lineup.js";
-import { evaluateTrade } from "../src/engine/trade.js";
+import { POSITIONS, SAMPLE_LEAGUE, SLEEPER, TRADEABLE } from "../src/config.js";
+import {
+  activePlayers,
+  buildContext,
+  irEligibleStatus,
+  playerOf,
+  rosPoints,
+  rosterById,
+  tradeablePlayers,
+} from "../src/engine/context.js";
+import { curveFit, marketValue, surplus, tableFor, waiverReplacement } from "../src/engine/values.js";
+import { seasonLineup, weekVector } from "../src/engine/lineup.js";
+import { evaluateTrade, rosterLanding } from "../src/engine/trade.js";
 import { sideNames } from "../src/engine/explain.js";
 import { findLeagueTrades, findTrades, tradePool } from "../src/engine/finder.js";
 import { findFreeAgents, freeAgentPool, gradeTransaction } from "../src/engine/waiver.js";
+import { applyStatuses } from "../src/engine/advisor.js";
+import { IR_STATUSES } from "../src/engine/injuries.js";
+// The alerts job is the reference implementation for "build a ctx from live Sleeper" (§13.4 C5);
+// importing its parsers keeps this audit honest rather than re-deriving the same shapes.
+import { projectionsUrl, statusRowsFromProjections } from "../pipeline/alerts.mjs";
 
 const LEAGUE_ID = process.argv[2] || SAMPLE_LEAGUE.leagueId;
 const USER_ID = LEAGUE_ID === SAMPLE_LEAGUE.leagueId ? SAMPLE_LEAGUE.userId : null;
@@ -28,6 +41,14 @@ const FETCH_TIMEOUT_MS = 8000;
 const readJson = (relative) => JSON.parse(readFileSync(new URL(relative, import.meta.url), "utf8"));
 const pipeline = (name) => readJson(`../data/${name}`);
 const snapshot = (name) => readJson(`../test/fixtures/${name}`);
+/** An optional pipeline file — `data/history.json` only exists once WS-F has run (§13.6 F1). */
+const optional = (name) => {
+  try {
+    return pipeline(name);
+  } catch {
+    return null;
+  }
+};
 
 /**
  * Fetch one cache-busted Sleeper endpoint, falling back to a committed snapshot.
@@ -96,7 +117,28 @@ const [transactionRounds, trending] = await Promise.all([
 ]);
 const transactions = transactionRounds.flat().sort((a, b) => b.created - a.created);
 
-const ctx = buildContext(
+// §13.4 C5 freshness: `data/players.json` carries the statuses of its last pipeline run, and an
+// audit of IR handling that reads yesterday's injury list is worthless. One position-filtered call
+// to the projections endpoint reprices every status, exactly as `pipeline/alerts.mjs` does.
+const history = optional("history.json");
+const liveStatusRows = await (async () => {
+  const season = String(league?.season || state?.season || SAMPLE_LEAGUE.season);
+  const week = Math.max(1, Number(state?.week) || 1);
+  const url = `${projectionsUrl(season, week)}&cb=${Date.now()}`;
+  try {
+    const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(20000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const { statuses } = statusRowsFromProjections(await response.json());
+    notes.push(`statuses live (${statuses.length} rows)`);
+    return statuses;
+  } catch (error) {
+    notes.push(`statuses from data/players.json (${error.message})`);
+    return [];
+  }
+})();
+notes.push(history ? "history.json loaded" : "history.json absent (WS-F pending)");
+
+const rawCtx = buildContext(
   {
     league,
     users,
@@ -104,6 +146,7 @@ const ctx = buildContext(
     state,
     transactions,
     trending,
+    history,
     now: Date.now(),
     players: pipeline("players.json"),
     projections: pipeline("projections.json"),
@@ -112,6 +155,7 @@ const ctx = buildContext(
   },
   { leagueId: LEAGUE_ID, userId: USER_ID }
 );
+const ctx = applyStatuses(rawCtx, liveStatusRows);
 
 const nm = (id) => (ctx.players.get(id) || { name: id }).name;
 const team = (rosterId) => {
@@ -276,3 +320,266 @@ leagueDeals.slice(0, 5).forEach((d, i) => {
   const rival = d.result.reasons.find((line) => line.kind === "rival");
   if (rival) out(`   ${rival.text}`);
 });
+
+// --- §13.4 C5 · analyzer audit on live data ----------------------------------------------------
+// Everything below is an AUDIT: it prints what the engine believes and names anything that looks
+// wrong, so a number nobody can defend cannot ship quietly. Anomalies are collected as they are
+// found and printed together at the end.
+
+/** @type {string[]} */
+const anomalies = [];
+const flag = (line) => anomalies.push(line);
+const finite = (n) => Number.isFinite(Number(n));
+const pct = (a, b) => (b ? `${(((a - b) / b) * 100).toFixed(1)}%` : "n/a");
+/** IR-class in the Sleeper sense: on a reserve list, or eligible for one in this league. */
+const isStashable = (id) => {
+  const inj = playerOf(ctx, id).inj;
+  return !!inj && (IR_STATUSES.includes(inj) || irEligibleStatus(ctx, inj));
+};
+const parkedIds = new Set();
+for (const r of ctx.rosters) for (const id of r.reserve || []) parkedIds.add(id);
+
+out("\n=== replacement levels W[pos] (R3 §b) — priced off THIS league's wire ===");
+const faPool = freeAgentPool(ctx);
+const faCount = {};
+for (const id of faPool) {
+  const pos = playerOf(ctx, id).pos;
+  if (pos) faCount[pos] = (faCount[pos] || 0) + 1;
+}
+for (const pos of TRADEABLE) {
+  const best = W.best[pos];
+  const line =
+    `  ${pos.padEnd(4)} W ${String(Math.round(W[pos])).padStart(5)}` +
+    `  best free agent: ${best ? `${nm(best.id)} (${Math.round(best.m)})` : "none"}` +
+    `  · ${faCount[pos] || 0} free`;
+  out(line);
+  if (!finite(W[pos])) flag(`W[${pos}] is not a finite number (${W[pos]}) — values.js waiverReplacement`);
+  if (!W[pos]) flag(`W[${pos}] is 0 — every ${pos} on the wire is unpriced, so surplus is raw value`);
+}
+out(`  FLEX W ${Math.round(W.FLEX)} (= max of RB/WR/TE) · pool ${faPool.length} players`);
+for (const pos of ["K", "DEF"]) {
+  if (W[pos] != null) flag(`W has a ${pos} entry — K/DEF must never be valued (R3 §f stage 0)`);
+}
+
+out("\n=== top-10 market values vs FantasyCalc raw ===");
+out("  #  player                    pos  m      mAdj   fc_redraft  Δ vs raw  inj      cover  src");
+const priced = [];
+for (const [id, p] of ctx.players) {
+  if (!p || !TRADEABLE.includes(p.pos)) continue;
+  const mv = marketValue(ctx, id);
+  if (mv.m == null) continue;
+  priced.push([id, mv]);
+}
+priced.sort((a, b) => b[1].m - a[1].m || (a[0] < b[0] ? -1 : 1));
+for (const [i, [id, mv]] of priced.slice(0, 10).entries()) {
+  const raw = mv.sourcesRaw && mv.sourcesRaw.fc_redraft != null ? mv.sourcesRaw.fc_redraft : null;
+  out(
+    `  ${String(i + 1).padStart(2)}  ${nm(id).padEnd(24).slice(0, 24)}  ${String(playerOf(ctx, id).pos).padEnd(3)}  ` +
+      `${String(Math.round(mv.m)).padStart(6)} ${String(Math.round(mv.mAdj)).padStart(6)}  ` +
+      `${raw == null ? "     —    " : String(Math.round(raw)).padStart(10)}  ${
+        raw == null ? "   n/a  " : pct(mv.m, raw).padStart(8)
+      }  ${String(mv.inj || "—").padEnd(7)}  ${mv.coverage}/${Object.keys(mv.sources).length}  ${
+        mv.fallback || "blend"
+      }`
+  );
+}
+out("  blend: m = (1−keeperTilt)·redraft + keeperTilt·dynasty, redraft = weights over the present sources");
+for (const [id, mv] of priced.slice(0, 3)) {
+  out(
+    `    ${nm(id).padEnd(22).slice(0, 22)} redraft ${Math.round(mv.redraft)} · dynasty ${
+      mv.dynasty == null ? "—" : Math.round(mv.dynasty)
+    } · projV ${mv.projV == null ? "—" : Math.round(mv.projV)} → m ${Math.round(mv.m)}` +
+      ` (rank ${mv.rank}, ${playerOf(ctx, id).pos}${mv.posRank})`
+  );
+}
+{
+  const missing = priced.slice(0, 10).filter(([, mv]) => mv.sourcesRaw.fc_redraft == null);
+  if (missing.length) {
+    flag(`${missing.length} of the top 10 have no fc_redraft price — the blend is running on the curve`);
+  }
+  const drifted = priced
+    .slice(0, 10)
+    .filter(([, mv]) => mv.sourcesRaw.fc_redraft != null && Math.abs(mv.m - mv.sourcesRaw.fc_redraft) / mv.sourcesRaw.fc_redraft > 0.5);
+  for (const [id, mv] of drifted) {
+    flag(`${nm(id)}: m ${Math.round(mv.m)} is ${pct(mv.m, mv.sourcesRaw.fc_redraft)} off fc_redraft ${Math.round(mv.sourcesRaw.fc_redraft)}`);
+  }
+}
+
+out("\n=== IR / reserve players in this league (the §13.0 row-4 case) ===");
+const stashes = [];
+for (const r of ctx.rosters) {
+  for (const id of tradeablePlayers(r)) {
+    if (!parkedIds.has(id) && !isStashable(id)) continue;
+    const mv = marketValue(ctx, id);
+    if (mv.m == null) continue;
+    stashes.push({ id, rosterId: r.rosterId, parked: parkedIds.has(id), mv });
+  }
+}
+stashes.sort((a, b) => (b.mv.mAdj || 0) - (a.mv.mAdj || 0));
+if (!stashes.length) out("  nobody in the league is hurt enough to matter today");
+for (const s of stashes.slice(0, 12)) {
+  const ros = rosPoints(ctx, s.id);
+  const vec = weekVector(ctx, s.id);
+  let rest = 0;
+  for (const w of ctx.weeksLeft) rest += vec[w];
+  const p = playerOf(ctx, s.id);
+  out(
+    `  ${nm(s.id).padEnd(22).slice(0, 22)} ${String(p.pos).padEnd(3)} ${String(p.inj).padEnd(4)} ` +
+      `${team(s.rosterId).padEnd(14).slice(0, 14)} ${s.parked ? "on IR " : "active"} ` +
+      `m ${String(Math.round(s.mv.m)).padStart(5)} → mAdj ${String(Math.round(s.mv.mAdj)).padStart(5)} ` +
+      `(−${Math.round((s.mv.discount || 0) * 100)}%) · ROS proj ${ros.toFixed(0)} · lineup-visible ${rest.toFixed(0)}` +
+      `${irEligibleStatus(ctx, p.inj) ? " · IR-eligible" : " · NOT IR-eligible here"}`
+  );
+  // The known gap until §13.5 D1 lands: the lineup axis zeroes the CURRENT week only, so a man
+  // who is out for two months still projects full points from next week on.
+  if (rest > 0.9 * ros && ros > 0 && IR_STATUSES.includes(p.inj)) {
+    flag(
+      `${nm(s.id)} (${p.inj}) still projects ${rest.toFixed(0)} of ${ros.toFixed(0)} remaining pts at full value ` +
+        `— availability scaling is WS-D's lineup.js/injuries.js (§13.5 D1)`
+    );
+  }
+  // R3 §d puts the injury discount on the market axis because "market values lag". When the
+  // market has ALREADY crashed him, δ lands on top of a price that priced the same news.
+  const raw = s.mv.sourcesRaw && s.mv.sourcesRaw.fc_redraft;
+  if (s.mv.trend != null && s.mv.trend <= -1000 && (s.mv.discount || 0) > 0) {
+    flag(
+      `${nm(s.id)}: FantasyCalc has already repriced him (${Math.round(s.mv.trend)} over 30 days, now ` +
+        `${raw == null ? "—" : Math.round(raw)}) and the engine takes another ${Math.round(s.mv.discount * 100)}% ` +
+        `— possible double count of one injury (values.js injuryDiscount, R3 §d)`
+    );
+  }
+}
+
+out("\n=== three canonical trades ===");
+/** The n best assets on a roster by injury-adjusted market value. */
+const bestOf = (rosterId, n, filter = () => true) =>
+  tradePool(ctx, rosterId)
+    .filter(filter)
+    .slice(0, n);
+/** The cheapest tradeable bodies on a roster — the "benchers" of the star-for-two case. */
+const benchOf = (rosterId, n) => {
+  const pool = tradePool(ctx, rosterId);
+  return pool.slice(Math.max(0, pool.length - n));
+};
+const posOf = (id) => playerOf(ctx, id).pos;
+const rival = ctx.rosters.find((r) => r.rosterId !== sideA).rosterId;
+
+/** Print one graded trade in full. */
+const grade = (title, theirRosterId, give, get) => {
+  out(`\n— ${title}`);
+  if (!give.length || !get.length || theirRosterId == null) {
+    out("  (no such pair exists in this league today)");
+    return null;
+  }
+  const r = evaluateTrade(ctx, { myRosterId: sideA, theirRosterId, give, get });
+  out(
+    `  ${team(sideA)} sends ${give.map(nm).join(" + ")}  ⇄  ${team(theirRosterId)} sends ${get.map(nm).join(" + ")}`
+  );
+  out(`  verdict: ${r.verdict.code} — ${r.verdict.label}`);
+  out(
+    `  Edge ${r.verdict.edgePct.toFixed(1)}%  ΔL_pw ${r.verdict.deltaPerWeek.toFixed(2)}  ` +
+      `ΔL_po ${r.verdict.deltaPlayoffPerWeek.toFixed(2)}  acceptance ${r.verdict.acceptance}  ` +
+      `override ${r.verdict.override || "none"}`
+  );
+  out(
+    `  value: give raw ${r.me.valueGive.raw.toFixed(0)} / surplus ${r.me.valueGive.surplus.toFixed(0)}  ·  ` +
+      `get raw ${r.me.valueGet.raw.toFixed(0)} / surplus ${r.me.valueGet.surplus.toFixed(0)}`
+  );
+  const c = r.me.rosterCount;
+  const t = r.them.rosterCount;
+  out(
+    `  roster: me ${c.before}→${c.after} of ${c.max}, IR ${c.irBefore}→${c.irAfter} of ${c.irMax}  ·  ` +
+      `them ${t.before}→${t.after} of ${t.max}, IR ${t.irBefore}→${t.irAfter} of ${t.irMax}`
+  );
+  if (r.me.backfill.length) out(`  backfill: ${r.me.backfill.map(nm).join(", ")}`);
+  if (r.me.dropSuggestion) out(`  drop: ${nm(r.me.dropSuggestion)}`);
+  r.reasons.forEach((l) => out(`    [${l.kind}] ${l.text}`));
+  r.flags.filter((f) => f.type === "ir_slot").forEach((f) => out(`    FLAG ${f.severity}/${f.type}: ${f.text}`));
+
+  for (const [label, n] of [
+    ["edgePct", r.verdict.edgePct],
+    ["deltaPerWeek", r.verdict.deltaPerWeek],
+    ["deltaPlayoffPerWeek", r.verdict.deltaPlayoffPerWeek],
+    ["me.valueGet.surplus", r.me.valueGet.surplus],
+    ["them.edgePct", r.them.edgePct],
+  ]) {
+    if (!finite(n)) flag(`${title}: ${label} is ${n}`);
+  }
+  if (c.after > c.max && r.verdict.code !== "needs_drop") {
+    flag(`${title}: ${c.after} of ${c.max} on my roster but the verdict is ${r.verdict.code}`);
+  }
+  if (c.irAfter > c.irMax || t.irAfter > t.irMax) flag(`${title}: IR slots oversubscribed`);
+  return r;
+};
+
+// 1 — star for two benchers: the classic "they consolidate, I get depth" shape
+const star = bestOf(rival, 1)[0] || null;
+grade("star for two benchers (2-for-1 against me)", rival, benchOf(sideA, 2), star ? [star] : []);
+
+// 2 — IR star for a healthy WR2: the case Tom reported as broken
+const irTarget = stashes.find((s) => s.rosterId !== sideA && (s.parked || isStashable(s.id))) || null;
+const myWrs = bestOf(sideA, 99, (id) => posOf(id) === "WR");
+const myWr2 = myWrs[1] || myWrs[0] || null;
+grade(
+  `IR star for a healthy WR2${irTarget ? ` (${nm(irTarget.id)} is ${playerOf(ctx, irTarget.id).inj})` : ""}`,
+  irTarget ? irTarget.rosterId : null,
+  myWr2 ? [myWr2] : [],
+  irTarget ? [irTarget.id] : []
+);
+
+// 3 — 2-for-1 consolidation: I send two, I get their best
+const mine2 = bestOf(sideA, 3).slice(1, 3);
+grade("2-for-1 consolidation (I send two, I get their best)", rival, mine2, star ? [star] : []);
+
+out("\n=== anomalies ===");
+// league-wide sweeps that do not belong to any one trade
+let negativeSurplus = 0;
+let nanValues = 0;
+let valuedKickers = 0;
+for (const [id, p] of ctx.players) {
+  if (!p) continue;
+  const mv = marketValue(ctx, id);
+  if (["K", "DEF"].includes(p.pos)) {
+    if (mv.m != null) {
+      valuedKickers += 1;
+      if (valuedKickers <= 3) flag(`${nm(id)} (${p.pos}) carries a market value of ${Math.round(mv.m)}`);
+    }
+    continue;
+  }
+  if (mv.m != null && (!finite(mv.m) || !finite(mv.mAdj))) {
+    nanValues += 1;
+    if (nanValues <= 3) flag(`${nm(id)}: m=${mv.m} mAdj=${mv.mAdj}`);
+  }
+  const s = surplus(ctx, id);
+  if (s < 0 || !finite(s)) {
+    negativeSurplus += 1;
+    if (negativeSurplus <= 3) flag(`${nm(id)}: surplus ${s}`);
+  }
+}
+if (valuedKickers > 3) flag(`…and ${valuedKickers - 3} more valued K/DEF`);
+for (const r of ctx.rosters) {
+  const spots = activePlayers(r).length;
+  if (spots > ctx.league.maxRoster) flag(`${team(r.rosterId)} holds ${spots} of ${ctx.league.maxRoster} roster spots`);
+  if ((r.reserve || []).length > ctx.league.irSlots) {
+    flag(`${team(r.rosterId)} has ${r.reserve.length} on IR but the league allows ${ctx.league.irSlots}`);
+  }
+  for (const id of r.reserve || []) {
+    if (!irEligibleStatus(ctx, playerOf(ctx, id).inj)) {
+      flag(
+        `${team(r.rosterId)} has ${nm(id)} (${playerOf(ctx, id).inj || "healthy"}) parked on IR, which this ` +
+          `league does not allow — Sleeper will block their next move`
+      );
+    }
+  }
+  // the landing arithmetic must agree with itself for a no-op trade
+  const noop = rosterLanding(ctx, r.rosterId, [], []);
+  if (noop.before !== activePlayers(r).length || noop.irBefore !== (r.reserve || []).length) {
+    flag(`rosterLanding disagrees with the roster for ${team(r.rosterId)}`);
+  }
+}
+if (!anomalies.length) out("  none — every number above is defensible");
+for (const line of anomalies) out(`  ! ${line}`);
+out(
+  `\nsummary: ${priced.length} priced players · ${stashes.length} hurt-enough-to-stash · ` +
+    `${anomalies.length} anomaly(ies) · history ${history ? "loaded" : "absent"}`
+);
