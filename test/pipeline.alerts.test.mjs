@@ -344,22 +344,30 @@ test("free-agent alerts respect minFaGain and the freeAgents toggle", () => {
   const me = device({ prefs: { trades: false, deals: false, minFaGain: 0.5 } });
   const loud = composeAlerts(CTX, me, emptyState());
   const fa = loud.notifications.filter((n) => n.kind === "fa");
-  assert.ok(fa.length > 0, "a 0.5 pts/wk threshold surfaces the dropped free agent");
+  assert.ok(fa.length > 0, "a 0.5 pts/wk threshold surfaces a free agent worth a drop");
   const best = fa[0];
   assert.equal(best.url, `${SUBJECT}#deals`);
-  assert.ok(best.body.includes("Patrick Mahomes"), `expected the 6-hour-old drop, got: ${best.body}`);
-  assert.ok(best.keys.includes("4046"));
+  // CROSS-WORKSTREAM NOTE (WS-D, design-v14 section 13.5 D2/D3): this used to assert that the
+  // top row was the dropped quarterback (4046, Patrick Mahomes). Since the streaming credit an
+  // empty QB slot is no longer valued at zero, so a QB2 in a 1QB league earns only his margin
+  // over a streamer and no longer heads the wire — which is the point of the release. The test is
+  // now candidate-agnostic: it checks the SHAPE of an FA alert and the single-candidate wording.
+  // WS-B owns this file; if the alert copy should call out a specific archetype, that is B's call.
+  assert.match(best.body, /^Add .+ (?:to an open spot|, drop .+)? ?\(\+\d\.\d pts\/wk\)$/, best.body);
+  assert.ok(best.keys.length >= 1);
+  const topKey = best.keys[0];
+  assert.ok(!CTX.rosterOf.has(topKey), `${topKey} must be a free agent`);
 
-  // Drain everyone but the dropped quarterback so the single-candidate wording is exercised too.
-  const others = loud.seen.fa.filter((key) => key !== "4046");
+  // Drain everyone but the top candidate so the single-candidate wording is exercised too.
+  const others = loud.seen.fa.filter((key) => key !== topKey);
   assert.ok(others.length > 0, "the shortlist is deeper than one player");
   const drained = applyState(emptyState(), { deviceId: me.id, seen: { fa: others } });
   const single = composeAlerts(CTX, me, drained).notifications;
   assert.equal(single.length, 1);
   assert.equal(single[0].title, "Free agent worth a drop");
-  assert.match(single[0].body, /^Add Patrick Mahomes, (drop .+|to an open spot) \(\+\d\.\d pts\/wk\)$/);
-  assert.deepEqual(single[0].keys, ["4046"]);
-  assert.equal(single[0].tag, "fa-4046");
+  assert.match(single[0].body, /^Add .+, (drop .+|to an open spot) \(\+\d\.\d pts\/wk\)$/);
+  assert.deepEqual(single[0].keys, [topKey]);
+  assert.equal(single[0].tag, `fa-${topKey}`);
 
   const off = composeAlerts(CTX, device({ prefs: { trades: false, deals: false, freeAgents: false } }), emptyState());
   assert.deepEqual(off.notifications, []);

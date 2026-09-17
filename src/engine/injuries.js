@@ -345,14 +345,26 @@ export function availability(ctx, id, week, absence) {
  * feed still projects a full week 2. The current week needs no help — `weekVector` already zeroes
  * it for every status in WEEK_ZERO_STATUSES. Never mutates the input: memoized week vectors and
  * remaining-season points are keyed to a ctx, so a scenario gets a new ctx with an empty memo.
+ *
+ * Since §13.5 D1 `weekVector` applies the SAME discount from the live status, so the scenario ctx
+ * carries `memo.absenceApplied` — the set of ids whose projections already hold the discount.
+ * Without it a hypothetical would be scaled twice and an Out player would read a quarter of his
+ * points rather than a half. The stamp survives nesting: a second `withAbsence` on the same ctx
+ * keeps the first id marked.
  * @param {object} ctx
  * @param {string} id
  * @param {{branches:Array<{games:number,p:number}>}} absence
  * @returns {object} a new ctx
  */
 export function withAbsence(ctx, id, absence) {
+  const applied = new Set(ctx.absenceApplied || (ctx.memo && ctx.memo.absenceApplied) || []);
   const vec = ctx.proj.get(id);
-  if (!vec || !absence || !absence.branches) return { ...ctx, memo: {} };
+  // The stamp lives on the ctx as well as in the memo: several helpers derive a scenario with
+  // `{ ...ctx, memo: {} }` (advisor's `withReserve`, `applyStatuses`), and a lost stamp would
+  // silently square the discount.
+  if (!vec || !absence || !absence.branches) {
+    return applied.size ? { ...ctx, absenceApplied: applied, memo: { absenceApplied: applied } } : { ...ctx, memo: {} };
+  }
   const patched = Array.from(vec, (n) => Number(n) || 0);
   for (let w = ctx.week + 1; w <= ctx.lastWeek; w += 1) {
     const i = w - 1;
@@ -362,5 +374,6 @@ export function withAbsence(ctx, id, absence) {
   }
   const proj = new Map(ctx.proj);
   proj.set(id, patched);
-  return { ...ctx, proj, memo: {} };
+  applied.add(id);
+  return { ...ctx, proj, absenceApplied: applied, memo: { absenceApplied: applied } };
 }

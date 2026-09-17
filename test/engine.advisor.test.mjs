@@ -223,7 +223,11 @@ test("withAbsence discounts the injured player's future weeks and never touches 
   assert.equal(snapshot(ctx), beforeSnapshot, "the shared ctx is immutable");
   assert.notEqual(scen, ctx);
   assert.notEqual(scen.proj, ctx.proj);
-  assert.deepEqual(scen.memo, {}, "memoized week vectors cache the old status");
+  // The memo is empty of CACHES (week vectors cache the old status), but since 13.5 D1 it also
+  // carries the stamp that stops weekVector discounting these projections a second time.
+  assert.deepEqual(Object.keys(scen.memo), ["absenceApplied"]);
+  assert.deepEqual([...scen.memo.absenceApplied], [BOWERS]);
+  assert.deepEqual([...scen.absenceApplied], [BOWERS], "and it survives a { ...ctx, memo: {} } derivation");
 
   const raw = ctx.proj.get(BOWERS);
   const cut = scen.proj.get(BOWERS);
@@ -420,7 +424,18 @@ test("SC-007 — Bowers Doubtful: start Goedert, IR opens at Out, nothing on the
   assert.ok(advisory.thisWeek.was > 12, "he projected 12.7 before the news");
   assert.equal(advisory.thisWeek.replacement, GOEDERT);
   assert.ok(advisory.thisWeek.lineupDelta < 0, "the news costs points");
-  assert.ok(Math.abs(advisory.thisWeek.gain - advisory.thisWeek.replacementPts) < 1e-9);
+  // Verified by hand on this fixture: the set lineup is worth 122.872 and the optimal one 132.594,
+  // so the swap is worth 9.722 — Goedert's 7.863 PLUS 1.859. That second term is 13.5 D1 doing its
+  // job: Higgins is Questionable, so his current week is 13.331 x P(plays) = 0.7 = 9.331, which
+  // drops him below Reed's 11.190 and moves the FLEX too. Before D1 the set lineup was already
+  // optimal apart from Bowers, and the two numbers were equal.
+  assert.ok(
+    advisory.thisWeek.gain >= advisory.thisWeek.replacementPts - 1e-9,
+    `${advisory.thisWeek.gain} < ${advisory.thisWeek.replacementPts}`
+  );
+  const higgins = weekPoints(doubtful, "6801", doubtful.week);
+  const raw = doubtful.proj.get("6801")[doubtful.week - 1];
+  assert.ok(Math.abs(higgins - raw * 0.7) < 1e-9, "a Questionable starter is worth 70% of his projection");
 
   // IR is the free move, but not yet: Boyball bars Doubtful
   assert.equal(advisory.ir.eligibleNow, false);

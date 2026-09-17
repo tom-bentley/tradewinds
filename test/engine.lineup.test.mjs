@@ -11,8 +11,11 @@ import {
   isBye,
   seasonLineup,
   slotDemand,
+  streamBudget,
   weekPoints,
 } from "../src/engine/lineup.js";
+import { absenceOf, withAbsence } from "../src/engine/injuries.js";
+import { DEFAULTS } from "../src/config.js";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
 // Fixtures load lazily inside a before() hook, never at import time: the pipeline regenerates
@@ -90,7 +93,7 @@ test("a bye week excludes the player from that week only", () => {
   assert.ok(!bestLineup(ctx, MINE, 13).slots.map((s) => s.id).includes(BOWERS));
 });
 
-test("OUT-class statuses zero the current week but not future weeks", () => {
+test("OUT-class statuses zero the current week and DISCOUNT the ones after it", () => {
   const out = [...ctx.players.keys()].find((id) => {
     const p = ctx.players.get(id);
     return p.inj === "Out" && ctx.proj.has(id) && (ctx.proj.get(id)[0] || 0) > 0;
@@ -98,10 +101,19 @@ test("OUT-class statuses zero the current week but not future weeks", () => {
   if (out) {
     assert.equal(weekPoints(ctx, out, 1), 0, "week 1 is zeroed for an Out player");
     const laterWeek = ctx.proj.get(out).findIndex((v, i) => i > 0 && v > 0) + 1;
-    if (laterWeek > 1) assert.ok(weekPoints(ctx, out, laterWeek) > 0, "later weeks keep Sleeper's projection");
+    if (laterWeek > 1) {
+      // §13.5 D1: Sleeper still projects him in full, the duration table does not. The Out row
+      // is [{1,.5},{2,.3},{3,.1},{4,.1}], so week 2 is P(misses fewer than 2 games) = 0.5.
+      const raw = ctx.proj.get(out)[laterWeek - 1];
+      assert.ok(weekPoints(ctx, out, laterWeek) > 0, "he is not written off either");
+      assert.ok(weekPoints(ctx, out, laterWeek) < raw, "but he is no longer worth Sleeper's number");
+    }
   }
-  // Questionable is a market-axis discount, never a lineup zero
-  assert.ok(weekPoints(ctx, HIGGINS, 1) > 0);
+  // Questionable plays 70% of the time (STATUS_BRANCHES.Questionable), so his current week is
+  // worth 70% of the projection — not zero, and not the full number either.
+  const rawNow = ctx.proj.get(HIGGINS)[ctx.week - 1];
+  assert.ok(Math.abs(weekPoints(ctx, HIGGINS, ctx.week) - rawNow * 0.7) < 1e-9, "Questionable = 0.7 × proj");
+  assert.ok(weekPoints(ctx, HIGGINS, ctx.week + 1) > weekPoints(ctx, HIGGINS, ctx.week));
 });
 
 test("seasonLineup weights the playoff weeks and reports shortfalls", () => {
@@ -204,4 +216,157 @@ test("slot demand spreads the FLEX slots over the flex-eligible positions", () =
   assert.ok(demand.RB > 2 && demand.WR > 3 && demand.TE > 1, "each picks up a share of the two FLEX slots");
   const flexTotal = demand.RB + demand.WR + demand.TE;
   assert.ok(Math.abs(flexTotal - 8) < 1e-9, "2 RB + 3 WR + 1 TE + 2 FLEX = 8");
+});
+
+// ---------------------------------------------------------------------------------------------
+// §13.5 D1 — availability-scaled week vectors
+// ---------------------------------------------------------------------------------------------
+
+test("D1: the live status discounts future weeks exactly as withAbsence would", () => {
+  const players = { ...INPUT.players, players: { ...INPUT.players.players } };
+  players.players[BOWERS] = {
+    ...players.players[BOWERS],
+    inj: "Out",
+    injPart: "Knee - Meniscus",
+    injNotes: "Surgery",
+  };
+  const hurt = buildContext({ ...INPUT, players }, {});
+  const absence = absenceOf(hurt, hurt.players.get(BOWERS));
+  const scen = withAbsence(hurt, BOWERS, absence);
+
+  // the scenario ctx carries the stamp that stops the discount being applied twice
+  assert.ok(scen.absenceApplied.has(BOWERS));
+  assert.ok(scen.memo.absenceApplied.has(BOWERS));
+  for (const w of hurt.weeksLeft) {
+    assert.ok(
+      Math.abs(weekPoints(hurt, BOWERS, w) - weekPoints(scen, BOWERS, w)) < 1e-9,
+      `week ${w}: ${weekPoints(hurt, BOWERS, w)} vs ${weekPoints(scen, BOWERS, w)} — discounted twice`
+    );
+  }
+  // ...and it is a real discount, not a no-op
+  const raw = hurt.proj.get(BOWERS);
+  assert.equal(weekPoints(hurt, BOWERS, hurt.week), 0, "Out zeroes the current week outright");
+  assert.ok(weekPoints(hurt, BOWERS, hurt.week + 1) < raw[hurt.week] * 0.8, "and discounts the next one");
+  assert.ok(
+    weekPoints(hurt, BOWERS, hurt.week + 3) > weekPoints(hurt, BOWERS, hurt.week + 1),
+    "the discount unwinds as he gets closer"
+  );
+});
+
+test("D1: scaleFutureWeeks false restores the current-week-only rule", () => {
+  const players = { ...INPUT.players, players: { ...INPUT.players.players } };
+  players.players[BOWERS] = { ...players.players[BOWERS], inj: "Out", injPart: "Knee", injNotes: "Meniscus" };
+  const off = buildContext({ ...INPUT, players }, { availability: { scaleFutureWeeks: false } });
+  const raw = off.proj.get(BOWERS);
+  assert.equal(weekPoints(off, BOWERS, off.week), 0);
+  for (const w of off.weeksLeft.slice(1)) {
+    if (isBye(off, BOWERS, w)) continue;
+    assert.ok(Math.abs(weekPoints(off, BOWERS, w) - raw[w - 1]) < 1e-9, `week ${w} should be untouched`);
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// §13.5 D2 — streaming credit for empty slots (R5 §5.5)
+// ---------------------------------------------------------------------------------------------
+
+/** The best free agent at `pos` in `week`, straight from the pool — the streamer's raw value. */
+function bestFreeAt(context, pos, week) {
+  let best = 0;
+  for (const id of freeAgentPoolByPos(context)[pos] || []) {
+    const pts = weekPoints(context, id, week);
+    if (pts > best) best = pts;
+  }
+  return best;
+}
+
+test("D2: an empty slot is credited with the wire, a filled one never is", () => {
+  const noKicker = MINE.filter((id) => ctx.players.get(id).pos !== "K");
+  const lu = bestLineup(ctx, noKicker, 1);
+  const kSlot = lu.slots.find((s) => s.slot === "K");
+  assert.equal(kSlot.id, null, "the roster still has nobody there");
+  assert.deepEqual(lu.short, ["K"], "and the slot is still reported short");
+  assert.equal(lu.streamed.length, 1);
+  assert.equal(lu.streamed[0].slot, "K");
+
+  const wire = bestFreeAt(ctx, "K", 1);
+  const friction = DEFAULTS.streaming.frictionByPos.K;
+  assert.ok(Math.abs(kSlot.pts - wire * friction) < 1e-9, `${kSlot.pts} vs ${wire} x ${friction}`);
+  assert.ok(kSlot.pts < wire, "friction is a discount, never a bonus");
+  assert.equal(kSlot.streamed, lu.streamed[0].id, "the slot names the free agent it borrowed");
+
+  // every slot the roster CAN fill is untouched
+  for (const s of lu.slots) {
+    if (s.slot === "K") continue;
+    assert.equal(s.streamed, undefined, `${s.slot} was topped up although it has a body`);
+    assert.ok(Math.abs(s.pts - weekPoints(ctx, s.id, 1)) < 1e-9);
+  }
+  assert.ok(Math.abs(lu.total - lu.slots.reduce((a, s) => a + s.pts, 0)) < 1e-9, "total still sums the slots");
+});
+
+test("D2: the credit is per position — a QB hole is worth more of the wire than a WR hole", () => {
+  const f = DEFAULTS.streaming.frictionByPos;
+  assert.ok(f.QB > f.TE && f.TE > f.DEF && f.DEF > f.K && f.K > f.WR, "R5 section 5.5 ordering");
+  const noQb = MINE.filter((id) => ctx.players.get(id).pos !== "QB");
+  const qbSlot = bestLineup(ctx, noQb, 1).slots.find((s) => s.slot === "QB");
+  assert.ok(Math.abs(qbSlot.pts - bestFreeAt(ctx, "QB", 1) * f.QB) < 1e-9);
+});
+
+test("D2: a bye-heavy week is streamed at most twice, and never by the same body twice", () => {
+  // strip the K, the DEF and every quarterback: three holes, one waiver run (R5 section 5.5 rule 2)
+  const gutted = MINE.filter((id) => !["K", "DEF", "QB"].includes(ctx.players.get(id).pos));
+  const lu = bestLineup(ctx, gutted, 1);
+  assert.deepEqual([...lu.short].sort(), ["DEF", "K", "QB"], "three slots have nobody in them");
+  assert.equal(lu.streamed.length, DEFAULTS.streaming.maxSlotsPerWeek, "only two of them get covered");
+  assert.equal(new Set(lu.streamed.map((s) => s.id)).size, lu.streamed.length, "two different players");
+  // the best hole is the one that gets covered first
+  assert.ok(new Set(lu.streamed.map((s) => s.slot)).has("QB"), "a QB hole outscores a K hole");
+});
+
+test("D2: the k-th streamed slot takes the k-th-best free agent (R5 section 5.5 rule 1)", () => {
+  // two FLEX-eligible holes at once: without rule 1 both would book the same best body
+  const two = MINE.filter((id) => !["WR", "RB", "TE"].includes(ctx.players.get(id).pos));
+  const lu = bestLineup(ctx, two, 1);
+  assert.equal(lu.streamed.length, DEFAULTS.streaming.maxSlotsPerWeek);
+  const [first, second] = lu.streamed;
+  assert.notEqual(first.id, second.id);
+  assert.ok(first.pts >= second.pts, "best body first");
+});
+
+test("D2: the roster's own players are never its streamers", () => {
+  const noKicker = MINE.filter((id) => ctx.players.get(id).pos !== "K");
+  for (const s of bestLineup(ctx, noKicker, 1).streamed) {
+    assert.ok(!noKicker.includes(s.id), `${s.id} is on the roster and cannot also be on the wire`);
+    assert.ok(!ctx.rosterOf.has(s.id), `${s.id} is rostered somewhere in the league`);
+  }
+});
+
+test("D2: seasonLineup reports every streamed week, and streaming can be switched off", () => {
+  const noKicker = MINE.filter((id) => ctx.players.get(id).pos !== "K");
+  const s = seasonLineup(ctx, noKicker);
+  const kicked = s.streamed.filter((row) => row.slot === "K");
+  assert.equal(kicked.length, s.perWeek.length, "the K slot is empty in every remaining week");
+  for (const row of s.streamed) {
+    assert.ok(row.week >= ctx.week && row.pts > 0);
+    assert.ok(ctx.slots.includes(row.slot));
+  }
+  // a bye can open a second hole in a week; the per-week cap still holds everywhere
+  const perWeek = new Map();
+  for (const row of s.streamed) perWeek.set(row.week, (perWeek.get(row.week) || 0) + 1);
+  for (const [, n] of perWeek) assert.ok(n <= DEFAULTS.streaming.maxSlotsPerWeek);
+  assert.equal(s.shortWeeks.length, 17, "a streamed slot is still a slot the roster cannot fill");
+
+  const off = buildContext(INPUT, { streaming: { enabled: false } });
+  const plain = seasonLineup(off, noKicker);
+  assert.deepEqual(plain.streamed, []);
+  assert.ok(plain.avgPerWeek < s.avgPerWeek, "the credit is worth real points");
+  const delta = s.avgPerWeek - plain.avgPerWeek;
+  assert.ok(delta > 3 && delta < 9, `a streamed kicker is worth ${delta.toFixed(2)} pts/wk`);
+});
+
+test("D2: the streaming budget is what the roster could actually sign", () => {
+  assert.equal(streamBudget(ctx, MINE), DEFAULTS.streaming.maxSlotsPerWeek, "a 17-man roster can cut two");
+  const skeleton = MINE.slice(0, ctx.slots.length); // exactly 11 bodies, no bench
+  assert.equal(streamBudget(ctx, skeleton), DEFAULTS.streaming.maxSlotsPerWeek, "and it has open spots");
+  const off = buildContext(INPUT, { streaming: { enabled: false } });
+  assert.equal(streamBudget(off, MINE), 0);
 });

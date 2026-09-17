@@ -16,12 +16,14 @@ import {
   rosPoints,
   rosterById,
   rosteredIds,
+  slotEligibility,
   DEFAULT_WAIVER_CLEAR_DAYS,
   FAAB_WAIVER_TYPE,
 } from "./context.js";
 import { marketValue, surplus } from "./values.js";
-import { bestLineup, weekPoints } from "./lineup.js";
+import { bestLineup, settingsBlock, weekPoints } from "./lineup.js";
 import { cachedSeasonLineup, evaluateTrade } from "./trade.js";
+import { consensusGaps, playerRisk, rosterFragility } from "./risk.js";
 import { fmt1, nameOf, sideNames, voice } from "./explain.js";
 
 /** One day in milliseconds — the unit Sleeper's `waiver_clear_days` is counted in. */
@@ -42,6 +44,12 @@ export const SEASON_WEEKS = 17;
 export const ALT_BAND_PER_WEEK = 2;
 /** Lineup gains inside this margin are a tie, settled on market value instead. */
 const GAIN_EPSILON = 1e-6;
+/** How many drop candidates (best gain first) are re-scored with their insurance cost (§13.5 D3).
+ *  The gain-maximizing drop is not always the right one: cutting the only body that covers a
+ *  fragile starter can cost more than the add brings. */
+const DROP_FINALISTS = 3;
+/** Below this the insurance/risk components are not worth a sentence. */
+const WHY_EPSILON = 0.05;
 
 /**
  * Every player nobody rosters: not on a `players`, `reserve` or `taxi` list anywhere in the
@@ -222,12 +230,30 @@ export function dropCandidates(ctx, rosterId, addId) {
   });
 }
 
-/** mAdj(add) − mAdj(drop); zero for a K/DEF candidate, who is only ever worth his points. */
+/** mAdj(add) − mAdj(drop); zero for a K/DEF candidate, who is only ever worth his points.
+ *  Display only since §13.5 D3 — the scored market term is `surplusDeltaOf` below. */
 function valueDeltaOf(ctx, addId, dropId) {
   if (!TRADEABLE.includes(playerOf(ctx, addId).pos)) return 0;
   const add = marketValue(ctx, addId).mAdj || 0;
   const drop = dropId ? marketValue(ctx, dropId).mAdj || 0 : 0;
   return add - drop;
+}
+
+/**
+ * surplus(add) − surplus(drop) — the market term FaScore actually scores (R5 §2.2 mechanism 2,
+ * §5.8 check 3).
+ *
+ * `valueDelta` is a raw mAdj difference, and raw mAdj is not comparable across positions: the
+ * wire's best free quarterback prices at 1,359 against 764 for its best free receiver, so a QB2
+ * add booked a +12 point score bonus purely for being a quarterback. `surplus` (values.js) nets
+ * each player against the WAIVER REPLACEMENT AT HIS OWN POSITION, which is the same number for
+ * both sides of a cross-position comparison. A free agent is by construction at or below his
+ * position's replacement, so an add's surplus is ~0 and the term reduces to "what the drop
+ * costs" — which is exactly the honest answer.
+ */
+function surplusDeltaOf(ctx, addId, dropId) {
+  if (!TRADEABLE.includes(playerOf(ctx, addId).pos) && !dropId) return 0;
+  return surplus(ctx, addId) - (dropId ? surplus(ctx, dropId) : 0);
 }
 
 /** Remaining-season points per week for one player. */
@@ -375,6 +401,48 @@ function whyLines(ctx, row, names) {
       ? `Drop ${nameOf(ctx, row.drop)} — ${v.aPossLower} starters gain ${fmt1(row.gainPerWeek)} pts/wk${playoff}.`
       : `Open roster spot, no drop needed — ${v.aPossLower} starters gain ${fmt1(row.gainPerWeek)} pts/wk${playoff}.`
   );
+
+  // 5 — what the wire already does for free. THE anti-QB-bias line (§13.5 D2/D3): a backup whose
+  // whole case is one bye week is competing with a streamer, not with an empty slot.
+  if (row.streamedAt && row.streamedAt.weeks.length) {
+    const weeks = row.streamedAt.weeks;
+    lines.push(
+      `Without him ${v.aPossLower} ${pos} slot is not empty in ${weeks.length === 1 ? `week ${weeks[0]}` : `weeks ${weeks.join(", ")}`} — ` +
+        `the wire streams ${fmt1(row.streamedAt.pts)} pts there for nothing, so he only earns the margin over that.`
+    );
+  }
+
+  // 5b — R5 §5.8 check 7: the wire is as good as what this roster already starts here, and the
+  // add is depth rather than an upgrade. Saying it on an actual upgrade would be noise.
+  if (row.streamable && row.streamable.streamable && !row.streamedAt && row.projPerWeek <= row.streamable.mine) {
+    lines.push(
+      `Do not pay for depth at ${pos}: the best free ${pos} projects ${fmt1(row.streamable.wire)} pts/wk against ` +
+        `${v.aPossLower} own ${fmt1(row.streamable.mine)} — that slot is streamable all season.`
+    );
+  }
+
+  // 6 — insurance: what he covers that nothing on the roster does
+  if (row.insurancePerWeek > WHY_EPSILON) {
+    lines.push(
+      `Insurance: he cuts ${v.aPossLower} expected loss from an absence by ${fmt1(row.insurancePerWeek)} pts/wk.`
+    );
+  } else if (row.insurancePerWeek < -WHY_EPSILON) {
+    lines.push(
+      `The drop costs cover: ${v.aPossLower} expected loss from an absence rises ${fmt1(-row.insurancePerWeek)} pts/wk.`
+    );
+  }
+
+  // 7 — his own risk, and the crowd's opinion of him
+  if (row.risk && (row.risk.band === "high" || row.risk.band === "severe")) {
+    lines.push(`Risk ${row.risk.band} (${Math.round(row.risk.score)}/100) — ${row.risk.reasons[0]}.`);
+  }
+  if (row.consensusGap != null && Math.abs(row.consensusGap) >= (row.consensusFlagAt || 2)) {
+    lines.push(
+      row.consensusGap > 0
+        ? `Consensus disagrees: the tier sheet has him ${row.consensusGap} tiers below where his projection ranks.`
+        : `Consensus disagrees: the tier sheet has him ${-row.consensusGap} tiers above where his projection ranks.`
+    );
+  }
   return lines;
 }
 
@@ -417,34 +485,116 @@ function weeksHelped(before, after) {
 }
 
 /**
+ * Where the roster is already leaning on the wire at one position, and how much that is worth
+ * (§13.5 D2). This is the honest denominator for "what does a backup at this position add".
+ * @param {object} ctx
+ * @param {object} lineup a seasonLineup result
+ * @param {string|null} pos
+ * @returns {{weeks:number[], pts:number}|null}
+ */
+function streamedAtPosition(ctx, lineup, pos) {
+  if (!pos) return null;
+  const weeks = [];
+  let best = 0;
+  for (const s of lineup.streamed || []) {
+    if (!slotEligibility(s.slot).includes(pos)) continue;
+    weeks.push(s.week);
+    if (s.pts > best) best = s.pts;
+  }
+  return weeks.length ? { weeks, pts: best } : null;
+}
+
+/**
+ * Is this position one where the wire is nearly as good as what the roster already starts?
+ * R5 §5.8 check 7: when `bestFA[pos] ≥ streamableShare × myStarter[pos]`, depth there is not
+ * worth a roster spot — the honest advice is "don't pay for depth here", and in a 1QB, 8-team
+ * league that is exactly what the quarterback position looks like.
+ * @returns {{mine:number, wire:number, share:number, streamable:boolean}|null}
+ */
+function streamableAt(ctx, rosterId, pos, share) {
+  if (!pos) return null;
+  const roster = rosterById(ctx, rosterId);
+  if (!roster) return null;
+  const perWeekOf = (id) => {
+    const weeks = ctx.weeksLeft || [];
+    if (!weeks.length) return 0;
+    let sum = 0;
+    for (const w of weeks) sum += weekPoints(ctx, id, w);
+    return sum / weeks.length;
+  };
+  let mine = 0;
+  for (const id of activePlayers(roster)) {
+    if (playerOf(ctx, id).pos !== pos) continue;
+    const pts = perWeekOf(id);
+    if (pts > mine) mine = pts;
+  }
+  let wire = 0;
+  for (const id of freeAgentPool(ctx)) {
+    if (playerOf(ctx, id).pos !== pos) continue;
+    wire = perWeekOf(id);
+    break; // the pool is sorted by remaining points, so the first at this position is the best
+  }
+  if (mine <= 0) return { mine, wire, share: 1, streamable: wire > 0 };
+  return { mine, wire, share: wire / mine, streamable: wire / mine >= share };
+}
+
+/**
  * Free agents worth a roster spot, each paired with the player to drop for him.
  *
- * Every candidate is scored on the same season-long lineup sweep a trade is (`seasonLineup` over
- * `ctx.weeksLeft`, playoff weeks weighted by ω), with the roster set to active players − drop +
- * add. The drop maximizes that gain, market value breaks ties, and it is always legal.
+ * FaScore (§13.5 D3) — every term in the same unit, points per week:
+ *
+ *   score = gainPerWeek + κ_v·(surplusDelta/100) + κ_i·min(insurancePerWeek, cap) − κ_r·riskPenalty
+ *
+ * `gainPerWeek` is the same season-long lineup sweep a trade is measured on (`seasonLineup` over
+ * `ctx.weeksLeft`, playoff weeks weighted by ω, roster = active − drop + add) — but since §13.5
+ * D2 an empty slot is credited with what the WIRE would score there, so a QB2 in a 1QB league is
+ * now worth his margin over a streamer rather than his whole projection over an empty slot. That
+ * single change is what stops this list from reading "add a quarterback" every week.
+ * `surplusDelta` replaces the raw market difference (R5 §2.2 mechanism 2): mAdj is not comparable
+ * across positions — the wire's best free QB prices at 1,359 against 764 for its best free WR, so
+ * the old `valueDelta` term paid a quarterback +0.6 of score for being a quarterback. `surplus`
+ * nets every player against the replacement AT HIS OWN POSITION, so the term is position-blind.
+ * `insurancePerWeek` is how much the move reduces `rosterFragility.expectedLossPerWeek` — the
+ * bench cover a real handcuff provides and a third quarterback does not, capped at
+ * `insuranceCap` because 42% of round-1/2 RB handcuffs make zero starts (R5 §4). `riskPenalty`
+ * discounts an add's own gain by his `playerRisk` score, because a gain you cannot count on is
+ * worth less. `valueDelta`, `consensusGap` and `streamable` are reported, never scored: they are
+ * reasons to look, not numbers to add.
  * @param {object} ctx
  * @param {{rosterId?:number, maxResults?:number, position?:string|null, minGainPerWeek?:number,
- *          valueWeight?:number, names?:object}} [opts]
+ *          valueWeight?:number, insuranceWeight?:number, riskWeight?:number, names?:object}} [opts]
  * @returns {Array<{add:string, drop:string|null, gainPerWeek:number, playoffGainPerWeek:number,
- *   valueDelta:number, status:string, clearsAt:string|null, suggestedBid:object|null,
+ *   insurancePerWeek:number, riskPenalty:number, valueDelta:number, consensusGap:number|null,
+ *   risk:object, status:string, clearsAt:string|null, suggestedBid:object|null,
  *   trend:number|null, why:string[], score:number}>}
  */
 export function findFreeAgents(ctx, opts = {}) {
-  const cfg = (ctx.settings && ctx.settings.freeAgents) || {};
+  const cfg = settingsBlock(ctx, "freeAgents");
   const rosterId = opts.rosterId != null ? opts.rosterId : ctx.myRosterId;
   const roster = rosterById(ctx, rosterId);
   if (!roster) return [];
-  const maxResults = opts.maxResults != null ? opts.maxResults : cfg.maxResults != null ? cfg.maxResults : 12;
-  const minGain =
-    opts.minGainPerWeek != null ? opts.minGainPerWeek : cfg.minGainPerWeek != null ? cfg.minGainPerWeek : 0.5;
-  const kappa = opts.valueWeight != null ? opts.valueWeight : cfg.valueWeight != null ? cfg.valueWeight : 0.05;
+  const pick = (key, fallback) =>
+    opts[key] != null ? opts[key] : cfg[key] != null ? cfg[key] : fallback;
+  const maxResults = pick("maxResults", 12);
+  const minGain = pick("minGainPerWeek", 0.5);
+  const kappaV = pick("valueWeight", 0.05);
+  const kappaI = pick("insuranceWeight", 0.4);
+  const kappaR = pick("riskWeight", 0.4);
+  const insuranceCap = pick("insuranceCap", 1);
+  const streamShare = pick("streamableShare", 0.8);
+  const tierGap = pick("consensusTierGap", 2);
   const names = opts.names || sideNames(ctx, rosterId, null);
 
   const active = activePlayers(roster);
   const before = cachedSeasonLineup(ctx, active);
+  const fragBefore = rosterFragility(ctx, active);
+  const gaps = consensusGaps(ctx);
   const openSpot = active.length < ctx.league.maxRoster;
   const rows = [];
   const seen = new Set();
+
+  // insurance is measured on the roster the move leaves behind, so it is a per-pair number
+  const insuranceOf = (ids) => fragBefore.expectedLossPerWeek - rosterFragility(ctx, ids).expectedLossPerWeek;
 
   for (const add of shortlist(ctx, opts.position || null)) {
     if (seen.has(add)) continue;
@@ -459,37 +609,71 @@ export function findFreeAgents(ctx, opts = {}) {
     let best = openSpot
       ? {
           drop: null,
+          ids: [...active, add],
           gain: ceilingGain,
           playoff: ceiling.playoffAvg - before.playoffAvg,
           valueDelta: valueDeltaOf(ctx, add, null),
+          surplusDelta: surplusDeltaOf(ctx, add, null),
           after: ceiling,
         }
       : null;
     if (!openSpot) {
+      /** @type {object[]} */
+      const options = [];
       for (const drop of dropCandidates(ctx, rosterId, add)) {
-        const after = cachedSeasonLineup(ctx, active.filter((id) => id !== drop).concat(add));
+        const ids = active.filter((id) => id !== drop).concat(add);
+        const after = cachedSeasonLineup(ctx, ids);
         // a drop that leaves a slot unfillable is not a move Sleeper would even let you make
         if (after.shortWeeks.length > before.shortWeeks.length) continue;
-        const gain = after.avgPerWeek - before.avgPerWeek;
-        const valueDelta = valueDeltaOf(ctx, add, drop);
-        const better =
-          !best ||
-          gain > best.gain + GAIN_EPSILON ||
-          (Math.abs(gain - best.gain) <= GAIN_EPSILON && valueDelta > best.valueDelta);
-        if (better) best = { drop, gain, playoff: after.playoffAvg - before.playoffAvg, valueDelta, after };
+        options.push({
+          drop,
+          ids,
+          gain: after.avgPerWeek - before.avgPerWeek,
+          playoff: after.playoffAvg - before.playoffAvg,
+          valueDelta: valueDeltaOf(ctx, add, drop),
+          surplusDelta: surplusDeltaOf(ctx, add, drop),
+          after,
+        });
+      }
+      // Stage 1 ranks on lineup gain alone (cheap, and it is still the dominant term). Stage 2
+      // re-scores only the finalists on gain + κ_i·insurance, which is what stops the engine
+      // cutting the one body that covers a fragile starter to bank a tenth of a point.
+      options.sort((a, b) => b.gain - a.gain || b.surplusDelta - a.surplusDelta || (a.drop < b.drop ? -1 : 1));
+      for (const option of options.slice(0, DROP_FINALISTS)) {
+        option.insurance = insuranceOf(option.ids);
+        const objective = option.gain + kappaI * option.insurance;
+        if (!best || objective > best.objective + GAIN_EPSILON) best = { ...option, objective };
       }
     }
     if (!best || best.gain < minGain) continue;
 
+    // R5 §4: 42% of round-1/2 RB handcuffs make ZERO starts, so the credit is capped rather
+    // than trusted at face value.
+    const rawInsurance = best.insurance != null ? best.insurance : insuranceOf(best.ids);
+    const insurancePerWeek = Math.min(rawInsurance, insuranceCap);
+    const risk = playerRisk(ctx, add);
+    const riskPenalty = (risk.score / 100) * Math.max(0, best.gain);
+    const gap = gaps.get(add);
     const status = waiverStatus(ctx, add);
+    const pos = playerOf(ctx, add).pos;
     const row = {
       rosterId,
       add,
       drop: best.drop,
-      pos: playerOf(ctx, add).pos,
+      pos,
       gainPerWeek: best.gain,
       playoffGainPerWeek: best.playoff,
+      insurancePerWeek,
+      riskPenalty,
       valueDelta: best.valueDelta,
+      surplusDelta: best.surplusDelta,
+      consensusGap: gap ? gap.gap : null,
+      consensusTier: gap ? gap.tier : null,
+      consensusImpliedTier: gap ? gap.implied : null,
+      consensusFlagAt: tierGap,
+      risk,
+      streamedAt: streamedAtPosition(ctx, before, pos),
+      streamable: streamableAt(ctx, rosterId, pos, streamShare),
       weeksHelped: weeksHelped(before, best.after),
       projPerWeek: perWeek(ctx, add),
       value: marketValue(ctx, add).mAdj,
@@ -502,13 +686,15 @@ export function findFreeAgents(ctx, opts = {}) {
       suggestedBid: suggestedBid(ctx, rosterId, add, best.gain, status.status),
       trend: trendCount(ctx, add),
       why: [],
-      score: best.gain + kappa * (best.valueDelta / 100),
+      // the four components and nothing else — they sum to `score` exactly, so the UI can show
+      // the arithmetic rather than a black box
+      score: best.gain + kappaV * (best.surplusDelta / 100) + kappaI * insurancePerWeek - kappaR * riskPenalty,
     };
     row.why = whyLines(ctx, row, names);
     rows.push(row);
   }
 
-  rows.sort((a, b) => b.score - a.score || b.valueDelta - a.valueDelta || (a.add < b.add ? -1 : 1));
+  rows.sort((a, b) => b.score - a.score || b.surplusDelta - a.surplusDelta || (a.add < b.add ? -1 : 1));
   return rows.slice(0, maxResults);
 }
 
