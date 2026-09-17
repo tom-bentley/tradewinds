@@ -147,3 +147,12 @@ test("slotTag stands down when the injury chip already says IR", () => {
   assert.equal(slotTag("", "IR"), "", "an active player carries no slot chip");
   assert.equal(slotTag(null, null), "");
 });
+
+test("verdictBarText names the side that must drop", () => {
+  const theirs = verdictBarText({ code: "needs_drop", label: "They must drop J.K. Dobbins", labelParts: { kind: "needs_drop", side: "them", drop: "x" }, edgePct: 0.5, deltaPerWeek: 6.6, acceptance: "possible" });
+  assert.equal(theirs.word, "They need a drop", "side B is over the limit — not side A's problem to solve");
+  const mine = verdictBarText({ code: "needs_drop", label: "Requires dropping Josh Downs", labelParts: { kind: "needs_drop", side: "me", drop: "y" }, edgePct: -3, deltaPerWeek: 1.2, acceptance: "likely" });
+  assert.equal(mine.word, "Needs a drop");
+  const bare = verdictBarText({ code: "needs_drop", label: "Requires a drop" });
+  assert.equal(bare.word, "Needs a drop", "no side recorded reads as side A's, like before");
+});

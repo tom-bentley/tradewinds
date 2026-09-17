@@ -134,12 +134,25 @@ export function verdictTone(code) {
   return VERDICT_TONE[code] || "even";
 }
 
+/**
+ * The short verdict word. `needs_drop` names the side that is over the limit: the engine's
+ * `labelParts.side` is "them" when the OTHER roster must cut ("They must drop J.K. Dobbins"), and a
+ * bar that shouted "Needs a drop" at side A for that read as if it were their problem.
+ * @param {object} v verdict
+ * @returns {string}
+ */
+export function shortVerdictWord(v) {
+  const code = v?.code || "fair";
+  if (code === "needs_drop" && v?.labelParts && v.labelParts.side === "them") return "They need a drop";
+  return VERDICT_LABEL[code] || v?.label || "Fair";
+}
+
 export function verdictWord(v) {
   const code = v?.code || "fair";
   // Long engine labels ("Clear loss — decline", "Win — you get better now") carry their detail in
   // the headline sentence and flag chips. The big word stays short so the panel never wraps three
   // lines — and so a third-party trade's headline never leaks a second-person label.
-  const label = VERDICT_LABEL[code] || v?.label || "Fair";
+  const label = shortVerdictWord(v);
   return `<span class="verdict-word" data-tone="${verdictTone(code)}">${escapeHtml(label)}</span>`;
 }
 
@@ -165,7 +178,7 @@ export function verdictBarText(verdict, names = null) {
     : "";
   return {
     code,
-    word: VERDICT_LABEL[code] || v.label || "Fair",
+    word: shortVerdictWord(v),
     tone: verdictTone(code),
     invalid,
     edge: invalid ? "" : fmtPct(v.edgePct),
