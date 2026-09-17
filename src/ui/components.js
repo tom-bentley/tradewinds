@@ -2,7 +2,7 @@
 // Sheets and toasts own real DOM because they manage focus.
 
 import {
-  escapeHtml, fmtValue, fmtFull, fmtPct, fmtPts, initials, clip, posRankLabel, fmtRosterPct,
+  escapeHtml, fmtValue, fmtFull, fmtPct, fmtPts, fmtNum, initials, clip, posRankLabel, fmtRosterPct,
   acceptPhrase,
 } from "./format.js";
 import { SLEEPER } from "../config.js";
@@ -222,7 +222,7 @@ export function bestBadge(ctx, best, mv, names = null) {
 const FLAG_LABEL = {
   injury: "injury", bye: "bye clash", deadline: "deadline", roster_size: "roster size",
   coverage: "thin pricing", short: "lineup gap", unsettled: "unsettled price",
-  free_elsewhere: "free elsewhere", trend: "market moving",
+  free_elsewhere: "free elsewhere", trend: "market moving", ir_slot: "IR slot",
 };
 
 export function flagChips(flags) {
@@ -392,6 +392,158 @@ export async function copyText(text) {
   } catch {
     return false;
   }
+}
+
+/* ------------------------------------------------------------------ risk (v1.4 §13.5) */
+
+/** Band → the palette the rest of the app already uses. Low risk is a gain, severe is a loss. */
+export const BAND_TONE = { low: "win", moderate: "even", high: "loss-dim", severe: "loss" };
+const BAND_LABEL = { low: "Low", moderate: "Moderate", high: "High", severe: "Severe" };
+
+export function bandTone(band) {
+  return BAND_TONE[String(band || "").toLowerCase()] || "even";
+}
+
+export function bandLabel(band) {
+  const k = String(band || "").toLowerCase();
+  return BAND_LABEL[k] || "";
+}
+
+/** "Moderate" as a toned chip. Empty string for an unknown band, so callers can concatenate. */
+export function bandChip(band, extra = "") {
+  const label = bandLabel(band);
+  if (!label) return "";
+  return `<span class="band" data-tone="${bandTone(band)}">${escapeHtml(label)}${extra ? " " + escapeHtml(extra) : ""}</span>`;
+}
+
+/** 0.7749 -> "77%". A fraction, never a percent already multiplied. */
+export function pct01(v, digits = 0) {
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return (n * 100).toFixed(digits) + "%";
+}
+
+/**
+ * The roster ids the risk axis is asked about: roster spots PLUS the IR stash, never the taxi
+ * squad — mirrors `rosterLanding`'s `beforeIds` in src/engine/trade.js, which is what a trade
+ * result's own risk numbers are computed from. Getting this wrong makes the League tab and the
+ * Analyze sheet disagree about the same roster.
+ */
+export function lineupPool(roster) {
+  if (!roster) return [];
+  const taxi = new Set(roster.taxi || []);
+  const ids = [...new Set([...(roster.players || []), ...(roster.reserve || [])])];
+  return ids.filter((id) => !taxi.has(id));
+}
+
+/**
+ * "Starters hold 77% of value · exposure 2.7 pts/wk · Moderate" (design §13.8 step 2), and the
+ * `compact` wording for a standings row, where the full sentence plus the band chip overflows
+ * 354 px of cell and wraps to a second line on every team.
+ */
+export function riskStripText(rr, { compact = false } = {}) {
+  if (!rr) return "";
+  const parts = [];
+  const share = rr.concentration && rr.concentration.starterShare;
+  if (Number.isFinite(Number(share))) {
+    parts.push(compact ? `${pct01(share)} of value starts` : `Starters hold ${pct01(share)} of value`);
+  }
+  const loss = rr.fragility && rr.fragility.expectedLossPerWeek;
+  if (Number.isFinite(Number(loss))) {
+    parts.push(compact ? `${fmtNum(loss)} pts/wk at risk` : `exposure ${fmtNum(loss)} pts/wk`);
+  }
+  const band = bandLabel(rr.band);
+  if (band) parts.push(band);
+  return parts.join(" · ");
+}
+
+/**
+ * The same strip with the band toned, for a roster row or a team sheet. The chip is a flex
+ * sibling rather than text joined with a separator: when it wraps to a second line on a narrow
+ * phone, a literal " · " would be left stranded at the end of the first one.
+ */
+export function riskStrip(rr, { compact = false, cls = "" } = {}) {
+  if (!rr) return "";
+  const share = rr.concentration && rr.concentration.starterShare;
+  const loss = rr.fragility && rr.fragility.expectedLossPerWeek;
+  const bits = [];
+  if (Number.isFinite(Number(share))) {
+    bits.push(compact
+      ? `<span class="num">${pct01(share)}</span> of value starts`
+      : `Starters hold <span class="num">${pct01(share)}</span> of value`);
+  }
+  if (Number.isFinite(Number(loss))) {
+    bits.push(compact
+      ? `<span class="num">${fmtNum(loss)}</span> pts/wk at risk`
+      : `exposure <span class="num">${fmtNum(loss)}</span> pts/wk`);
+  }
+  const chip = bandChip(rr.band);
+  if (!bits.length && !chip) return "";
+  return `<span class="rstrip ${cls}"><span class="rstrip-t">${bits.join(" · ")}</span>${chip}</span>`;
+}
+
+/** Two segments on one track: what starts, and what watches. */
+export function starterBar(concentration) {
+  const c = concentration || {};
+  const s = Math.max(0, Number(c.starterValue) || 0);
+  const b = Math.max(0, Number(c.benchValue) || 0);
+  const total = s + b;
+  if (!total) return "";
+  const sp = (s / total) * 100;
+  return `<div class="sbar" role="img" aria-label="${escapeHtml(pct01(s / total))} of roster value starts">
+    <div class="sbar-track"><i class="sbar-s" style="width:${sp.toFixed(1)}%"></i></div>
+    <p class="sbar-key"><span class="sbar-d sbar-d-s"></span>starters <span class="num">${fmtFull(s)}</span>
+      <span class="sbar-d sbar-d-b"></span>bench <span class="num">${fmtFull(b)}</span></p>
+  </div>`;
+}
+
+/**
+ * "IR 1 → 2 of 2" — the IR ledger a trade lands on (design §13.4 C2). `shown` is false for a
+ * league with no IR slots, where the row is noise rather than information.
+ */
+export function irLedger(rosterCount) {
+  const rc = rosterCount || {};
+  const max = Number(rc.irMax);
+  const before = Number(rc.irBefore);
+  const after = Number(rc.irAfter);
+  if (!Number.isFinite(max) || max <= 0 || !Number.isFinite(before) || !Number.isFinite(after)) {
+    return { shown: false, before: 0, after: 0, max: 0, text: "" };
+  }
+  return { shown: true, before, after, max, text: `IR ${before} → ${after} of ${max}` };
+}
+
+/**
+ * The free-agent score, in its parts: "+1.6 lineup · +0.2 insurance · −0.1 risk · value +21".
+ * Only the parts that carry weight — a row of zeros says nothing and costs a line of screen.
+ * `riskPenalty` is reported positive by the engine and always subtracts, so it prints signed.
+ *
+ * The floor is a tenth of a point per week, not half of one: the line prints one decimal, and a
+ * 0.06 term rounded up to "0.1" would overstate itself by two thirds next to a 1.6 lineup gain.
+ */
+export function faComponents(row, { eps = 0.1, valueEps = 1 } = {}) {
+  const r = row || {};
+  const out = [];
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  if (Math.abs(n(r.gainPerWeek)) >= eps) out.push(`${fmtPts(r.gainPerWeek)} lineup`);
+  if (Math.abs(n(r.insurancePerWeek)) >= eps) out.push(`${fmtPts(r.insurancePerWeek)} insurance`);
+  if (Math.abs(n(r.riskPenalty)) >= eps) out.push(`${fmtPts(-Math.abs(n(r.riskPenalty)))} risk`);
+  if (Math.abs(n(r.valueDelta)) >= valueEps) {
+    out.push(`value ${n(r.valueDelta) > 0 ? "+" : MINUS_SIGN}${fmtValue(Math.abs(n(r.valueDelta)))}`);
+  }
+  return out;
+}
+
+const MINUS_SIGN = "−";
+
+export function faComponentsText(row, opts) {
+  return faComponents(row, opts).join(" · ");
+}
+
+/** The engine reports `streamable` as an object; the badge is about its boolean. */
+export function isStreamable(row) {
+  const s = row && row.streamable;
+  return !!(s && s.streamable);
 }
 
 /* ------------------------------------------------------------------ viewport */

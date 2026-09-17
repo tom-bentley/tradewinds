@@ -15,6 +15,7 @@ import { store, resetAnalyze, toggleSide } from "./store.js";
 import {
   avatar, teamName, playerRow, positionGroups, verdictWord, verdictBarText, valueBars, bestBadge,
   flagChips, statStrip, icon, empty, toast, copyText, openSheet, openTeamSheet, teamChip,
+  bandChip, pct01, irLedger, signTone,
 } from "./components.js";
 import { escapeHtml, fmtPct, fmtPts, fmtNum, fmtValue, fmtFull, clip, acceptPhrase } from "./format.js";
 
@@ -239,11 +240,41 @@ function sheetBody(ctx, r, nm) {
     ${flagChips(r.flags)}
     <p class="vp-head">${escapeHtml(headline)}</p>
     ${dead ? `<ul class="reasons">${(r.reasons || []).map((x) => `<li>${escapeHtml(x.text)}</li>`).join("")}</ul>` : details(ctx, r, nm, headline)}
+    ${dead ? "" : riskSection(ctx, r, nm)}
     <div class="vp-acts">
       <button type="button" class="btn btn-ghost" data-act="copy">Copy summary</button>
       <button type="button" class="btn btn-ghost" data-act="clear">Clear</button>
     </div>
   </div>`;
+}
+
+/**
+ * The risk axis on a graded trade (design §13.5 / §13.8 step 2). `result.risk` is null for an
+ * invalid trade and absent entirely when the engine build has no risk module, so the whole
+ * section stands down rather than printing zeros.
+ */
+function riskSection(ctx, r, nm) {
+  const risk = r.risk;
+  const mine = risk && risk.me;
+  if (!mine || !mine.before || !mine.after) return "";
+  const theirs = risk.them || {};
+  const dce = Number(risk.deltaCertaintyEquivalent);
+  const who = nm.first ? "Your risk" : `${nm.a} risk`;
+  const band = (side, when) => (side && side[when] ? bandChip(side[when].band) || "—" : "—");
+  const share = (when) => pct01(mine[when].concentration.starterShare);
+  const expo = (when) => fmtNum(mine[when].fragility.expectedLossPerWeek);
+  const notes = (mine.after.notes || []).slice(0, 2);
+
+  return `<h3 class="sub">Risk</h3>
+    ${Number.isFinite(dce) ? `<p class="risk-lead">Floor-adjusted points
+      <b class="num" data-tone="${signTone(dce)}">${fmtPts(dce)}</b> <span class="dim">pts/wk</span></p>` : ""}
+    <table class="mini"><tbody>
+      <tr><th scope="row">Starters' share of value</th><td class="num">${share("before")}</td><td class="num arrow">→</td><td class="num">${share("after")}</td></tr>
+      <tr><th scope="row">Injury exposure <span class="dim">(lower is better)</span></th><td class="num">${expo("before")}</td><td class="num arrow">→</td><td class="num">${expo("after")}</td></tr>
+      <tr><th scope="row">${escapeHtml(who)}</th><td>${band(mine, "before")}</td><td class="num arrow">→</td><td>${band(mine, "after")}</td></tr>
+      <tr><th scope="row">${escapeHtml(nm.first ? "Their risk" : `${nm.b} risk`)}</th><td>${band(theirs, "before")}</td><td class="num arrow">→</td><td>${band(theirs, "after")}</td></tr>
+    </tbody></table>
+    ${notes.length ? `<ul class="reasons risk-notes">${notes.map((n) => `<li>${escapeHtml(n)}</li>`).join("")}</ul>` : ""}`;
 }
 
 /**
@@ -275,9 +306,13 @@ function details(ctx, r, nm, headline = "") {
   const add = (me.backfillDetail || []).map((b) => ctx.players.get(b.id)?.name).filter(Boolean);
   const poss = nm.first ? "Your" : nm.aPoss;
   const po = ctx.playoffWeeks || [];
+  const ir = irLedger(me.rosterCount);
   // explain() promotes its strongest reason to the headline, so printing the list verbatim
-  // under it says the same sentence twice.
-  const reasons = (r.reasons || []).filter((x) => x.text !== headline);
+  // under it says the same sentence twice. The `profile` line is the Risk section's numbers as
+  // a sentence — it stays only when the section itself could not render (no risk module).
+  const reasons = (r.reasons || [])
+    .filter((x) => x.text !== headline)
+    .filter((x) => !(x.kind === "profile" && r.risk));
   return `<div class="vp-det">
     <ul class="reasons">${reasons.map((x) => `<li>${escapeHtml(x.text)}</li>`).join("")}</ul>
     <table class="mini">
@@ -286,6 +321,7 @@ function details(ctx, r, nm, headline = "") {
         <tr><th scope="row">Points per week</th><td class="num">${fmtNum(me.lineup.before.avgPerWeek)}</td><td class="num arrow">→</td><td class="num">${fmtNum(me.lineup.after.avgPerWeek)}</td></tr>
         <tr><th scope="row">Playoff weeks ${po[0] ?? 15}–${po[po.length - 1] ?? 17}</th><td class="num">${fmtNum(me.lineup.before.playoffAvg)}</td><td class="num arrow">→</td><td class="num">${fmtNum(me.lineup.after.playoffAvg)}</td></tr>
         <tr><th scope="row">Roster spots used</th><td class="num">${me.rosterCount.before}</td><td class="num arrow">→</td><td class="num">${me.rosterCount.after} of ${me.rosterCount.max}</td></tr>
+        ${ir.shown ? `<tr><th scope="row">IR slots used</th><td class="num">${ir.before}</td><td class="num arrow">→</td><td class="num">${ir.after} of ${ir.max}</td></tr>` : ""}
         <tr><th scope="row">${escapeHtml(nm.first ? "Their points per week" : nm.b + " points per week")}</th><td class="num">${fmtNum(r.them.lineup.before.avgPerWeek)}</td><td class="num arrow">→</td><td class="num">${fmtNum(r.them.lineup.after.avgPerWeek)}</td></tr>
       </tbody>
     </table>

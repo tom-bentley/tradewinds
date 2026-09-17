@@ -1,7 +1,9 @@
 // Tradewinds — Players tab. Search the whole player table, open a value card for anyone.
 
 import { store } from "./store.js";
-import { icon, openSheet, empty, trendArrow, rosterPctWarning, injuryTag } from "./components.js";
+import {
+  icon, openSheet, empty, trendArrow, rosterPctWarning, injuryTag, bandChip, pct01,
+} from "./components.js";
 import { escapeHtml, fmtValue, fmtFull, fmtNum, fmtRosterPct, initials, clip, posRankLabel } from "./format.js";
 import { SLEEPER } from "../config.js";
 
@@ -96,8 +98,9 @@ function paint() {
  * @param {string} id
  * @param {object} [e] view env (defaults to the one Players was mounted with)
  */
-// Wave 2 (design §13.8 step 2): floor / ceiling / durability from `playerRisk(ctx, id)` join the
-// KPI row below once services.js exposes risk.js.
+/** The risk module is wired in at integration and absent in demo mode — never assume it. */
+function safe(fn) { try { return fn(); } catch (err) { console.warn("[players]", err); return null; } }
+
 export function openPlayerSheet(id, e = env) {
   const svc = (e || env).svc;
   const ctx = store.ctx;
@@ -110,6 +113,10 @@ export function openPlayerSheet(id, e = env) {
   const pw = rosPerWeek(ctx, id);
   const ini = escapeHtml(initials(p.name));
   const img = p.pos === "DEF" ? SLEEPER.teamLogo(p.team || id) : SLEEPER.playerThumb(id);
+
+  // §13.5 D4: what this player's week actually looks like — the spread, not just the mean.
+  const pr = typeof svc.playerRisk === "function" ? safe(() => svc.playerRisk(ctx, id)) : null;
+  const hist = typeof svc.historyOf === "function" ? safe(() => svc.historyOf(ctx, id)) : null;
 
   const srcRows = Object.entries(mv.sources || {});
   const labels = { fc_redraft: "FantasyCalc redraft", fc_dynasty: "FantasyCalc dynasty", dp_dynasty: "DynastyProcess", ktc_redraft: "KeepTradeCut", proj: "Projection-implied", bc_tiers: "Boris Chen" };
@@ -132,6 +139,21 @@ export function openPlayerSheet(id, e = env) {
 
     ${mv.m == null ? `<p class="note note-warn">No market value: kickers and defenses are not priced by any trade source, so they never carry a verdict.</p>` : ""}
     ${rosterPctWarning(mv)}
+
+    ${pr ? `<h3 class="sub">Risk ${bandChip(pr.band)}</h3>
+    <div class="kpis">
+      <div class="kpi"><span class="kpi-k">Floor <span class="dim">p20</span></span><span class="kpi-v num">${fmtNum(pr.floor)}</span><span class="kpi-u">pts/wk</span></div>
+      <div class="kpi"><span class="kpi-k">Mean</span><span class="kpi-v num">${fmtNum(pr.mean)}</span><span class="kpi-u">pts/wk</span></div>
+      <div class="kpi"><span class="kpi-k">Ceiling <span class="dim">p80</span></span><span class="kpi-v num">${fmtNum(pr.ceiling)}</span><span class="kpi-u">pts/wk</span></div>
+    </div>
+    <table class="mini"><tbody>
+      <tr><th scope="row">Durability</th><td class="num">${pct01(pr.durability)}</td></tr>
+      <tr><th scope="row">Available now</th><td class="num">${pct01(pr.availabilityNow)}</td></tr>
+      <tr><th scope="row">Available rest of season</th><td class="num">${pct01(pr.rosAvailability)}</td></tr>
+      <tr><th scope="row">Weekly swing</th><td class="num">${pct01(pr.volatility)}</td></tr>
+      ${hist && hist.gp != null ? `<tr><th scope="row">${escapeHtml(String(hist.season || "last season"))} games played</th><td class="num">${hist.gp}${hist.ga != null ? ` of ${hist.ga}` : ""}</td></tr>` : ""}
+    </tbody></table>
+    ${(pr.reasons || []).length ? `<ul class="reasons risk-notes">${(pr.reasons || []).slice(0, 3).map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>` : ""}` : ""}
 
     <h3 class="sub">Where the value comes from</h3>
     ${srcRows.length ? `<table class="mini"><tbody>

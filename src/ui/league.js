@@ -3,6 +3,7 @@
 import { store, setIn } from "./store.js";
 import {
   avatar, teamName, skeleton, empty, openSheet, positionGroups, verdictWord, injuryTag, signTone,
+  riskStrip, starterBar, bandChip, pct01, lineupPool,
 } from "./components.js";
 import { escapeHtml, fmtValue, fmtFull, fmtNum, fmtPct, fmtPts, relTime, clip } from "./format.js";
 import { prefill } from "./analyze.js";
@@ -21,7 +22,50 @@ export function mount(el, e) {
   </div>`;
   el.addEventListener("click", onClick);
   loadTxns();
-  return { destroy() {} };
+  fillRiskStrips();
+  return { destroy() { riskGen += 1; } };
+}
+
+/* ---------------------------------------------------------------- risk (§13.5 D4) */
+
+// The risk axis is an engine module the orchestrator wires in at integration; demo mode ships
+// without it. Every surface below feature-detects rather than assuming.
+const hasRisk = () => typeof env?.svc?.rosterRisk === "function";
+
+/**
+ * `rosterRisk` sweeps the optimal lineup for every remaining week, per roster. Eight of those
+ * on the main thread would be felt on a phone, so the table paints first and the strips arrive
+ * one roster per idle tick. `riskGen` abandons an in-flight fill when the view is torn down.
+ */
+let riskGen = 0;
+
+function riskOf(rosterId) {
+  const ctx = store.ctx;
+  const r = ctx.rosters.find((x) => x.rosterId === rosterId);
+  if (!r || !hasRisk()) return null;
+  return safe(() => env.svc.rosterRisk(ctx, lineupPool(r)));
+}
+
+function idle(fn) {
+  if (typeof requestIdleCallback === "function") requestIdleCallback(fn, { timeout: 600 });
+  else setTimeout(fn, 0);
+}
+
+function fillRiskStrips() {
+  if (!hasRisk()) return;
+  riskGen += 1;
+  const token = riskGen;
+  const slots = [...document.querySelectorAll(".rrisk[data-rid]")];
+  const step = (i) => {
+    if (token !== riskGen || i >= slots.length) return;
+    const el = slots[i];
+    const rr = riskOf(Number(el.dataset.rid));
+    const html = riskStrip(rr, { compact: true });
+    if (html) el.innerHTML = html;
+    else el.closest("tr")?.remove();
+    idle(() => step(i + 1));
+  };
+  idle(() => step(0));
 }
 
 /* ---------------------------------------------------------------- standings */
@@ -47,16 +91,15 @@ function standings() {
           <span class="team-txt"><span class="team-n">${escapeHtml(clip(r.teamName, 20))}</span><span class="team-u">${escapeHtml(r.displayName)}</span></span></button></td>
         <td class="c-n num">${r.wins}–${r.losses}${r.ties ? "–" + r.ties : ""}</td>
         <td class="c-n num">${fmtNum(r.fpts, 0)}</td>
-        <td class="c-n num">${fmtValue(v)}</td></tr>`).join("")}</tbody>
+        <td class="c-n num">${fmtValue(v)}</td></tr>${
+        hasRisk() ? `<tr class="rrisk-row ${r.rosterId === ctx.myRosterId ? "is-me" : ""}"><td colspan="5"><span class="rrisk" data-rid="${r.rosterId}"></span></td></tr>` : ""
+      }`).join("")}</tbody>
     </table>
   </section>`;
 }
 
 /* ---------------------------------------------------------------- roster sheet */
 
-// Wave 2 (design §13.8 step 2): once the orchestrator exposes risk.js through services.js,
-// this sheet's KPI row gains starter share + fragility + band from `rosterRisk(ctx, r.players)`.
-// Nothing is stubbed here on purpose — the call does not exist in this worktree yet.
 function rosterSheet(rosterId) {
   const ctx = store.ctx;
   const r = ctx.rosters.find((x) => x.rosterId === rosterId);
@@ -65,6 +108,9 @@ function rosterSheet(rosterId) {
   const season = safe(() => env.svc.seasonLineup(ctx, r.players, {}));
   const total = r.players.reduce((s, id) => s + (env.svc.marketValue(ctx, id).mAdj || 0), 0);
   const groups = positionGroups(ctx, r.players);
+  // Risk is the second axis of §13.5: what starts, and what one absence costs. The sheet has
+  // the room the standings row does not, so it shows the split and the engine's own notes.
+  const rr = riskOf(rosterId);
 
   const body = `<div class="rsheet">
     <div class="rsheet-top">${avatar(r, 44)}
@@ -75,6 +121,14 @@ function rosterSheet(rosterId) {
       <div class="kpi"><span class="kpi-k">Week ${ctx.week} projection</span><span class="kpi-v num">${line ? fmtNum(line.total) : "—"}</span></div>
       <div class="kpi"><span class="kpi-k">Rest of season</span><span class="kpi-v num">${season ? fmtNum(season.avgPerWeek) : "—"}</span><span class="kpi-u">pts/wk</span></div>
     </div>
+    ${rr ? `<h3 class="sub">Risk ${bandChip(rr.band)}</h3>
+      <div class="kpis">
+        <div class="kpi"><span class="kpi-k">Starters' share of value</span><span class="kpi-v num">${pct01(rr.concentration.starterShare)}</span></div>
+        <div class="kpi"><span class="kpi-k">Injury exposure</span><span class="kpi-v num">${fmtNum(rr.fragility.expectedLossPerWeek)}</span><span class="kpi-u">pts/wk</span></div>
+        <div class="kpi"><span class="kpi-k">Floor-adjusted</span><span class="kpi-v num">${fmtNum(rr.certaintyEquivalent)}</span><span class="kpi-u">pts/wk</span></div>
+      </div>
+      ${starterBar(rr.concentration)}
+      ${(rr.notes || []).length ? `<ul class="reasons risk-notes">${(rr.notes || []).slice(0, 2).map((n) => `<li>${escapeHtml(n)}</li>`).join("")}</ul>` : ""}` : ""}
     ${line ? `<h3 class="sub">Best lineup this week</h3>
       <table class="mini mini-line"><tbody>${line.slots.map((s) => {
         const p = s.id ? ctx.players.get(s.id) : null;

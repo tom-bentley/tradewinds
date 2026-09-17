@@ -13,6 +13,7 @@ import * as league from "./league.js";
 import * as players from "./players.js";
 import * as settings from "./settings.js";
 import * as setup from "./setup.js";
+import { checkAlertsHealth } from "./alerts.js";
 
 // Advisor is first, and therefore the default route: the reason to open the app at all is
 // usually a status change, and that is the only tab that says what to do about one (design §12.5).
@@ -75,6 +76,10 @@ async function boot() {
     // The advice dot is read off the feed `loadAll` already downloaded, so it costs nothing and
     // is right even when the user opens some other tab first (design §12.5).
     setTimeout(() => adviceDot(), 0);
+    // Alerts health is a network round-trip to GitHub and to the sender's state file. It never
+    // gates the app: the banner appears whenever the answer lands, and a failure is silent
+    // (alerts.js already logs it) — design §13.3 B2.
+    setTimeout(() => alertsBanner(), 0);
   } catch (err) {
     // data.js signals "no league configured" with SetupRequiredError, not a crash screen.
     if (isSetupRequired(err)) { showSetup(); return; }
@@ -361,6 +366,21 @@ function clearAdviceDot() {
   paintAdviceDot();
 }
 
+/* ---------------------------------------------------------------- alerts health (§13.3 B2)
+   `checkAlertsHealth` re-subscribes what it can, asks the sender whether it has ever heard of
+   this phone, and writes a ready one-sentence `store.alerts.problem` (or null). The banner is
+   the only place a user who never opens Settings would see it. */
+
+async function alertsBanner() {
+  try {
+    await checkAlertsHealth(env);
+  } catch (err) {
+    console.warn("[app] alerts health check skipped", err);
+    return;
+  }
+  paintHeader();
+}
+
 /* ================================================================== router */
 
 function tabFromHash() {
@@ -505,6 +525,12 @@ function paintHeader() {
     banner.hidden = false;
     banner.className = "banner banner-warn";
     banner.textContent = `${hard.length} source${hard.length > 1 ? "s" : ""} degraded: ${hard.map((e) => e.source).join(", ")}. Values may be stale.`;
+  } else if (store.alerts && store.alerts.problem) {
+    // "Alerts on" has been a lie before (§13.0 row 2). When the health check knows better, it
+    // says so on every tab, not only in Settings — and it clears itself the moment it is fixed.
+    banner.hidden = false;
+    banner.className = "banner banner-warn";
+    banner.textContent = store.alerts.problem;
   } else {
     banner.hidden = true;
   }
@@ -595,7 +621,7 @@ function offerUpdate(reg) {
 /* ================================================================== wiring */
 
 $("btn-refresh").addEventListener("click", refresh);
-subscribe((_, reason) => { if (reason === "refresh" || reason === "reload") paintHeader(); });
+subscribe((_, reason) => { if (reason === "refresh" || reason === "reload" || reason === "alerts") paintHeader(); });
 // Installed outside the boot path on purpose: onboarding is the screen with the most typing
 // in it, and it renders before (and sometimes instead of) a successful load.
 installKeyboardGuard();
