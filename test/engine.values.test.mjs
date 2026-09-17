@@ -6,6 +6,7 @@ import { buildContext } from "../src/engine/context.js";
 import { displayTier, explain, MAX_MEANINGFUL_TIER } from "../src/engine/explain.js";
 import { evaluateTrade } from "../src/engine/trade.js";
 import {
+  applyInjuryHaircut,
   curveFit,
   curveValue,
   injuryDiscount,
@@ -138,7 +139,15 @@ test("the injury discount applies on the market axis only", () => {
   const mv = marketValue(ctx, HIGGINS);
   assert.equal(ctx.players.get(HIGGINS).inj, "Questionable");
   assert.equal(mv.discount, 0.03);
-  assert.ok(Math.abs(mv.mAdj - mv.m * 0.97) < 1e-9);
+  // design §13.9: the market legs already priced the injury, so only the projection-curve part of
+  // the blend takes the full δ; the rest takes δ·injuryMarketShare.
+  const s = ctx.settings.injuryMarketShare;
+  assert.equal(s, 0.35);
+  assert.ok(mv.projPart > 0 && mv.projPart < mv.m, "Higgins is priced by FantasyCalc AND the curve");
+  const expected = (mv.m - mv.projPart) * (1 - 0.03 * s) + mv.projPart * (1 - 0.03);
+  assert.ok(Math.abs(mv.mAdj - expected) < 1e-9, "mAdj = (m − P)(1 − δs) + P(1 − δ)");
+  assert.ok(mv.mAdj > mv.m * 0.97 && mv.mAdj < mv.m, "less than the old full haircut, more than none");
+  assert.ok(mv.discountApplied > 0.03 * s - 1e-9 && mv.discountApplied < 0.03 + 1e-9);
 
   assert.equal(injuryDiscount(ctx, null), 0);
   assert.equal(injuryDiscount(ctx, "Out"), 0.15);
@@ -148,6 +157,41 @@ test("the injury discount applies on the market axis only", () => {
 
   const noDiscount = make({ injuryDiscount: { Questionable: 0 } });
   assert.equal(marketValue(noDiscount, HIGGINS).mAdj, marketValue(noDiscount, HIGGINS).m);
+  assert.equal(marketValue(noDiscount, HIGGINS).discountApplied, 0);
+
+  // injuryMarketShare = 1 is the R3 §d rule: the whole blend takes δ
+  const legacy = make({ injuryMarketShare: 1 });
+  const lv = marketValue(legacy, HIGGINS);
+  assert.ok(Math.abs(lv.mAdj - lv.m * 0.97) < 1e-9, "s = 1 restores m·(1 − δ)");
+});
+
+test("applyInjuryHaircut: full δ on the curve leg, residual δ·s on the market legs", () => {
+  assert.equal(applyInjuryHaircut(null, 0, 0.35, 0.35), null);
+  assert.equal(applyInjuryHaircut(1000, 0, 0, 0.35), 1000, "no status, no haircut");
+  assert.ok(Math.abs(applyInjuryHaircut(1000, 0, 0.35, 0.35) - 1000 * (1 - 0.35 * 0.35)) < 1e-9, "market-only value");
+  assert.ok(Math.abs(applyInjuryHaircut(1000, 1000, 0.35, 0.35) - 650) < 1e-9, "curve-only value takes the full δ");
+  assert.ok(Math.abs(applyInjuryHaircut(1000, 200, 0.35, 0.35) - (800 * (1 - 0.1225) + 200 * 0.65)) < 1e-9);
+  assert.ok(Math.abs(applyInjuryHaircut(1000, 200, 0.35) - 650) < 1e-9, "s defaults to 1 (legacy rule)");
+  assert.ok(Math.abs(applyInjuryHaircut(1000, 5000, 0.35, 0.35) - 650) < 1e-9, "P is clamped to m");
+  assert.equal(applyInjuryHaircut(1000, 0, 2, 0.35), 1000 * (1 - 1 * 0.35), "δ is clamped to 1");
+});
+
+test("a curve-only injured player still takes the whole haircut", () => {
+  // a player no market table prices (fallback "curve"), re-listed as IR in a patched fixture
+  const id = [...ctx.players.keys()].find((pid) => {
+    const mv = marketValue(ctx, pid);
+    return mv.fallback === "curve" && mv.m > 0;
+  });
+  assert.ok(id, "fixture has a curve-only priced player");
+  const players = JSON.parse(JSON.stringify(INPUT.players));
+  players.players[id] = { ...players.players[id], inj: "IR" };
+  const patched = buildContext({ ...INPUT, players }, {});
+  const mv = marketValue(patched, id);
+  assert.equal(mv.fallback, "curve");
+  assert.equal(mv.inj, "IR");
+  assert.ok(Math.abs(mv.projPart - mv.m) < 1e-9, "the whole blend is the curve");
+  assert.ok(Math.abs(mv.mAdj - mv.m * (1 - 0.35)) < 1e-9, "P = m → m·(1 − δ)");
+  assert.ok(Math.abs(mv.discountApplied - 0.35) < 1e-9);
 });
 
 test("waiverReplacement measures this league's live wire, position by position", () => {

@@ -43,6 +43,10 @@ export const DEFAULTS = Object.freeze({
     Sus: 0.25,
     DNR: 0.4,
   }),
+  // Share of the haircut the MARKET legs (FantasyCalc, DynastyProcess) still take. Real-trade
+  // prices re-price an injury within days, so the full δ applies only to the projection-curve leg
+  // (design §13.9); 1.0 restores the R3 rule of haircutting the whole blend.
+  injuryMarketShare: 0.35,
 
   // --- Free agents (design.md §11.2) ------------------------------------------------------
   // The wire is the cheapest trade there is: every add is measured on the same lineup axis as a

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import { activePlayers, buildContext, rosterById } from "../src/engine/context.js";
-import { marketValue, surplus, waiverReplacement } from "../src/engine/values.js";
+import { applyInjuryHaircut, marketValue, surplus, waiverReplacement } from "../src/engine/values.js";
 import {
   ACCEPT_DELTA,
   ACCEPT_EDGE,
@@ -591,7 +591,12 @@ test("IR: the injury haircut is the only discount on a stashed player's market v
   const c = make({}, stash(INPUT, 3, [REED], "IR"));
   const mv = marketValue(c, REED);
   assert.equal(c.players.get(REED).inj, "IR");
-  assert.ok(Math.abs(mv.mAdj - mv.m * (1 - c.settings.injuryDiscount.IR)) < 1e-9, "mAdj = m × (1 − 0.35)");
+  // design §13.9: full δ on the projection-curve part of the blend, δ·injuryMarketShare on the
+  // market legs that already re-priced the injury
+  const delta = c.settings.injuryDiscount.IR;
+  const expected = applyInjuryHaircut(mv.m, mv.projPart, delta, c.settings.injuryMarketShare);
+  assert.ok(Math.abs(mv.mAdj - expected) < 1e-9, "mAdj = (m − P)(1 − δs) + P(1 − δ)");
+  assert.ok(mv.mAdj < mv.m && mv.mAdj > mv.m * (1 - delta) - 1e-9, "haircut applied, but not twice");
 
   const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
   assert.ok(Math.abs(r.me.valueGive.raw - mv.mAdj) < 1e-9, "sideValue.raw is Σ mAdj — haircut included");
@@ -603,7 +608,10 @@ test("IR: the injury haircut is the only discount on a stashed player's market v
   const healthy = marketValue(healthyCtx, REED);
   assert.equal(healthyCtx.players.get(REED).inj, null);
   assert.ok(Math.abs(healthy.m - mv.m) < 1e-9, "the market price itself is untouched");
-  assert.ok(Math.abs(mv.mAdj - healthy.mAdj * (1 - c.settings.injuryDiscount.IR)) < 1e-9);
+  assert.ok(Math.abs(healthy.projPart - mv.projPart) < 1e-9, "same blend underneath");
+  assert.ok(
+    Math.abs(mv.mAdj - applyInjuryHaircut(healthy.mAdj, healthy.projPart, delta, c.settings.injuryMarketShare)) < 1e-9
+  );
   assert.ok(healthy.mAdj > mv.mAdj, "the stash is discounted, not repriced");
 });
 

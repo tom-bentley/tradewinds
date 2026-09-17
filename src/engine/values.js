@@ -522,11 +522,65 @@ export function marketValue(ctx, id) {
   out.sd = meta.sd ?? null; // signed: sources report direction as well as magnitude
   out.ecr = meta.ecr ?? null;
 
+  // Injury haircut (R3 §d, revised design §13.9): the market legs — FantasyCalc's real-trade prices
+  // and DynastyProcess's expert ranks — already re-price an injury within days (A.J. Brown lost
+  // 2,845 FC points in the 30 days after his knee scope, 2026-09-17 audit), so taking the full δ
+  // on top of them counted the injury twice. The full δ now applies only to the projection-curve
+  // leg (Sleeper projections lag news by days); the market legs take the residual
+  // `injuryMarketShare` (default 0.35) of δ for that lag. A curve-only player is unchanged.
   out.discount = injuryDiscount(ctx, inj);
-  out.mAdj = out.m == null ? null : out.m * (1 - out.discount);
+  out.projPart = projContribution(ctx, rd, dyn, phi);
+  out.mAdj = applyInjuryHaircut(out.m, out.projPart, out.discount, ctx.settings.injuryMarketShare);
+  out.discountApplied = out.m > 0 && out.mAdj != null ? 1 - out.mAdj / out.m : 0;
 
   ctx.memo.marketValue.set(id, out);
   return out;
+}
+
+/**
+ * How much of the blended market value `m` came from the synthetic projection curve — the only leg
+ * that has NOT priced an injury yet. The curve enters the redraft blend alone; the redraft blend
+ * carries weight (1 − φ) when a dynasty value exists and 1 otherwise.
+ * @param {object} ctx
+ * @param {{value:number|null, parts:object, weight:number}} rd redraft blend
+ * @param {{value:number|null}} dyn dynasty blend
+ * @param {number} phi keeper tilt
+ * @returns {number} points of `m` attributable to the curve (0 when the curve did not price him)
+ */
+function projContribution(ctx, rd, dyn, phi) {
+  const v = rd && rd.parts ? rd.parts[CURVE_SOURCE] : null;
+  if (v == null || !(rd.weight > 0) || rd.value == null) return 0;
+  const w = Number((ctx.settings.weights || {})[CURVE_SOURCE]) || 0;
+  const redraftShare = dyn && dyn.value != null ? 1 - phi : 1;
+  return (redraftShare * w * v) / rd.weight;
+}
+
+/**
+ * The market-axis injury haircut with the double-count removed (design §13.9).
+ *   mAdj = (m − P)·(1 − δ·s) + P·(1 − δ)
+ * where P is the projection-curve part of `m`, δ the status haircut and s the share of δ the
+ * market-priced legs still take. s = 1 reproduces the R3 rule `m·(1 − δ)`; a curve-only value
+ * (P = m) is haircut in full either way.
+ * @param {number|null} m blended market value
+ * @param {number} projPart points of `m` from the projection curve (0..m)
+ * @param {number} discount δ, 0..1
+ * @param {number} [marketShare=1] s, 0..1 — `settings.injuryMarketShare`
+ * @returns {number|null}
+ */
+export function applyInjuryHaircut(m, projPart, discount, marketShare = 1) {
+  if (m == null || !Number.isFinite(Number(m))) return null;
+  const d = clamp01(discount);
+  if (!d) return m;
+  const s = marketShare == null || !Number.isFinite(Number(marketShare)) ? 1 : clamp01(marketShare);
+  const p = Math.min(Math.max(Number(projPart) || 0, 0), Math.max(m, 0));
+  const market = m - p;
+  return market * (1 - d * s) + p * (1 - d);
+}
+
+function clamp01(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(1, Math.max(0, n));
 }
 
 /**
