@@ -222,7 +222,11 @@ test("lineups, trades and the finder all run against the live table", () => {
   const started = process.hrtime.bigint();
   const deals = findTrades(make(), { myRosterId: 3 });
   const elapsed = Number(process.hrtime.bigint() - started) / 1e6;
-  assert.ok(elapsed < 3000, `findTrades took ${elapsed.toFixed(0)} ms on the live table`);
+  // Budget is a CI guard, not the phone's: the finder measures ~0.6 s warm on the live league and
+  // 1.1–1.4 s cold in this file; the streaming table + availability scaling (v1.4) added ~0.5 s of
+  // cold memo work, and a shared GitHub runner under the parallel test load hit 3005 ms once
+  // (2026-09-17). 6 s still catches a real regression (the enumeration bound is 50,000 candidates).
+  assert.ok(elapsed < 6000, `findTrades took ${elapsed.toFixed(0)} ms on the live table`);
   assert.ok(deals.length > 0);
   for (const d of deals) {
     assert.notEqual(d.acceptance, "unlikely");
