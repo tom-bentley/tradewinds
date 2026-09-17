@@ -154,7 +154,7 @@ iOS rotates a push subscription on its own schedule and does not reliably tell t
 happens, so a manual re-paste is a chore that recurs. If you give the app a GitHub token, the phone
 re-pairs itself:
 
-1. github.com → Settings → Developer settings → **Fine-grained tokens** → Generate new token.
+1. Open <https://github.com/settings/personal-access-tokens/new> in a browser signed in as the repo owner (Safari on the phone works; the GitHub iPhone app has no token screens, and on the mobile site "Developer settings" sits at the very bottom of Settings). Generate new token.
    Repository access: **only** `tom-bentley/tradewinds`. Permissions: **Contents: Read and write** (the `repository_dispatch` endpoint is a Contents permission, verified 2026-09-17; copy the full `github_pat_…` value from the page shown right after creation — the token list shows a shortened copy)
    (Metadata: Read is added automatically). Nothing else.
 2. In the app: Settings → Alerts → **Auto re-pair** → paste the token → **Save**.

@@ -102,7 +102,13 @@ export const PAT_HELP =
   "you create the token; the token list only shows a shortened copy. The token is stored on this " +
   "phone only and is sent to api.github.com and nowhere else.";
 
-export const PAT_URL = `${REPO}/settings/personal-access-tokens`;
+/**
+ * Fine-grained tokens live in the USER's settings, never under the repository (the repo path only
+ * exists for organisations approving token requests). The GitHub iPhone app has no token screens
+ * and the mobile site buries "Developer settings" at the foot of the list, so the card links the
+ * creation page directly — open it in Safari, signed in as the repo owner.
+ */
+export const PAT_URL = "https://github.com/settings/personal-access-tokens/new";
 
 /** The "Auto re-pair" field: masked when set, an input when not. */
 function autoRepairBlock() {
