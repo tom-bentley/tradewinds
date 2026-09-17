@@ -99,7 +99,10 @@ export const ADVISOR_FILE = "advisor.json";
  */
 export const OPTIONAL_PIPELINE_FILES = Object.freeze(["history.json"]);
 
-/** The heavy four plus the optional extras. `meta.json` is fetched first and decides whether these are downloaded at all. */
+/**
+ * The heavy four plus the optional extras. `meta.json` is fetched first and decides whether any
+ * of these are downloaded at all.
+ */
 const PIPELINE_DATA_FILES = Object.freeze([
   ...PIPELINE_FILES.filter((file) => file !== "meta.json"),
   ...OPTIONAL_PIPELINE_FILES,
