@@ -71,6 +71,12 @@ export const DEFAULT_PREFS = Object.freeze({
   rivalNews: false,
   minDealScore: 2,
   minFaGain: 1,
+  // v1.4 (design §13.3 B3): noise control. Seventy "new deal" pushes in eight days is how a phone
+  // learns to ignore an app. There is no UI for these yet — the job's `normalizePrefs` fills the
+  // same values, so a device paired before v1.4 is throttled without re-pasting anything.
+  dealsCooldownHours: 6,
+  faCooldownHours: 6,
+  maxDealsPerPush: 1,
 });
 
 /**
@@ -95,6 +101,23 @@ export const ALERT_REASON_TEXT = Object.freeze({
 export function reasonText(reason) {
   return ALERT_REASON_TEXT[reason] ?? (reason ? String(reason) : "");
 }
+
+/**
+ * Where the sender publishes what it believes about this device (design §13.3 B2). Relative to
+ * the app scope so a fork of the repo works unchanged; fetched with `cache: "no-store"`, because
+ * a service worker that served a cached copy would answer "paired" forever.
+ */
+export const ALERTS_STATE_URL = "./data/alerts-state.json";
+
+/** The public Actions API — unauthenticated, rate-limited, and entirely optional. */
+export const ACTIONS_RUNS_URL =
+  "https://api.github.com/repos/tom-bentley/tradewinds/actions/workflows/alerts.yml/runs?per_page=1";
+
+/** How long a server/Actions probe is reused; the Settings card repaints far more often than this. */
+export const PROBE_TTL_MS = 60_000;
+
+/** How long to wait for the service worker to answer a `push-receipts` message. */
+export const RECEIPTS_TIMEOUT_MS = 1500;
 
 /** Thrown by `enableAlerts` when the browser or the user says no. `reason` matches the union. */
 export class PushError extends Error {
@@ -143,6 +166,14 @@ function resolve(deps = {}) {
     pushManager: deps.pushManager ?? win?.PushManager,
     swReadyTimeoutMs: deps.swReadyTimeoutMs,
     now: deps.now ?? Date.now,
+    // Diagnostics plumbing (design §13.3 B2). `network: false` is how the Settings card paints
+    // instantly before the slower probes come back.
+    fetchImpl: deps.fetchImpl ?? (typeof win?.fetch === "function" ? win.fetch.bind(win) : null),
+    subtle: deps.subtle ?? win?.crypto?.subtle ?? globalThis.crypto?.subtle ?? null,
+    indexedDB: deps.indexedDB ?? win?.indexedDB ?? null,
+    network: deps.network !== false,
+    receiptsTimeoutMs: Number(deps.receiptsTimeoutMs ?? RECEIPTS_TIMEOUT_MS),
+    probeTtlMs: Number(deps.probeTtlMs ?? PROBE_TTL_MS),
   };
 }
 
@@ -444,14 +475,267 @@ export async function disableAlerts(deps = {}) {
   return { unsubscribed, cleared };
 }
 
+/* ───────────────────────── diagnostics: is anything actually arriving? ─────────────────────────
+ *
+ * The 2026-09-17 complaint in one sentence: the card said "On" for eight days while ~80 pushes
+ * were accepted by Apple and none were shown. "On" came from purely LOCAL state — a live
+ * subscription plus a pairing in localStorage — which cannot fail the two ways this actually
+ * fails: the phone rotated its endpoint (so the secret holds a dead-but-accepted subscription),
+ * or the notifications are delivered and suppressed by iOS. Everything below exists so the card
+ * can say which.
+ */
+
+/**
+ * Stable per-device id: the first 16 hex characters of SHA-256(endpoint). **Byte-identical to
+ * `deviceIdOf` in pipeline/alerts.mjs and to the copy inside sw.js** — the shared test vector
+ * `https://web.push.apple.com/QF2c-token` → `ee64af5d15e243bb` is asserted in both test files.
+ * It is what `data/alerts-state.json` keys its `devices` map by, so it is the only way the phone
+ * can ask "does the sender know about me?".
+ *
+ * @param {string|null|undefined} endpoint
+ * @param {PushDeps} [deps]
+ * @returns {Promise<string|null>} null when there is no endpoint or no WebCrypto
+ */
+export async function deviceIdOf(endpoint, deps = {}) {
+  const value = typeof endpoint === "string" ? endpoint.trim() : "";
+  // An explicit `subtle: null` means "this browser has no WebCrypto" — `??` would helpfully fall
+  // back to the real one and hide exactly the case being tested.
+  const subtle = deps.subtle !== undefined ? deps.subtle : resolve(deps).subtle;
+  if (!value || !subtle?.digest) return null;
+  try {
+    const digest = await subtle.digest("SHA-256", new TextEncoder().encode(value));
+    return [...new Uint8Array(digest)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 16);
+  } catch {
+    return null;
+  }
+}
+
+/** Module-level probe cache: `alertsStatus` runs on every Settings paint, the network does not. */
+const probeCache = new Map();
+
+async function cachedProbe(key, ttlMs, now, load) {
+  const hit = probeCache.get(key);
+  if (hit && now - hit.at < ttlMs) return hit.value;
+  const value = await load();
+  probeCache.set(key, { at: now, value });
+  return value;
+}
+
+/** Forget the cached server/Actions probes — the Diagnose sheet's refresh button. */
+export function clearProbeCache() {
+  probeCache.clear();
+}
+
+/**
+ * `data/alerts-state.json` as the sender last committed it, or null when it cannot be read.
+ * @param {PushDeps} [deps]
+ * @returns {Promise<object|null>}
+ */
+export async function fetchAlertsState(deps = {}) {
+  const d = resolve(deps);
+  if (!d.network || typeof d.fetchImpl !== "function") return null;
+  return cachedProbe("state", d.probeTtlMs, d.now(), async () => {
+    try {
+      const response = await d.fetchImpl(ALERTS_STATE_URL, { cache: "no-store" });
+      if (!response?.ok) return null;
+      const parsed = await response.json();
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      return null;
+    }
+  });
+}
+
+/**
+ * When the Alerts workflow last ran, from the public Actions API. Unauthenticated and entirely
+ * optional: a rate limit or an offline phone just means the card does not mention it.
+ * @param {PushDeps} [deps]
+ * @returns {Promise<{at: string|null, conclusion: string|null, url: string|null}|null>}
+ */
+export async function fetchLastRun(deps = {}) {
+  const d = resolve(deps);
+  if (!d.network || typeof d.fetchImpl !== "function") return null;
+  return cachedProbe("runs", Math.max(d.probeTtlMs, 5 * 60_000), d.now(), async () => {
+    try {
+      const response = await d.fetchImpl(ACTIONS_RUNS_URL, {
+        cache: "no-store",
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!response?.ok) return null;
+      const body = await response.json();
+      const run = Array.isArray(body?.workflow_runs) ? body.workflow_runs[0] : null;
+      if (!run) return null;
+      return {
+        at: run.run_started_at ?? run.created_at ?? null,
+        conclusion: run.conclusion ?? run.status ?? null,
+        url: run.html_url ?? null,
+      };
+    } catch {
+      return null;
+    }
+  });
+}
+
+/** Ask the service worker for its receipt log. Resolves null when it does not answer in time. */
+function askServiceWorker(d) {
+  const controller = d.serviceWorker?.controller;
+  const channelCtor = d.win?.MessageChannel ?? globalThis.MessageChannel;
+  if (!controller?.postMessage || typeof channelCtor !== "function") return Promise.resolve(null);
+  return new Promise((resolveReply) => {
+    let timer;
+    const done = (value) => {
+      clearTimeout(timer);
+      resolveReply(value);
+    };
+    try {
+      const channel = new channelCtor();
+      channel.port1.onmessage = (event) => done(event?.data ?? null);
+      controller.postMessage({ type: "push-receipts" }, [channel.port2]);
+      // Never unref'd: it is always cleared, and an unref'd timer lets Node's test runner drain
+      // the loop before the reply lands.
+      timer = setTimeout(() => done(null), d.receiptsTimeoutMs);
+    } catch {
+      done(null);
+    }
+  });
+}
+
+/** Read the worker's IndexedDB log directly — the fallback when the worker does not reply. */
+function readReceiptsFromIdb(d) {
+  const factory = d.indexedDB;
+  if (!factory?.open) return Promise.resolve(null);
+  return new Promise((resolveRows) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolveRows(value);
+    };
+    let request;
+    try {
+      request = factory.open("tradewinds-sw", 1);
+    } catch {
+      finish(null);
+      return;
+    }
+    // Do NOT create the stores from here: an upgrade fired by the page would race the worker.
+    request.onupgradeneeded = () => finish(null);
+    request.onerror = () => finish(null);
+    request.onblocked = () => finish(null);
+    request.onsuccess = () => {
+      const db = request.result;
+      try {
+        if (!db.objectStoreNames.contains("pushes")) {
+          finish(null);
+          return;
+        }
+        const read = db.transaction("pushes", "readonly").objectStore("pushes").getAll();
+        read.onsuccess = () => finish(Array.isArray(read.result) ? [...read.result].reverse() : []);
+        read.onerror = () => finish(null);
+      } catch {
+        finish(null);
+      }
+    };
+  });
+}
+
+/**
+ * What this phone has actually been shown (design §13.3 B1/B2). The service worker answers first
+ * (which also proves it is alive); its IndexedDB log is the fallback for a page the worker is not
+ * controlling yet.
+ * @param {PushDeps} [deps]
+ * @returns {Promise<{count24h: number, count: number, lastAt: number|null, lastShown: boolean|null,
+ *   failed: number, items: object[], source: "sw"|"idb"|null, subscriptionChange: object|null}>}
+ */
+export async function pushReceipts(deps = {}) {
+  const d = resolve(deps);
+  const empty = {
+    count24h: 0,
+    count: 0,
+    lastAt: null,
+    lastShown: null,
+    failed: 0,
+    items: [],
+    source: null,
+    subscriptionChange: null,
+  };
+
+  let source = null;
+  let items = null;
+  let subscriptionChange = null;
+
+  const reply = await askServiceWorker(d);
+  if (reply && Array.isArray(reply.receipts)) {
+    source = "sw";
+    items = reply.receipts;
+    subscriptionChange = reply.subscriptionChange ?? null;
+  } else {
+    const rows = await readReceiptsFromIdb(d);
+    if (Array.isArray(rows)) {
+      source = "idb";
+      items = rows;
+    }
+  }
+  if (!items) return empty;
+
+  const now = d.now();
+  const dayAgo = now - 24 * 3600 * 1000;
+  const timed = items.filter((item) => item && Number.isFinite(Number(item.at)));
+  return {
+    count: items.length,
+    count24h: timed.filter((item) => Number(item.at) >= dayAgo).length,
+    lastAt: timed.length ? Number(timed[0].at) : null,
+    lastShown: items.length ? items[0].shown !== false : null,
+    failed: items.filter((item) => item && item.shown === false).length,
+    items: items.slice(0, 10),
+    source,
+    subscriptionChange,
+  };
+}
+
+/**
+ * A notification raised by this device, for this device — no GitHub, no VAPID, no network. It is
+ * the one test that separates "the push never arrived" from "iOS is hiding it", so the Diagnose
+ * sheet leads with it.
+ * @param {{title?: string, body?: string, deps?: PushDeps}} [options]
+ * @returns {Promise<{ok: boolean, reason?: string}>}
+ */
+export async function testNotification(options = {}, deps = options.deps ?? {}) {
+  const d = resolve(deps);
+  const permission = d.notification?.permission;
+  if (permission !== "granted") return { ok: false, reason: permission === "denied" ? "denied" : "permission" };
+  const reg = await readyRegistration(d, SW_STATUS_TIMEOUT_MS);
+  if (!reg?.showNotification) return { ok: false, reason: "no-service-worker" };
+  try {
+    await reg.showNotification(options.title ?? "Tradewinds test", {
+      body: options.body ?? "If you can see this, this phone can show alerts.",
+      tag: "test-local",
+      icon: "./icons/icon-192.png",
+      badge: "./icons/icon-192.png",
+      data: { url: "./#settings" },
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: String(error?.message ?? error) };
+  }
+}
+
 /**
  * What the Settings → Alerts card renders. **Async** — it asks the service worker whether a
  * subscription is actually live, which is the only honest answer (the stored pairing can
- * outlive a subscription the OS dropped).
- * @param {PushDeps} [deps]
+ * outlive a subscription the OS dropped), and — unless `deps.network === false` — it also asks
+ * the SENDER what it believes (design §13.3 B2).
+ *
+ * @param {PushDeps} [deps] `network: false` keeps it local-only and instant.
  * @returns {Promise<{supported: boolean, reason: string|null, permission: string,
- *   subscribed: boolean, pairing: object|null}>} `reason` is the `alertsSupported()` reason and
- *   is additive to the design's four keys — it saves the UI a second probe.
+ *   subscribed: boolean, pairing: object|null, endpoint: string|null, deviceId: string|null,
+ *   pairedDeviceId: string|null, endpointChanged: boolean, serverPaired: boolean|null,
+ *   server: {lastSentAt: string|null, sentCount: number|null, lastResult: object|null,
+ *     lastNotifiedAt: string|null, expired: boolean}|null,
+ *   lastRunAt: string|null, lastRun: object|null, receipts: object, probed: boolean}>}
  */
 export async function alertsStatus(deps = {}) {
   const d = resolve(deps);
@@ -460,10 +744,83 @@ export async function alertsStatus(deps = {}) {
   const permission = typeof d.notification?.permission === "string" ? d.notification.permission : "unsupported";
 
   let subscribed = Boolean(pairing);
+  let live = null;
   const reg = await readyRegistration(d, SW_STATUS_TIMEOUT_MS);
-  if (reg) subscribed = Boolean(await currentSubscription(reg));
+  if (reg) {
+    live = await currentSubscription(reg);
+    subscribed = Boolean(live);
+  }
 
-  return { supported: support.ok, reason: support.reason, permission, subscribed, pairing };
+  const endpoint = live?.endpoint ?? pairing?.sub?.endpoint ?? null;
+  const pairedEndpoint = pairing?.sub?.endpoint ?? null;
+  const [deviceId, pairedDeviceId] = await Promise.all([
+    deviceIdOf(endpoint, deps),
+    deviceIdOf(pairedEndpoint, deps),
+  ]);
+  // The failure this release was written for: the OS handed the app a new endpoint and the
+  // GitHub secret still holds the old one, which keeps returning 201 to the sender.
+  const endpointChanged = Boolean(deviceId && pairedDeviceId && deviceId !== pairedDeviceId);
+
+  const base = {
+    supported: support.ok,
+    reason: support.reason,
+    permission,
+    subscribed,
+    pairing,
+    endpoint,
+    deviceId,
+    pairedDeviceId,
+    endpointChanged,
+    serverPaired: null,
+    server: null,
+    lastRunAt: null,
+    lastRun: null,
+    receipts: {
+      count24h: 0,
+      count: 0,
+      lastAt: null,
+      lastShown: null,
+      failed: 0,
+      items: [],
+      source: null,
+      subscriptionChange: null,
+    },
+    probed: d.network,
+  };
+  if (!d.network) return base;
+
+  const [state, lastRun, receipts] = await Promise.all([
+    fetchAlertsState(deps),
+    fetchLastRun(deps),
+    pushReceipts(deps),
+  ]);
+
+  // `serverPaired` is a three-state answer on purpose: false means "the sender does not know this
+  // phone" (re-pair), null means "we could not ask" (say nothing rather than accuse).
+  let serverPaired = null;
+  let server = null;
+  if (state && state.devices && typeof state.devices === "object") {
+    const entry = deviceId ? state.devices[deviceId] : null;
+    serverPaired = Boolean(entry);
+    if (entry) {
+      server = {
+        lastSentAt: entry.lastSentAt ?? entry.lastNotifiedAt ?? null,
+        lastNotifiedAt: entry.lastNotifiedAt ?? null,
+        sentCount: entry.sentCount != null && Number.isFinite(Number(entry.sentCount)) ? Number(entry.sentCount) : null,
+        lastResult: entry.lastResult ?? null,
+        expired: entry.expired === true,
+      };
+    }
+  }
+
+  return {
+    ...base,
+    serverPaired,
+    server,
+    lastRunAt: lastRun?.at ?? null,
+    lastRun: lastRun ?? null,
+    receipts: receipts ?? base.receipts,
+  };
 }
 
 /**

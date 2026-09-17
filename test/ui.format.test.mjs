@@ -8,6 +8,7 @@ import {
   DASH, MINUS, fmtValue, fmtFull, fmtPct, fmtPts, fmtNum, fmtRosterPct,
   relTime, clockTime, toMs, initials, escapeHtml, posRankLabel, clip, byDesc,
   numQbsOf, qbLabel, pprOf, pprLabel, leagueShape, possessive, acceptPhrase,
+  alertsStatusText, alertsStatusTone, alertsProblem,
 } from "../src/ui/format.js";
 
 test("fmtValue abbreviates thousands and survives junk", () => {
@@ -168,4 +169,131 @@ test("acceptPhrase names side B when side names are supplied", () => {
   assert.equal(acceptPhrase({ acceptance: "unlikely" }, names).long, "speckledorf would likely decline");
   assert.equal(acceptPhrase({ acceptance: "likely" }, names).short, "likely accepts", "the short form is already name-prefixed by the caller");
   assert.equal(acceptPhrase({ acceptLikely: false }, names).cls, "no");
+});
+
+/* ─────────────── the alerts status line tells the truth (design §13.3 B2) ─────────────── */
+
+const NOW = Date.parse("2026-09-17T16:30:00Z");
+
+/** A fully probed status: paired locally, paired on the server, receipts arriving. */
+const healthy = (over = {}) => ({
+  supported: true,
+  reason: null,
+  permission: "granted",
+  subscribed: true,
+  pairing: { createdAt: "2026-09-09T10:00:00Z", label: "iPhone" },
+  deviceId: "11b2551101563b49",
+  pairedDeviceId: "11b2551101563b49",
+  endpointChanged: false,
+  serverPaired: true,
+  server: { lastSentAt: "2026-09-17T12:11:48Z", lastNotifiedAt: "2026-09-17T12:11:48Z", sentCount: 80, lastResult: { status: 201, at: "2026-09-17T12:11:48Z" }, expired: false },
+  lastRunAt: "2026-09-17T12:11:00Z",
+  receipts: { source: "sw", count: 12, count24h: 3, lastAt: Date.parse("2026-09-17T12:11:50Z"), lastShown: true, failed: 0, items: [], subscriptionChange: null },
+  probed: true,
+  ...over,
+});
+
+test("alertsStatusText: the pre-v1.4 shape keeps the old wording", () => {
+  // A cached status, mock mode, or the fast local-only probe: nothing was asked of the sender,
+  // so nothing may be claimed about it.
+  const legacy = { permission: "granted", subscribed: true, pairing: { createdAt: "2026-09-09T10:00:00Z" } };
+  assert.equal(alertsStatusText(legacy, NOW), "On · paired 9/9");
+  assert.equal(alertsStatusTone(legacy, NOW), "ok");
+  assert.equal(alertsProblem(legacy, NOW), null);
+});
+
+test("alertsStatusText: receipts arriving reads as On, with the time of the last one", () => {
+  const status = healthy();
+  assert.match(alertsStatusText(status, NOW), /^On · paired · last alert \d{1,2}:\d\d (AM|PM)$/);
+  assert.equal(alertsStatusTone(status, NOW), "ok");
+  assert.equal(alertsProblem(status, NOW), null);
+});
+
+test("alertsStatusText: the sender delivering into a phone that shows nothing is the headline bug", () => {
+  // 2026-09-09..17: ~80 accepted pushes, none shown. The old card said "On · paired 9/9".
+  const status = healthy({ receipts: { source: "sw", count: 0, count24h: 0, lastAt: null, lastShown: null, failed: 0, items: [], subscriptionChange: null } });
+  assert.equal(
+    alertsStatusText(status, NOW),
+    "Paired · sender delivered 80 alerts, none shown on this phone — check iOS notification settings",
+  );
+  assert.equal(alertsStatusTone(status, NOW), "bad");
+  assert.match(alertsProblem(status, NOW), /Notifications → Tradewinds/);
+  assert.match(alertsProblem(status, NOW), /Scheduled Summary/);
+});
+
+test("alertsStatusText: receipts older than the last send by more than a day also count as stale", () => {
+  const status = healthy({
+    receipts: { source: "sw", count: 4, count24h: 0, lastAt: Date.parse("2026-09-10T18:00:00Z"), lastShown: true, failed: 0, items: [], subscriptionChange: null },
+  });
+  assert.match(alertsStatusText(status, NOW), /none shown on this phone/);
+  assert.equal(alertsStatusTone(status, NOW), "bad");
+});
+
+test("alertsStatusText: a rotated endpoint says re-pair, and dates it when the worker logged it", () => {
+  const changed = healthy({
+    endpointChanged: true,
+    receipts: { source: "sw", count: 0, count24h: 0, lastAt: null, lastShown: null, failed: 0, items: [], subscriptionChange: { at: Date.parse("2026-09-14T15:00:00Z") } },
+  });
+  assert.equal(alertsStatusText(changed, NOW), "This phone's alert address changed on 9/14 — re-pair");
+  assert.equal(alertsStatusTone(changed, NOW), "bad");
+  assert.match(alertsProblem(changed, NOW), /paste the new code into GitHub/);
+
+  // Undated rotation (the worker's log was unreadable) still says the important half.
+  const undated = healthy({ endpointChanged: true, receipts: { source: null, count: 0, count24h: 0, lastAt: null, lastShown: null, failed: 0, items: [], subscriptionChange: null } });
+  assert.equal(alertsStatusText(undated, NOW), "This phone's alert address changed — re-pair");
+});
+
+test("alertsStatusText: a rotation is reported even from the fast local-only probe", () => {
+  // The local probe knows nothing about the sender, but comparing the live endpoint with the
+  // paired one needs no network at all — and it is the fix Tom has to make.
+  const local = { permission: "granted", subscribed: true, pairing: { createdAt: "2026-09-09T10:00:00Z" }, endpointChanged: true, probed: false };
+  assert.equal(alertsStatusText(local, NOW), "This phone's alert address changed — re-pair");
+  assert.equal(alertsStatusTone(local, NOW), "bad");
+});
+
+test("alertsStatusText: not in the sender's device list, and written off by it", () => {
+  const unpaired = healthy({ serverPaired: false, server: null });
+  assert.equal(alertsStatusText(unpaired, NOW), "Subscribed, but NOT paired with the sender — re-pair");
+  assert.equal(alertsStatusTone(unpaired, NOW), "bad");
+  assert.match(alertsProblem(unpaired, NOW), /PUSH_SUBSCRIPTIONS/);
+
+  const expired = healthy({ server: { ...healthy().server, expired: true } });
+  assert.equal(alertsStatusText(expired, NOW), "The sender marked this phone dead — re-pair");
+  assert.equal(alertsStatusTone(expired, NOW), "bad");
+});
+
+test("alertsStatusText: pushes that arrived but could not be displayed are their own case", () => {
+  const status = healthy({
+    receipts: { source: "sw", count: 3, count24h: 3, lastAt: Date.parse("2026-09-17T12:11:50Z"), lastShown: false, failed: 2, items: [], subscriptionChange: null },
+  });
+  assert.equal(alertsStatusText(status, NOW), "On · paired · 2 alerts arrived but could not be shown");
+  assert.equal(alertsStatusTone(status, NOW), "warn");
+  assert.match(alertsProblem(status, NOW), /Reopen the app/);
+});
+
+test("alertsStatusText: an unreadable receipt log is admitted, not papered over", () => {
+  const blind = healthy({ receipts: { source: null, count: 0, count24h: 0, lastAt: null, lastShown: null, failed: 0, items: [], subscriptionChange: null } });
+  assert.match(alertsStatusText(blind, NOW), /^On · paired · sender last sent .* · this phone keeps no receipts$/);
+  assert.equal(alertsStatusTone(blind, NOW), "warn");
+  assert.equal(alertsProblem(blind, NOW), null, "nothing to DO about it — it is a blind spot, not a fault");
+});
+
+test("alertsStatusText: paired but nothing sent yet is fine, and an unreachable sender says so", () => {
+  const quiet = healthy({ server: { lastSentAt: null, lastNotifiedAt: null, sentCount: 0, lastResult: null, expired: false }, receipts: { source: "sw", count: 0, count24h: 0, lastAt: null, lastShown: null, failed: 0, items: [], subscriptionChange: null } });
+  assert.equal(alertsStatusText(quiet, NOW), "On · paired · nothing sent yet");
+  assert.equal(alertsStatusTone(quiet, NOW), "ok");
+
+  const offline = healthy({ serverPaired: null, server: null, receipts: { source: "sw", count: 0, count24h: 0, lastAt: null, lastShown: null, failed: 0, items: [], subscriptionChange: null } });
+  assert.equal(alertsStatusText(offline, NOW), "On · paired 9/9 · sender not reachable");
+  assert.equal(alertsStatusTone(offline, NOW), "warn");
+});
+
+test("alertsStatusText: off and denied outrank every diagnosis", () => {
+  assert.equal(alertsStatusText(null, NOW), "Checking…");
+  assert.equal(alertsStatusText(healthy({ subscribed: false }), NOW), "Off");
+  assert.equal(alertsStatusTone(healthy({ subscribed: false }), NOW), "mute");
+  assert.equal(alertsStatusText(healthy({ permission: "denied", endpointChanged: true }), NOW), "Permission denied");
+  assert.equal(alertsStatusTone(healthy({ permission: "denied" }), NOW), "bad");
+  assert.match(alertsProblem(healthy({ permission: "denied" }), NOW), /Allow Notifications|turn them back on|Notifications → Tradewinds/i);
+  assert.equal(alertsProblem(null, NOW), null);
 });

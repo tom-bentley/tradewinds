@@ -7,6 +7,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { webcrypto } from "node:crypto";
+
 import {
   ALERT_REASON_TEXT,
   DEFAULT_PREFS,
@@ -16,15 +18,20 @@ import {
   VAPID_PUBLIC_KEY,
   alertsStatus,
   alertsSupported,
+  clearProbeCache,
+  deviceIdOf,
   deviceLabel,
   disableAlerts,
   enableAlerts,
   pairingCode,
+  pushReceipts,
   reasonText,
   storedPairing,
+  testNotification,
   updatePrefs,
   urlBase64ToUint8Array,
 } from "../src/push.js";
+import { makeMemoryIndexedDb } from "./shims/indexeddb-shim.mjs";
 
 /** The key from design §11.1 — public half, safe to embed. */
 const VAPID = "BHRrun9caaSWpO0KOYVBrEHU7lo0SJ2qNQ203fkbMP24VIyZTa1Rssxk2XpiFekMscVSUBlj6TakzQ8Xu0l5CQo";
@@ -288,8 +295,9 @@ test("enableAlerts: prefs and label override the defaults, viewer mode keeps nul
   );
 
   assert.deepEqual(pairing.prefs, {
-    // v1.3 (design §12.5) added `advice` and `rivalNews` to the payload; the schema is additive,
-    // so PAIRING_VERSION stays 1 and a device paired before them keeps working.
+    // v1.3 (design §12.5) added `advice` and `rivalNews` to the payload; v1.4 (§13.3 B3) added the
+    // three noise-control numbers. The schema is additive, so PAIRING_VERSION stays 1 and a device
+    // paired before either release keeps working — the job's normalizePrefs fills the gaps.
     advice: true,
     rivalNews: false,
     trades: true,
@@ -297,6 +305,9 @@ test("enableAlerts: prefs and label override the defaults, viewer mode keeps nul
     freeAgents: false,
     minDealScore: 3,
     minFaGain: 2,
+    dealsCooldownHours: 6,
+    faCooldownHours: 6,
+    maxDealsPerPush: 1,
   });
   assert.equal(pairing.label, "Tom's iPhone", "trimmed");
   assert.equal(pairing.leagueId, null, "no league configured is a legitimate state");
@@ -439,17 +450,17 @@ test("updatePrefs merges into the stored pairing (and the code has to be re-past
 test("alertsStatus reports what the Settings card needs", async () => {
   const { deps, notification } = harness();
 
-  const before = await alertsStatus(deps);
-  assert.deepEqual(before, {
-    supported: true,
-    reason: null,
-    permission: "default",
-    subscribed: false,
-    pairing: null,
-  });
+  // `network: false` is the fast local-only probe the card paints with first (design §13.3 B2).
+  const before = await alertsStatus({ ...deps, network: false });
+  assert.deepEqual(
+    { supported: before.supported, reason: before.reason, permission: before.permission, subscribed: before.subscribed, pairing: before.pairing },
+    { supported: true, reason: null, permission: "default", subscribed: false, pairing: null },
+  );
+  assert.equal(before.probed, false, "nothing was asked of the sender");
+  assert.equal(before.serverPaired, null, "and so nothing is claimed about it");
 
   const pairing = await enableAlerts({ settings }, deps);
-  const after = await alertsStatus(deps);
+  const after = await alertsStatus({ ...deps, network: false });
   assert.equal(after.permission, "granted");
   assert.equal(notification.permission, "granted");
   assert.equal(after.subscribed, true);
@@ -473,13 +484,16 @@ test("alertsStatus: a live subscription beats a stale stored pairing", async () 
 
 test("alertsStatus on a browser that cannot do any of this never throws", async () => {
   const bare = harness({ hasServiceWorker: false, hasNotification: false, pushManager: false });
-  assert.deepEqual(await alertsStatus(bare.deps), {
-    supported: false,
-    reason: "unsupported",
-    permission: "unsupported",
-    subscribed: false,
-    pairing: null,
-  });
+  const status = await alertsStatus(bare.deps);
+  assert.deepEqual(
+    { supported: status.supported, reason: status.reason, permission: status.permission, subscribed: status.subscribed, pairing: status.pairing },
+    { supported: false, reason: "unsupported", permission: "unsupported", subscribed: false, pairing: null },
+  );
+  // Every diagnostic answer is "we could not check" rather than a verdict pulled from nowhere.
+  assert.equal(status.deviceId, null);
+  assert.equal(status.serverPaired, null);
+  assert.equal(status.endpointChanged, false);
+  assert.equal(status.receipts.source, null);
 });
 
 test("disableAlerts unsubscribes and clears the pairing", async () => {
@@ -520,4 +534,271 @@ test("a service worker that never becomes ready cannot hang the app", async () =
   const status = await alertsStatus(deps);
   assert.equal(status.subscribed, false, "no pairing stored, so the honest answer is 'no'");
   assert.deepEqual(await disableAlerts(deps), { unsubscribed: false, cleared: true });
+});
+
+/* ───────────────── diagnostics: device id, server view, receipts (design §13.3 B2) ───────────────── */
+
+/** The shared test vector. pipeline/alerts.mjs asserts the SAME endpoint → the SAME id. */
+const SHARED_ENDPOINT = "https://web.push.apple.com/QF2c-token";
+const SHARED_DEVICE_ID = "ee64af5d15e243bb";
+
+/** A `fetch` that answers a fixed map of URLs; anything else rejects like a network error. */
+function fakeFetch(routes) {
+  const calls = [];
+  const impl = async (url, init) => {
+    calls.push({ url, init });
+    const answer = routes[url] ?? routes[Object.keys(routes).find((k) => String(url).startsWith(k))];
+    if (answer === undefined) throw new TypeError("network error");
+    if (answer instanceof Error) throw answer;
+    return {
+      ok: answer.ok !== false,
+      status: answer.status ?? 200,
+      json: async () => answer.body,
+    };
+  };
+  impl.calls = calls;
+  return impl;
+}
+
+/** A service worker controller that answers `push-receipts` on the MessageChannel port. */
+function fakeController(reply) {
+  const posts = [];
+  return {
+    posts,
+    postMessage(message, transfer) {
+      posts.push(message);
+      const port = transfer && transfer[0];
+      if (!port || reply === undefined) return;
+      queueMicrotask(() => port.onmessage({ data: reply }));
+    },
+  };
+}
+
+/** The MessageChannel stand-in: port2 is handed to the worker, port1 keeps the handler. */
+function FakeMessageChannel() {
+  const port1 = { onmessage: null };
+  const port2 = {
+    postMessage: (data) => {
+      if (typeof port1.onmessage === "function") port1.onmessage({ data });
+    },
+  };
+  // The fake controller calls `port.onmessage(...)` directly on what it is handed.
+  port2.onmessage = (event) => {
+    if (typeof port1.onmessage === "function") port1.onmessage(event);
+  };
+  this.port1 = port1;
+  this.port2 = port2;
+}
+
+const STATE_URL = "./data/alerts-state.json";
+const RUNS_URL =
+  "https://api.github.com/repos/tom-bentley/tradewinds/actions/workflows/alerts.yml/runs?per_page=1";
+
+/** The committed state file, trimmed to the two fields the phone reads. */
+const serverState = (deviceId, entry) => ({
+  ok: true,
+  body: { v: 1, leagues: {}, devices: { [deviceId]: entry } },
+});
+
+const runsBody = (at) => ({
+  ok: true,
+  body: { workflow_runs: [{ run_started_at: at, conclusion: "success", html_url: "https://github.com/x/y/actions/runs/1" }] },
+});
+
+/** A harness whose deps also carry the diagnostics plumbing. */
+function diagnosticHarness({ state, runs, receiptsReply, ...rest } = {}) {
+  const h = harness({
+    notification: fakeNotification({ permission: "granted" }),
+    storage: fakeStorage(),
+    ...rest,
+  });
+  const fetchImpl = fakeFetch({
+    ...(state === undefined ? {} : { [STATE_URL]: state }),
+    ...(runs === undefined ? {} : { [RUNS_URL]: runs }),
+  });
+  h.win.crypto = webcrypto;
+  h.win.MessageChannel = FakeMessageChannel;
+  h.navigator.serviceWorker.controller = fakeController(receiptsReply);
+  h.deps = { win: h.win, fetchImpl, subtle: webcrypto.subtle, probeTtlMs: 0, receiptsTimeoutMs: 50 };
+  h.fetchImpl = fetchImpl;
+  return h;
+}
+
+test("deviceIdOf matches the alerts job byte for byte (shared vector)", async () => {
+  const deps = { subtle: webcrypto.subtle };
+  assert.equal(await deviceIdOf(SHARED_ENDPOINT, deps), SHARED_DEVICE_ID);
+  assert.equal((await deviceIdOf(SHARED_ENDPOINT, deps)).length, 16);
+  assert.equal(await deviceIdOf("https://web.push.apple.com/QF2c-old", deps), "9131f5dc3c5f376c");
+  assert.equal(await deviceIdOf("", deps), null, "no endpoint, no id");
+  assert.equal(await deviceIdOf(null, deps), null);
+  assert.equal(await deviceIdOf(SHARED_ENDPOINT, { subtle: null }), null, "no WebCrypto, no guess");
+});
+
+test("alertsStatus: paired on the server, receipts arriving → everything green", async () => {
+  clearProbeCache();
+  const h = diagnosticHarness({
+    state: serverState(SHARED_DEVICE_ID, {
+      seenDeals: [],
+      seenFa: [],
+      lastNotifiedAt: "2026-09-17T12:11:48Z",
+      lastSentAt: "2026-09-17T12:11:48Z",
+      sentCount: 80,
+      lastResult: { status: 201, at: "2026-09-17T12:11:48Z" },
+    }),
+    runs: runsBody("2026-09-17T12:11:00Z"),
+    receiptsReply: {
+      type: "push-receipts",
+      receipts: [{ at: Date.parse("2026-09-17T12:11:50Z"), title: "New deal", tag: "deals", kind: "deals", shown: true }],
+      subscriptionChange: null,
+    },
+  });
+  await enableAlerts({ settings }, h.deps);
+
+  const status = await alertsStatus(h.deps);
+
+  assert.equal(status.deviceId, SHARED_DEVICE_ID);
+  assert.equal(status.serverPaired, true);
+  assert.equal(status.endpointChanged, false);
+  assert.equal(status.server.sentCount, 80);
+  assert.deepEqual(status.server.lastResult, { status: 201, at: "2026-09-17T12:11:48Z" });
+  assert.equal(status.lastRunAt, "2026-09-17T12:11:00Z");
+  assert.equal(status.receipts.source, "sw");
+  assert.equal(status.receipts.count, 1);
+  assert.equal(status.receipts.lastShown, true);
+  assert.equal(status.probed, true);
+  // The state file must never be served from the app's own cache, or "paired" is a fossil.
+  const stateCall = h.fetchImpl.calls.find((c) => c.url === STATE_URL);
+  assert.equal(stateCall.init.cache, "no-store");
+});
+
+test("alertsStatus: the sender does not know this device → serverPaired false", async () => {
+  clearProbeCache();
+  const h = diagnosticHarness({
+    state: serverState("0000000000000000", { seenDeals: [], seenFa: [], lastNotifiedAt: null }),
+    receiptsReply: { type: "push-receipts", receipts: [], subscriptionChange: null },
+  });
+  await enableAlerts({ settings }, h.deps);
+
+  const status = await alertsStatus(h.deps);
+  assert.equal(status.serverPaired, false, "this is the re-pair case");
+  assert.equal(status.server, null);
+});
+
+test("alertsStatus: an unreachable state file says null, never false", async () => {
+  // The difference matters: false accuses the pairing, null admits we could not look.
+  clearProbeCache();
+  const h = diagnosticHarness({ receiptsReply: { type: "push-receipts", receipts: [], subscriptionChange: null } });
+  await enableAlerts({ settings }, h.deps);
+
+  const status = await alertsStatus(h.deps);
+  assert.equal(status.serverPaired, null);
+  assert.equal(status.lastRunAt, null, "the Actions API is optional too");
+});
+
+test("alertsStatus: a rotated endpoint is caught by comparing ids", async () => {
+  clearProbeCache();
+  const rotated = fakeSubscription("https://web.push.apple.com/QF2c-ROTATED");
+  const h = diagnosticHarness({
+    state: serverState(SHARED_DEVICE_ID, { seenDeals: [], seenFa: [], lastNotifiedAt: "2026-09-17T12:11:48Z", lastSentAt: "2026-09-17T12:11:48Z", sentCount: 80 }),
+    receiptsReply: { type: "push-receipts", receipts: [], subscriptionChange: { at: Date.parse("2026-09-14T03:00:00Z"), oldEndpointHash: SHARED_DEVICE_ID } },
+  });
+  await enableAlerts({ settings }, h.deps); // pairs the original endpoint…
+  h.serviceWorker.registration.pushManager.getSubscription = async () => rotated; // …then iOS moves it
+
+  const status = await alertsStatus(h.deps);
+  assert.equal(status.pairedDeviceId, SHARED_DEVICE_ID);
+  assert.notEqual(status.deviceId, SHARED_DEVICE_ID);
+  assert.equal(status.endpointChanged, true, "the GitHub secret is pointing at a dead address");
+  assert.equal(status.serverPaired, false, "…and the id the job knows is not this one");
+});
+
+test("pushReceipts falls back to the worker's IndexedDB when it does not answer", async () => {
+  clearProbeCache();
+  const idb = makeMemoryIndexedDb();
+  // Seed the log the way sw.js writes it.
+  await new Promise((resolve) => {
+    const open = idb.open("tradewinds-sw", 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("pushes", { keyPath: "seq", autoIncrement: true });
+    open.onsuccess = () => {
+      const store = open.result.transaction("pushes", "readwrite").objectStore("pushes");
+      store.add({ at: 1, title: "older", kind: "fa", shown: true });
+      const last = store.add({ at: Date.now(), title: "newest", kind: "advice", shown: false });
+      last.onsuccess = () => resolve();
+    };
+  });
+
+  const h = diagnosticHarness({ receiptsReply: undefined }); // the worker never replies
+  const receipts = await pushReceipts({ ...h.deps, indexedDB: idb });
+
+  assert.equal(receipts.source, "idb");
+  assert.equal(receipts.count, 2);
+  assert.equal(receipts.items[0].title, "newest", "newest first");
+  assert.equal(receipts.failed, 1);
+  assert.equal(receipts.lastShown, false);
+});
+
+test("pushReceipts reports nothing readable rather than nothing received", async () => {
+  clearProbeCache();
+  const h = diagnosticHarness({ receiptsReply: undefined });
+  const receipts = await pushReceipts({ ...h.deps, indexedDB: null });
+  assert.equal(receipts.source, null, "no evidence either way");
+  assert.equal(receipts.count, 0);
+  assert.equal(receipts.lastShown, null);
+});
+
+test("pushReceipts counts only the last 24 hours for count24h", async () => {
+  clearProbeCache();
+  const now = Date.parse("2026-09-17T12:00:00Z");
+  const h = diagnosticHarness({
+    receiptsReply: {
+      type: "push-receipts",
+      receipts: [
+        { at: now - 3600_000, title: "an hour ago", shown: true },
+        { at: now - 40 * 3600_000, title: "nearly two days ago", shown: true },
+      ],
+      subscriptionChange: null,
+    },
+  });
+  const receipts = await pushReceipts({ ...h.deps, now: () => now });
+  assert.equal(receipts.count, 2);
+  assert.equal(receipts.count24h, 1);
+});
+
+test("testNotification raises one locally and reports why when it cannot", async () => {
+  const shown = [];
+  const granted = harness({ notification: fakeNotification({ permission: "granted" }) });
+  granted.serviceWorker.registration.showNotification = async (title, options) => shown.push({ title, options });
+  assert.deepEqual(await testNotification({}, granted.deps), { ok: true });
+  assert.equal(shown[0].title, "Tradewinds test");
+  assert.equal(shown[0].options.tag, "test-local");
+
+  const denied = harness({ notification: fakeNotification({ permission: "denied" }) });
+  assert.deepEqual(await testNotification({}, denied.deps), { ok: false, reason: "denied" });
+
+  const refused = harness({ notification: fakeNotification({ permission: "granted" }) });
+  refused.serviceWorker.registration.showNotification = async () => {
+    throw new Error("nope");
+  };
+  assert.deepEqual(await testNotification({}, refused.deps), { ok: false, reason: "nope" });
+});
+
+test("the server/Actions probes are cached so a repaint is not a request storm", async () => {
+  clearProbeCache();
+  const h = diagnosticHarness({
+    state: serverState(SHARED_DEVICE_ID, { seenDeals: [], seenFa: [], lastNotifiedAt: null }),
+    runs: runsBody("2026-09-17T12:11:00Z"),
+    receiptsReply: { type: "push-receipts", receipts: [], subscriptionChange: null },
+  });
+  h.deps.probeTtlMs = 60_000;
+  await enableAlerts({ settings }, h.deps);
+
+  await alertsStatus(h.deps);
+  await alertsStatus(h.deps);
+  await alertsStatus(h.deps);
+
+  assert.equal(h.fetchImpl.calls.filter((c) => c.url === STATE_URL).length, 1, "one state read for three paints");
+  assert.equal(h.fetchImpl.calls.filter((c) => c.url === RUNS_URL).length, 1);
+  clearProbeCache();
+  await alertsStatus(h.deps);
+  assert.equal(h.fetchImpl.calls.filter((c) => c.url === STATE_URL).length, 2, "…until the sheet asks again");
 });

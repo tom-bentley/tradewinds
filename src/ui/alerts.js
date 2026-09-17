@@ -7,7 +7,7 @@
 
 import { store, setIn } from "./store.js";
 import { toast, openSheet, copyText, skeleton } from "./components.js";
-import { escapeHtml, fmtNum, alertsStatusText } from "./format.js";
+import { escapeHtml, fmtNum, relTime, alertsStatusText, alertsStatusTone, alertsProblem } from "./format.js";
 
 const REPO = "https://github.com/tom-bentley/tradewinds";
 export const SECRETS_URL = `${REPO}/settings/secrets/actions`;
@@ -91,7 +91,10 @@ export function alertsCard() {
   const blocked = !st.supported;
   const reason = blocked ? reasonTextOf(st.reason) : "";
   const prefs = prefsOf(st);
-  const tone = st.permission === "denied" ? "bad" : on ? "ok" : "mute";
+  const tone = alertsStatusTone(st);
+  // The boot health check writes here; the card is the surface that shows it until app.js
+  // (WS-A) hooks `store.alerts.problem` into the #banner.
+  const problem = store.alerts.problem || alertsProblem(st);
 
   return `<div class="card alerts">
     <div class="al-top">
@@ -104,6 +107,7 @@ export function alertsCard() {
       ${store.alerts.busy ? "Asking…" : "Enable alerts"}</button>`}
     ${reason ? `<p class="note note-warn" id="al-reason">${escapeHtml(reason)}</p>` : ""}
     ${store.alerts.error && !reason ? `<p class="note note-warn">${escapeHtml(store.alerts.error)}</p>` : ""}
+    ${on && problem ? `<p class="note note-warn" id="al-problem">${escapeHtml(problem)}</p>` : ""}
 
     ${on ? `<div class="al-prefs">
       ${PREF_TOGGLES.map((t) => `<label class="swrow">
@@ -123,13 +127,16 @@ export function alertsCard() {
     </div>
 
     <div class="btn-col al-acts">
+      <button type="button" class="btn btn-ghost" data-act="al-test">Test this phone</button>
+      <button type="button" class="btn btn-ghost" data-act="al-diagnose">Diagnose</button>
       <button type="button" class="btn btn-ghost" data-act="al-code">Show pairing code</button>
       <a class="btn btn-ghost" href="${ACTIONS_URL}" target="_blank" rel="noopener">Send test alert</a>
       <button type="button" class="btn btn-ghost" data-act="al-disable">Disable alerts</button>
     </div>
-    <p class="note">“Send test alert” opens the Alerts workflow on GitHub — press <strong>Run
-      workflow</strong>, set <strong>test</strong> to <code>true</code>, and this device should
-      buzz within a minute.</p>` : ""}
+    <p class="note">“Test this phone” raises a notification locally — no GitHub, no network — so
+      it proves whether iOS will display one at all. “Send test alert” opens the Alerts workflow
+      on GitHub: press <strong>Run workflow</strong>, set <strong>test</strong> to
+      <code>true</code>, and this device should buzz within a minute.</p>` : ""}
   </div>`;
 }
 
@@ -139,17 +146,52 @@ export function paintAlerts() {
   if (host) host.innerHTML = alertsCard();
 }
 
-/** Probe the real state (async in push.js: it asks the SW whether a subscription is live). */
+const OFFLINE_STATUS = {
+  supported: false, reason: "unsupported", permission: "default", subscribed: false, pairing: null,
+};
+
+/**
+ * Probe the real state. Two passes on purpose (design §13.3 B2): the local-only probe answers in
+ * milliseconds so the card paints immediately, then the full probe fetches the sender's device
+ * list, the Actions API and this phone's receipt log and repaints with the truth.
+ */
 export async function refreshStatus(e) {
   env = e || env;
   try {
-    const status = await Promise.resolve(env.svc.alertsStatus());
-    setIn("alerts", { status });
+    const fast = await Promise.resolve(env.svc.alertsStatus({ network: false }));
+    setIn("alerts", { status: fast, problem: alertsProblem(fast) });
+    paintAlerts();
   } catch (err) {
-    console.warn("[alerts] status failed", err);
-    setIn("alerts", { status: { supported: false, reason: "unsupported", permission: "default", subscribed: false, pairing: null } });
+    console.warn("[alerts] local status failed", err);
+    setIn("alerts", { status: OFFLINE_STATUS, problem: null });
+    paintAlerts();
+    return;
   }
-  paintAlerts();
+  await checkAlertsHealth(env);
+}
+
+/**
+ * The full probe: does the SENDER know this phone, and has anything actually been shown here?
+ * Writes `store.alerts.problem` — a one-sentence "what to do" string, or null. app.js belongs to
+ * WS-A, so the banner hook is theirs to add; the Settings card renders the same string today.
+ *
+ * Safe to call from anywhere (boot, Settings mount, the Diagnose sheet): it never throws.
+ * @param {object} [e] the services env
+ * @returns {Promise<string|null>} the problem text, or null when there is nothing to report
+ */
+export async function checkAlertsHealth(e) {
+  env = e || env;
+  if (!env || !env.svc || !env.svc.alertsStatus) return null;
+  try {
+    const status = await Promise.resolve(env.svc.alertsStatus());
+    const problem = alertsProblem(status);
+    setIn("alerts", { status, problem });
+    paintAlerts();
+    return problem;
+  } catch (err) {
+    console.warn("[alerts] health check failed", err);
+    return null;
+  }
 }
 
 /* ---------------------------------------------------------------- pairing sheet */
@@ -199,6 +241,186 @@ export function openPairingSheet(pairing, e) {
   });
 }
 
+/* ---------------------------------------------------------------- diagnose sheet */
+
+const YES = "yes";
+const NO = "no";
+const UNKNOWN = "could not check";
+
+/** One evidence row: what we asked, what came back. */
+const row = (label, value, note) =>
+  `<tr><th scope="row">${escapeHtml(label)}</th><td>${escapeHtml(String(value))}${
+    note ? `<span class="dg-note">${escapeHtml(note)}</span>` : ""
+  }</td></tr>`;
+
+/** iOS version out of the UA string — the one thing the app cannot ask for directly. */
+export function iosVersion(ua = (typeof navigator !== "undefined" && navigator.userAgent) || "") {
+  const m = String(ua).match(/(?:iPhone |CPU )OS (\d+)[._](\d+)/);
+  return m ? `${m[1]}.${m[2]}` : null;
+}
+
+/**
+ * Everything the app knows about why alerts are or are not arriving, with the next step spelled
+ * out. Pure: takes a status and returns HTML, so it is rendered the same from the card and from
+ * a future banner.
+ * @param {object} st from `alertsStatus()`
+ * @returns {string}
+ */
+export function diagnoseBody(st, now = Date.now()) {
+  const receipts = (st && st.receipts) || {};
+  const server = (st && st.server) || null;
+  const ua = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+  const standalone =
+    (typeof navigator !== "undefined" && navigator.standalone === true) ||
+    (typeof matchMedia === "function" && (() => { try { return matchMedia("(display-mode: standalone)").matches; } catch { return false; } })());
+
+  const serverPaired = st.serverPaired === true ? YES : st.serverPaired === false ? NO : UNKNOWN;
+  const steps = nextSteps(st);
+
+  const items = (receipts.items || []).slice(0, 10);
+  const log = items.length
+    ? `<ul class="dg-log">${items
+        .map(
+          (r) =>
+            `<li><span class="dg-when">${escapeHtml(relTime(r.at, now))}</span> ${escapeHtml(
+              r.title || "(no title)",
+            )} <span class="tag tag-mute">${escapeHtml(r.kind || "?")}</span>${
+              r.shown === false ? ` <span class="tag tag-bad">not shown</span>` : ""
+            }${r.error ? `<span class="dg-note">${escapeHtml(r.error)}</span>` : ""}</li>`,
+        )
+        .join("")}</ul>`
+    : `<p class="note note-warn">This phone has no record of ever receiving a push${
+        receipts.source ? "" : " (and its receipt log could not be read)"
+      }.</p>`;
+
+  return `<div class="diagnose">
+    ${steps.length ? `<ol class="steps dg-steps">${steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol>` : `<p class="note">Alerts are arriving on this phone. Nothing to fix.</p>`}
+
+    <h4>This phone</h4>
+    <table class="dg-table"><tbody>
+      ${row("Device id", st.deviceId || UNKNOWN, "the id the alert job files this phone under")}
+      ${row("Notification permission", st.permission || UNKNOWN)}
+      ${row("Installed to Home Screen", standalone ? YES : NO, standalone ? "" : "iOS only pushes to installed web apps")}
+      ${row("iOS version", iosVersion(ua) || UNKNOWN)}
+      ${row("Push subscription live", st.subscribed ? YES : NO)}
+      ${row("Address changed since pairing", st.endpointChanged ? YES : NO, st.endpointChanged ? "re-pair to fix" : "")}
+    </tbody></table>
+
+    <h4>The sender</h4>
+    <table class="dg-table"><tbody>
+      ${row("Knows this phone", serverPaired, st.serverPaired === false ? "paste the pairing code into PUSH_SUBSCRIPTIONS" : "")}
+      ${row("Last sent to it", server && server.lastSentAt ? relTime(server.lastSentAt, now) : "never")}
+      ${row("Pushes sent all-time", server && server.sentCount != null ? server.sentCount : UNKNOWN)}
+      ${row(
+        "Last result",
+        server && server.lastResult ? `${server.lastResult.status ?? "?"} · ${relTime(server.lastResult.at, now)}` : UNKNOWN,
+      )}
+      ${row("Marked dead", server && server.expired ? YES : NO)}
+      ${row("Alerts workflow last ran", st.lastRunAt ? relTime(st.lastRunAt, now) : UNKNOWN, st.lastRun && st.lastRun.conclusion ? String(st.lastRun.conclusion) : "")}
+    </tbody></table>
+
+    <h4>Shown on this phone (last 10)</h4>
+    <p class="note">${escapeHtml(
+      `${receipts.count24h || 0} in the last 24 hours · ${receipts.count || 0} on record${
+        receipts.failed ? ` · ${receipts.failed} could not be displayed` : ""
+      }`,
+    )}</p>
+    ${log}
+
+    <div class="btn-col">
+      <button type="button" class="btn" data-act="al-test">Test this phone</button>
+      <button type="button" class="btn btn-ghost" data-act="al-code">Show pairing code</button>
+      <button type="button" class="btn btn-ghost" data-act="dg-refresh">Check again</button>
+    </div>
+  </div>`;
+}
+
+/**
+ * Plain English, in the order Tom should try them. The first entry is always the one thing that
+ * would fix the current diagnosis.
+ * @param {object} st
+ * @returns {string[]}
+ */
+export function nextSteps(st) {
+  const steps = [];
+  if (!st) return steps;
+  if (st.permission === "denied") {
+    steps.push("iOS Settings → Notifications → Tradewinds → turn Allow Notifications back on, then reopen the app.");
+    return steps;
+  }
+  if (st.endpointChanged || st.serverPaired === false || (st.server && st.server.expired)) {
+    steps.push("Tap “Show pairing code”, Copy, then paste it into GitHub → repo Settings → Secrets → PUSH_SUBSCRIPTIONS (replacing the old entry). That is the whole fix.");
+    steps.push("Wait for the next Alerts run (about 10 minutes) and check this screen again.");
+    return steps;
+  }
+  const receipts = st.receipts || {};
+  const server = st.server || null;
+  if (server && server.lastSentAt && !receipts.lastAt) {
+    steps.push("Tap “Test this phone”. If no notification appears, iOS is blocking them — check Settings → Notifications → Tradewinds (Allow Notifications, Lock Screen, Banners, Sounds).");
+    steps.push("Check Focus modes and Settings → Notifications → Scheduled Summary: Tradewinds must not be in a summary.");
+    steps.push("If the test notification DOES appear, re-pair (Show pairing code → paste into the secret) — the sender is pushing to an address this phone no longer uses.");
+    return steps;
+  }
+  if (receipts.failed) {
+    steps.push("Some pushes arrived but could not be shown. Close and reopen Tradewinds from the Home Screen icon, then tap “Test this phone”.");
+  }
+  if (st.serverPaired === null) {
+    steps.push("The sender's device list could not be read (offline, or the site has not rebuilt yet). Try again when this phone is online.");
+  }
+  return steps;
+}
+
+export function openDiagnoseSheet(e) {
+  env = e || env;
+  const st = store.alerts.status;
+  if (!st) return;
+  openSheet({
+    title: "Alerts diagnosis",
+    body: diagnoseBody(st),
+    onMount(el) {
+      el.addEventListener("click", async (ev) => {
+        const b = ev.target.closest("[data-act]");
+        if (!b) return;
+        if (b.dataset.act === "al-test") { await testThisPhone(); return; }
+        if (b.dataset.act === "al-code") {
+          const p = store.alerts.status && store.alerts.status.pairing;
+          if (p) openPairingSheet(p, env);
+          return;
+        }
+        if (b.dataset.act === "dg-refresh") {
+          try { if (env.svc.clearProbeCache) env.svc.clearProbeCache(); } catch { /* optional */ }
+          await checkAlertsHealth(env);
+          const host = el.querySelector(".diagnose");
+          if (host && store.alerts.status) host.outerHTML = diagnoseBody(store.alerts.status);
+        }
+      });
+    },
+  });
+}
+
+/** The one check that needs no GitHub: can this phone display a notification at all? */
+async function testThisPhone() {
+  try {
+    const result = await Promise.resolve(env.svc.testNotification());
+    if (result && result.ok) {
+      toast("Sent — look for “Tradewinds test” on this phone.");
+      return;
+    }
+    const why = result && result.reason;
+    toast(
+      why === "denied"
+        ? "iOS is blocking notifications for Tradewinds. Settings → Notifications → Tradewinds."
+        : why === "no-service-worker"
+          ? "The app's service worker is not ready — reopen Tradewinds from the Home Screen icon."
+          : "This phone refused to show a notification. Check Settings → Notifications → Tradewinds.",
+      { tone: "warn" },
+    );
+  } catch (err) {
+    console.warn("[alerts] test notification failed", err);
+    toast("Could not raise a test notification.", { tone: "warn" });
+  }
+}
+
 /* ---------------------------------------------------------------- events */
 
 /** @returns {boolean} true when the click belonged to the Alerts card. */
@@ -214,6 +436,8 @@ export function alertsClick(ev, e) {
     return true;
   }
   if (act === "al-disable") { disable(); return true; }
+  if (act === "al-test") { testThisPhone(); return true; }
+  if (act === "al-diagnose") { openDiagnoseSheet(env); return true; }
   if (act === "al-code") {
     const p = store.alerts.status && store.alerts.status.pairing;
     if (p) openPairingSheet(p, env);

@@ -266,14 +266,181 @@ export function waiverChipText(row = {}, now = Date.now()) {
  * @param {{permission?: string, subscribed?: boolean, pairing?: object|null}|null} status
  * @returns {string}
  */
-export function alertsStatusText(status) {
+export function alertsStatusText(status, now = Date.now()) {
   if (!status) return "Checking…";
   if (status.permission === "denied") return "Permission denied";
   if (!status.subscribed || !status.pairing) return "Off";
+  const diagnosed = diagnose(status, now);
+  if (diagnosed) return diagnosed.text;
   const t = toMs(status.pairing.createdAt);
   if (t === null) return "On";
   const d = new Date(t);
   return `On · paired ${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+/* ------------------------------------------------- alerts diagnosis (design §13.3 B2) */
+
+/**
+ * A day of silence is the honest threshold: the job runs every ~10 minutes, so if the sender
+ * says it delivered something yesterday and this phone has no receipt, the pushes are being
+ * dropped between Apple and the Home Screen, not merely delayed.
+ */
+const RECEIPT_LAG_MS = 24 * 3600 * 1000;
+
+const pad2 = (n) => String(n).padStart(2, "0");
+
+/** "8:11 AM" — the phrase design §13.3 spells out for the status line. */
+function clockPhrase(ms) {
+  if (!Number.isFinite(ms)) return "";
+  const d = new Date(ms);
+  const hours = d.getHours();
+  const suffix = hours < 12 ? "AM" : "PM";
+  const hour12 = hours % 12 === 0 ? 12 : hours % 12;
+  return `${hour12}:${pad2(d.getMinutes())} ${suffix}`;
+}
+
+const dayPhrase = (ms) => {
+  const d = new Date(ms);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+};
+
+/**
+ * The one truthful line, plus its tone and (when something is wrong) what to do about it.
+ * Returns null for a status that carries no diagnostics — the pre-§13.3 shape keeps the old
+ * "On · paired 9/9" wording so nothing that renders a cached status starts lying the other way.
+ *
+ * @param {object} status from `alertsStatus()`
+ * @param {number} [now]
+ * @returns {{text: string, tone: "ok"|"warn"|"bad", problem: string|null}|null}
+ */
+function diagnose(status, now = Date.now()) {
+  const receipts = status.receipts || {};
+  const server = status.server || null;
+  // `Number(null)` is 0 and 0 is finite, so the null check has to come first — otherwise a phone
+  // that has never received anything reports "last alert 7:00 PM" (the epoch, in local time).
+  const lastReceiptAt =
+    receipts.lastAt != null && Number.isFinite(Number(receipts.lastAt)) ? Number(receipts.lastAt) : null;
+  const serverSentAt = toMs(server?.lastSentAt ?? server?.lastNotifiedAt);
+  // `probed` is set only by a full `alertsStatus()`. A fast local-only probe (the first Settings
+  // paint) knows nothing about the sender — but it DOES know the endpoint moved, and that alone
+  // is worth shouting about, so case 1 runs either way.
+  const full = status.probed === true;
+
+  // 1. The endpoint moved. Everything the sender pushes now goes to an address nothing reads.
+  if (status.endpointChanged) {
+    const when = toMs(receipts.subscriptionChange?.at);
+    return {
+      text: `This phone's alert address changed${when ? ` on ${dayPhrase(when)}` : ""} — re-pair`,
+      tone: "bad",
+      problem:
+        "This phone re-subscribed, so the alert job is still pushing to the old address. " +
+        "Open Settings → Alerts → Show pairing code and paste the new code into GitHub.",
+    };
+  }
+
+  if (!full) return null;
+
+  // 2. The sender has never heard of this device (or wrote it off after a 410).
+  if (status.serverPaired === false) {
+    return {
+      text: "Subscribed, but NOT paired with the sender — re-pair",
+      tone: "bad",
+      problem:
+        "The alert job's device list does not contain this phone, so nothing is being sent to it. " +
+        "Show the pairing code and paste it into the PUSH_SUBSCRIPTIONS secret.",
+    };
+  }
+  if (server?.expired) {
+    return {
+      text: "The sender marked this phone dead — re-pair",
+      tone: "bad",
+      problem:
+        "Apple rejected the last push to this phone as gone. The pairing code has to be copied " +
+        "into the PUSH_SUBSCRIPTIONS secret again before anything can arrive.",
+    };
+  }
+
+  // 3. No readable receipt log on this phone: report the sender's view and say we cannot confirm.
+  //    Better an admitted blind spot than the old "On" that meant nothing.
+  if (!receipts.source) {
+    if (serverSentAt !== null) {
+      return {
+        text: `On · paired · sender last sent ${clockPhrase(serverSentAt)} · this phone keeps no receipts`,
+        tone: "warn",
+        problem: null,
+      };
+    }
+    return { text: "On · paired · no delivery history on this phone", tone: "warn", problem: null };
+  }
+
+  // 4. Paired, and the sender has delivered — but nothing landed here. iOS is eating them.
+  if (status.serverPaired === true && serverSentAt !== null && (lastReceiptAt === null || lastReceiptAt < serverSentAt - RECEIPT_LAG_MS)) {
+    const sent = server.sentCount != null && Number.isFinite(Number(server.sentCount)) ? `${server.sentCount} ` : "";
+    return {
+      text: `Paired · sender delivered ${sent}alerts, none shown on this phone — check iOS notification settings`,
+      tone: "bad",
+      problem:
+        "The sender says it delivered, but this phone has shown none of them. Check iOS Settings → " +
+        "Notifications → Tradewinds (Allow Notifications, Lock Screen, Banners), then Focus modes " +
+        "and Scheduled Summary. Tap “Test this phone” to prove the phone can display one at all.",
+    };
+  }
+
+  // 5. Some pushes were received but the worker could not show them.
+  if (Number(receipts.failed) > 0 && lastReceiptAt !== null) {
+    return {
+      text: `On · paired · ${receipts.failed} alert${receipts.failed === 1 ? "" : "s"} arrived but could not be shown`,
+      tone: "warn",
+      problem:
+        "Pushes are reaching this phone, but the notification could not be displayed. Reopen the " +
+        "app from the Home Screen icon and check iOS Settings → Notifications → Tradewinds.",
+    };
+  }
+
+  // 6. Working.
+  if (lastReceiptAt !== null) {
+    return { text: `On · paired · last alert ${clockPhrase(lastReceiptAt)}`, tone: "ok", problem: null };
+  }
+  if (status.serverPaired === true) {
+    return { text: "On · paired · nothing sent yet", tone: "ok", problem: null };
+  }
+
+  // 7. We could not ask the sender. Say that, rather than claiming either way.
+  const t = toMs(status.pairing?.createdAt);
+  return {
+    text: `On · paired${t === null ? "" : ` ${dayPhrase(t)}`} · sender not reachable`,
+    tone: "warn",
+    problem: null,
+  };
+}
+
+/**
+ * Tone for the status dot: "bad" when this device cannot receive, "warn" when something is
+ * unverified, "ok" when alerts are demonstrably arriving, "mute" when they are off.
+ * @param {object|null} status
+ * @param {number} [now]
+ * @returns {"ok"|"warn"|"bad"|"mute"}
+ */
+export function alertsStatusTone(status, now = Date.now()) {
+  if (!status) return "mute";
+  if (status.permission === "denied") return "bad";
+  if (!status.subscribed || !status.pairing) return "mute";
+  return diagnose(status, now)?.tone ?? "ok";
+}
+
+/**
+ * The persistent warning the Settings card (and, once WS-A wires it, the app banner) shows.
+ * null when there is nothing wrong — or nothing we can prove is wrong.
+ * @param {object|null} status
+ * @param {number} [now]
+ * @returns {string|null}
+ */
+export function alertsProblem(status, now = Date.now()) {
+  if (!status || !status.subscribed || !status.pairing) return null;
+  if (status.permission === "denied") {
+    return "Notifications are blocked for Tradewinds. Turn them back on in iOS Settings → Notifications → Tradewinds.";
+  }
+  return diagnose(status, now)?.problem ?? null;
 }
 
 /* ---------------------------------------------------------------- advisor (design §12.5) */
