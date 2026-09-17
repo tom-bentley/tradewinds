@@ -69,6 +69,7 @@ export {
 export {
   evaluateTrade,
   finalizeExplanation,
+  rosterLanding,
   cheapestDroppable,
   acceptanceTier,
   edgeBand,
@@ -158,6 +159,7 @@ export {
   resolveNames,
   voice,
   flagText,
+  expectedReturn,
   fmt0,
   fmt1,
   nameOf,

@@ -15,7 +15,10 @@ import {
   edgeBand,
   edgePct,
   evaluateTrade,
+  rosterLanding,
 } from "../src/engine/trade.js";
+import { seasonLineup } from "../src/engine/lineup.js";
+import { sideNames } from "../src/engine/explain.js";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
 // Fixtures load lazily inside a before() hook, never at import time: the pipeline regenerates
@@ -90,7 +93,15 @@ test("evaluateTrade returns the documented TradeResult shape", () => {
     assert.ok("before" in side.lineup && "after" in side.lineup);
     assert.equal(typeof side.lineup.deltaPerWeek, "number");
     assert.equal(typeof side.lineup.deltaPlayoffPerWeek, "number");
-    assert.deepEqual(Object.keys(side.rosterCount).sort(), ["after", "before", "max"]);
+    // §13.4 C2 extends rosterCount with the IR-slot ledger
+    assert.deepEqual(Object.keys(side.rosterCount).sort(), [
+      "after",
+      "before",
+      "irAfter",
+      "irBefore",
+      "irMax",
+      "max",
+    ]);
   }
   for (const k of ["code", "label", "edgePct", "deltaPerWeek", "deltaPlayoffPerWeek", "override", "veto", "acceptance", "acceptLikely"]) {
     assert.ok(k in r.verdict, `verdict is missing ${k}`);
@@ -372,4 +383,289 @@ test("results are deterministic", () => {
   assert.equal(a.verdict.edgePct, b.verdict.edgePct);
   assert.equal(a.verdict.deltaPerWeek, b.verdict.deltaPerWeek);
   assert.deepEqual(a.me.backfill, b.me.backfill);
+});
+
+// --- §13.4 C2 — IR and taxi players in trades -------------------------------------------------
+// Tom's complaint: "players on IR invalidate trades on the analyzer. That should not be the case
+// as there is definitely some value to these players." Sleeper lets you trade a stashed player;
+// the receiver re-parks him if his league allows the status and a slot is free.
+//
+// Every IR fixture below zeroes the stashed player's projections unless the test is specifically
+// about the lineup axis, so WS-D's availability scaling (§13.5 D1) cannot move these numbers.
+
+const HENDERSON = "12529"; // RB, roster 4, Out in the fixture — IR-eligible in Boyball
+const BROWN = "5859"; // WR, roster 4, healthy, a real starter
+const CONNER = "4137"; // RB, unrostered, IR
+const KIRK = "4950"; // WR, unrostered, IR
+
+const clone = (x) => JSON.parse(JSON.stringify(x));
+
+/**
+ * Park `ids` on `rosterId`'s reserve list with `status`, adding them to the roster when they were
+ * not on it. Projections are zeroed by default so the lineup axis reads the same before and after
+ * WS-D lands.
+ */
+function stash(input, rosterId, ids, status, opts = {}) {
+  const zeroProj = opts.zeroProj !== false;
+  const rosters = clone(input.rosters);
+  const row = rosters.find((r) => r.roster_id === rosterId);
+  row.reserve = [...(row.reserve || []), ...ids];
+  const players = { ...input.players, players: { ...input.players.players } };
+  const projections = { ...input.projections, players: { ...input.projections.players } };
+  for (const id of ids) {
+    if (!row.players.includes(id)) row.players.push(id);
+    players.players[id] = { ...players.players[id], inj: status };
+    if (zeroProj) projections.players[id] = new Array(18).fill(0);
+  }
+  return { ...input, rosters, players, projections };
+}
+
+/** The same, for the taxi squad. */
+function onTaxi(input, rosterId, ids) {
+  const rosters = clone(input.rosters);
+  const row = rosters.find((r) => r.roster_id === rosterId);
+  row.taxi = [...(row.taxi || []), ...ids];
+  for (const id of ids) if (!row.players.includes(id)) row.players.push(id);
+  return { ...input, rosters };
+}
+
+/** A copy of the league payload with patched settings. */
+function leagueWith(input, settings) {
+  return { ...input, league: { ...input.league, settings: { ...input.league.settings, ...settings } } };
+}
+
+test("IR: a stashed player can be traded — the deal is no longer invalid (§13.0 row 4)", () => {
+  const c = make({}, stash(INPUT, 3, [REED], "IR"));
+  assert.ok(c.rosters.find((r) => r.rosterId === 3).reserve.includes(REED));
+  assert.ok(!activePlayers(rosterById(c, 3)).includes(REED), "he occupies no roster spot");
+
+  const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
+  assert.notEqual(r.verdict.code, "invalid");
+  assert.doesNotMatch(r.verdict.label, /not on/);
+  assert.ok(!r.flags.some((f) => f.severity === "block"));
+  assert.ok(r.me.valueGive.raw > 0, "his market value is still in the deal");
+
+  // and the same trade from the other side is just as legal
+  const mirror = evaluateTrade(c, { myRosterId: 4, theirRosterId: 3, give: [WORTHY], get: [REED] });
+  assert.notEqual(mirror.verdict.code, "invalid");
+
+  // a player who really is somewhere else is still rejected, in the new wording
+  const bogus = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [ADAMS], get: [WORTHY] });
+  assert.equal(bogus.verdict.code, "invalid");
+  assert.match(bogus.verdict.label, /Davante Adams is not on your roster\./);
+});
+
+test("IR: giving away a stashed player frees an IR slot, not a roster spot", () => {
+  const c = make({}, stash(INPUT, 3, [REED], "IR"));
+  const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
+  assert.deepEqual(r.me.rosterCount, {
+    before: 16, // 17 rostered, 1 parked
+    after: 17, // the healthy WR takes the freed spot
+    max: 17,
+    irBefore: 1,
+    irAfter: 0,
+    irMax: 2,
+  });
+  assert.notEqual(r.verdict.code, "needs_drop", "17 of 17 is legal");
+  assert.deepEqual(r.me.gaveFromIr, [REED]);
+  assert.equal(r.me.backfill.length, 0, "no roster spot was freed, so nothing is signed");
+});
+
+test("IR: a received IR-eligible player lands on IR when a slot is free", () => {
+  // Henderson is Out in the fixture and Boyball runs reserve_allow_out 1
+  const r = evaluateTrade(ctx, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [HENDERSON] });
+  assert.equal(r.me.rosterCount.before, 17);
+  assert.equal(r.me.rosterCount.after, 16, "he parks on IR, so the roster spot stays open");
+  assert.equal(r.me.rosterCount.irBefore, 0);
+  assert.equal(r.me.rosterCount.irAfter, 1);
+  assert.equal(r.me.rosterCount.irMax, 2);
+  assert.ok(r.me.irIds.includes(HENDERSON));
+  assert.ok(!r.me.spotIds.includes(HENDERSON));
+  assert.ok(r.me.afterIds.includes(HENDERSON), "he is still part of the team's season");
+  assert.equal(r.me.backfill.length, 1, "the freed spot is filled from the wire");
+
+  const flag = r.flags.find((f) => f.type === "ir_slot" && f.id === HENDERSON);
+  assert.ok(flag && flag.severity === "info" && flag.ir === true && flag.side === "me");
+  assert.match(flag.text, /TreVeyon Henderson can go straight to your IR — 1 of 2 slots used\./);
+  assert.ok(r.reasons.some((line) => line.text === flag.text), "the sentence reaches the explanation");
+
+  // their side loses an active body rather than an IR occupant
+  assert.equal(r.them.rosterCount.irBefore, 0, "Sleeper has him on the active roster over there");
+  assert.equal(r.them.rosterCount.after, 17);
+});
+
+test("IR: with every slot taken he takes a bench spot, and a full roster needs a drop", () => {
+  // roster 3 with 17 spots used AND both IR slots occupied
+  const full = make({}, stash(INPUT, 3, [CONNER, KIRK], "IR"));
+  assert.equal(activePlayers(rosterById(full, 3)).length, 17);
+
+  const r = evaluateTrade(full, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [HENDERSON, WORTHY] });
+  assert.equal(r.me.rosterCount.irBefore, 2);
+  assert.equal(r.me.rosterCount.irAfter, 2, "no room left, so nobody new parks");
+  assert.equal(r.me.rosterCount.after, 18, "both arrivals take bench spots");
+  assert.equal(r.verdict.code, "needs_drop");
+  assert.ok(r.me.dropSuggestion);
+  assert.ok(!r.me.irIds.includes(r.me.dropSuggestion), "the drop frees a roster spot, not an IR slot");
+
+  const flag = r.flags.find((f) => f.type === "ir_slot" && f.id === HENDERSON);
+  assert.ok(flag && flag.severity === "warn" && flag.ir === false && flag.reason === "full");
+  assert.match(flag.text, /No IR slot for TreVeyon Henderson — all 2 of your are full/);
+
+  // the identical trade with the IR slots empty absorbs him for free
+  const open = evaluateTrade(ctx, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [HENDERSON, WORTHY] });
+  assert.equal(open.me.rosterCount.irAfter, 1);
+  assert.equal(open.me.rosterCount.after, 17, "only the healthy WR needs a spot");
+  assert.notEqual(open.verdict.code, "needs_drop");
+});
+
+test("IR: an Out player parks only where reserve_allow_out says he may", () => {
+  const strict = make({}, leagueWith(INPUT, { reserve_allow_out: 0 }));
+  assert.equal(strict.league.reserveAllow.out, false);
+  const r = evaluateTrade(strict, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [HENDERSON] });
+  assert.equal(r.me.rosterCount.irAfter, 0, "this league cannot stash Out");
+  assert.equal(r.me.rosterCount.after, 17, "so he takes the roster spot the WR vacated");
+  const flag = r.flags.find((f) => f.type === "ir_slot" && f.id === HENDERSON);
+  assert.ok(flag && flag.severity === "warn" && flag.reason === "status");
+  assert.match(flag.text, /TreVeyon Henderson is Out — this league cannot park that on IR/);
+
+  // a league with no reserve slots at all says so plainly
+  const none = make({}, leagueWith(INPUT, { reserve_slots: 0 }));
+  const r2 = evaluateTrade(none, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [HENDERSON] });
+  assert.equal(r2.me.rosterCount.irMax, 0);
+  assert.equal(r2.me.rosterCount.after, 17);
+  const flag2 = r2.flags.find((f) => f.type === "ir_slot" && f.id === HENDERSON);
+  assert.match(flag2.text, /This league has no IR slots, so TreVeyon Henderson takes a bench spot\./);
+
+  // a Doubtful arrival is never IR-eligible in Boyball (reserve_allow_doubtful 0)
+  const doubtful = make(
+    {},
+    {
+      ...INPUT,
+      players: {
+        ...INPUT.players,
+        players: { ...INPUT.players.players, [WORTHY]: { ...INPUT.players.players[WORTHY], inj: "Doubtful" } },
+      },
+    }
+  );
+  const r3 = evaluateTrade(doubtful, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
+  assert.equal(r3.me.rosterCount.irAfter, 0);
+  assert.equal(r3.me.rosterCount.after, 17);
+});
+
+test("taxi: a stashed rookie is tradeable and costs a taxi spot, not a roster spot", () => {
+  const c = make({}, onTaxi(INPUT, 3, [REED]));
+  assert.ok(!activePlayers(rosterById(c, 3)).includes(REED));
+  const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
+  assert.notEqual(r.verdict.code, "invalid");
+  assert.equal(r.me.rosterCount.before, 16);
+  assert.equal(r.me.rosterCount.after, 17, "the arrival takes a roster spot; the taxi spot is freed");
+  assert.equal(r.me.rosterCount.irAfter, 0, "a taxi player never came off IR");
+  assert.ok(!r.me.afterIds.includes(REED));
+});
+
+test("IR: rosterLanding places receipts in proposal order, first come first parked", () => {
+  const two = make({}, stash(INPUT, 4, [ADAMS, BROWN], "IR"));
+  const one = rosterLanding(two, 3, [], [ADAMS, BROWN]);
+  assert.equal(one.irMax, 2);
+  assert.deepEqual(
+    one.landing.map((x) => [x.id, x.ir]),
+    [
+      [ADAMS, true],
+      [BROWN, true],
+    ]
+  );
+  const oneSlot = make({}, leagueWith(stash(INPUT, 4, [ADAMS, BROWN], "IR"), { reserve_slots: 1 }));
+  const tight = rosterLanding(oneSlot, 3, [], [ADAMS, BROWN]);
+  assert.deepEqual(
+    tight.landing.map((x) => [x.id, x.ir]),
+    [
+      [ADAMS, true],
+      [BROWN, false],
+    ],
+    "one slot, so the second arrival takes a bench spot"
+  );
+  assert.equal(tight.after, 18, "17 spots plus the body that could not park");
+});
+
+test("IR: the injury haircut is the only discount on a stashed player's market value", () => {
+  const c = make({}, stash(INPUT, 3, [REED], "IR"));
+  const mv = marketValue(c, REED);
+  assert.equal(c.players.get(REED).inj, "IR");
+  assert.ok(Math.abs(mv.mAdj - mv.m * (1 - c.settings.injuryDiscount.IR)) < 1e-9, "mAdj = m × (1 − 0.35)");
+
+  const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
+  assert.ok(Math.abs(r.me.valueGive.raw - mv.mAdj) < 1e-9, "sideValue.raw is Σ mAdj — haircut included");
+  assert.ok(Math.abs(r.me.valueGive.surplus - surplus(c, REED)) < 1e-9);
+
+  // the same roster with the same (zeroed) projections and no status: only δ changes, and the
+  // market price underneath it is untouched
+  const healthyCtx = make({}, stash(INPUT, 3, [REED], null));
+  const healthy = marketValue(healthyCtx, REED);
+  assert.equal(healthyCtx.players.get(REED).inj, null);
+  assert.ok(Math.abs(healthy.m - mv.m) < 1e-9, "the market price itself is untouched");
+  assert.ok(Math.abs(mv.mAdj - healthy.mAdj * (1 - c.settings.injuryDiscount.IR)) < 1e-9);
+  assert.ok(healthy.mAdj > mv.mAdj, "the stash is discounted, not repriced");
+});
+
+test("IR: a stashed player counts on his own team's before-lineup — no free lunch", () => {
+  // Out, projections intact: WS-D scales his weeks by P(available), which is 1 again by week 5,
+  // so this identity holds before and after §13.5 D1 lands.
+  const c = make({}, stash(INPUT, 4, [BROWN], "Out", { zeroProj: false }));
+  const theirs = rosterById(c, 4);
+  const pool = [...activePlayers(theirs), ...theirs.reserve];
+  const withStash = seasonLineup(c, pool).total;
+  const withoutStash = seasonLineup(c, activePlayers(theirs)).total;
+  assert.ok(withStash > withoutStash, "he really does score points for them");
+
+  const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [BROWN] });
+  assert.equal(r.them.lineup.before.total, withStash, "their baseline includes the man on IR");
+  assert.ok(r.me.afterIds.includes(BROWN), "and mine counts him once he is mine");
+  // whatever he is worth to a lineup, he is worth it to exactly one of the two teams
+  assert.ok(r.them.lineup.after.total < r.them.lineup.before.total || r.them.backfill.length > 0);
+});
+
+test("IR: the third-person voice is unchanged when a stashed player changes hands", () => {
+  const c = make({}, stash(INPUT, 1, [CONNER], "IR"));
+  const names = sideNames(c, 1, 4);
+  assert.equal(names.first, false);
+  const r = evaluateTrade(c, { myRosterId: 1, theirRosterId: 4, give: [CONNER], get: [WORTHY] }, { names });
+  assert.notEqual(r.verdict.code, "invalid");
+  const flag = r.flags.find((f) => f.type === "ir_slot");
+  for (const text of [r.verdict.label, r.headline, ...r.reasons.map((l) => l.text), flag ? flag.text : ""]) {
+    assert.doesNotMatch(String(text), /\b[Yy]ou(r)?\b/, `second person leaked into: ${text}`);
+  }
+  assert.ok(r.reasons.some((l) => l.text.includes(names.a) || l.text.includes(names.b)));
+});
+
+test("IR: the injury flag says how long he is out (§13.4 C4)", () => {
+  const c = make({}, stash(INPUT, 3, [REED], "IR"));
+  const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
+  const inj = r.flags.find((f) => f.type === "injury" && f.id === REED);
+  assert.ok(inj);
+  assert.match(inj.text, /Jayden Reed is IR — expected (back ~week \d+|out for the season)\./);
+
+  // a season-ending body part says so instead of naming a week
+  const torn = make(
+    {},
+    {
+      ...INPUT,
+      players: {
+        ...INPUT.players,
+        players: {
+          ...INPUT.players.players,
+          [REED]: { ...INPUT.players.players[REED], inj: "IR", injPart: "Knee", injNotes: "Torn ACL" },
+        },
+      },
+    }
+  );
+  const r2 = evaluateTrade(torn, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
+  const inj2 = r2.flags.find((f) => f.type === "injury" && f.id === REED);
+  assert.match(inj2.text, /Jayden Reed is IR — expected out for the season\./);
+
+  // a Questionable player is expected to play, so he gets no return date
+  const q = evaluateTrade(ctx, { myRosterId: 3, theirRosterId: 4, give: ["6801"], get: [ADAMS] }).flags.find(
+    (f) => f.type === "injury" && f.id === "6801"
+  );
+  assert.ok(q);
+  assert.equal(q.text, "Tee Higgins is Questionable.");
 });

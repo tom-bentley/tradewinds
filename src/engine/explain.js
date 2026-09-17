@@ -8,6 +8,8 @@
 
 import { playerOf, rosterById } from "./context.js";
 import { marketValue, waiverReplacement } from "./values.js";
+import { isBye } from "./lineup.js";
+import { SEASON_GAMES, absenceOf } from "./injuries.js";
 
 /** A 30-day FantasyCalc move this large is worth calling out in the explanation. */
 export const TREND_FLAG = 400;
@@ -190,6 +192,44 @@ function badge(ctx, id) {
 }
 
 /**
+ * The week this player is expected back, from the injury-duration table (§12.2). `absence.mean`
+ * counts GAMES missed from `ctx.week` inclusive, so a bye in between pushes the date out a week.
+ * @param {object} ctx
+ * @param {string} id
+ * @returns {{week:number|null, seasonOver:boolean, games:number}} week = null when the estimate is
+ *   "he plays this week" or runs past the last scoring week
+ */
+export function expectedReturn(ctx, id) {
+  const p = playerOf(ctx, id);
+  const absence = absenceOf(ctx, p);
+  const games = absence.mean;
+  if (absence.seasonOver || games >= SEASON_GAMES) return { week: null, seasonOver: true, games };
+  let remaining = Math.round(games);
+  if (remaining <= 0) return { week: null, seasonOver: false, games };
+  for (let w = ctx.week; w <= ctx.lastWeek; w += 1) {
+    if (!isBye(ctx, id, w)) remaining -= 1;
+    if (remaining <= 0) return { week: w + 1 <= ctx.lastWeek ? w + 1 : null, seasonOver: false, games };
+  }
+  return { week: null, seasonOver: false, games };
+}
+
+/**
+ * "Tee Higgins is Questionable." / "James Conner is IR — expected back ~week 6." — the status,
+ * plus what the duration table says it costs (§13.4 C4).
+ * @param {object} ctx
+ * @param {string} id
+ * @param {string} status
+ * @returns {string}
+ */
+function injuryText(ctx, id, status) {
+  const base = `${nameOf(ctx, id)} is ${status}`;
+  const back = expectedReturn(ctx, id);
+  if (back.seasonOver) return `${base} — expected out for the season.`;
+  if (back.week != null) return `${base} — expected back ~week ${back.week}.`;
+  return `${base}.`;
+}
+
+/**
  * Text for one flag, by type. Used by trade.js so flags and reasons speak the same language.
  * @param {object} ctx
  * @param {{type:string, [k:string]:any}} flag
@@ -218,7 +258,22 @@ export function flagText(ctx, flag, names) {
       return `${who} ${nameOf(ctx, flag.drop)} — ${whose} roster would hold ${flag.count} of ${flag.max}.`;
     }
     case "injury":
-      return `${nameOf(ctx, flag.id)} is ${flag.status}.`;
+      return injuryText(ctx, flag.id, flag.status);
+    case "ir_slot": {
+      const theirs = flag.side === "them";
+      const whose = theirs ? v.bPossLower : v.aPossLower;
+      if (flag.ir) {
+        return `${nameOf(ctx, flag.id)} can go straight to ${whose} IR — ${flag.used} of ${flag.max} slots used.`;
+      }
+      if (flag.reason === "status") {
+        return (
+          `${nameOf(ctx, flag.id)} is ${flag.status} — this league cannot park that on IR, ` +
+          `so he takes a bench spot.`
+        );
+      }
+      if (!flag.max) return `This league has no IR slots, so ${nameOf(ctx, flag.id)} takes a bench spot.`;
+      return `No IR slot for ${nameOf(ctx, flag.id)} — all ${flag.max} of ${whose} are full, so he takes a bench spot.`;
+    }
     case "bye":
       return `${nameOf(ctx, flag.id)} is on bye in week ${flag.week}.`;
     case "coverage":
@@ -333,7 +388,9 @@ export function explain(ctx, result, opts = {}) {
   // RISK — one line per non-block flag that names a player
   for (const flag of result.flags || []) {
     if (flag.severity === "block") continue;
-    if (!["injury", "free_elsewhere", "trend", "bye", "coverage", "unsettled"].includes(flag.type)) continue;
+    if (!["injury", "ir_slot", "free_elsewhere", "trend", "bye", "coverage", "unsettled"].includes(flag.type)) {
+      continue;
+    }
     lines.push({ kind: "risk", text: flagText(ctx, flag, names) });
   }
 
