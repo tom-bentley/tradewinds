@@ -96,6 +96,8 @@ function paint() {
  * @param {string} id
  * @param {object} [e] view env (defaults to the one Players was mounted with)
  */
+// Wave 2 (design §13.8 step 2): floor / ceiling / durability from `playerRisk(ctx, id)` join the
+// KPI row below once services.js exposes risk.js.
 export function openPlayerSheet(id, e = env) {
   const svc = (e || env).svc;
   const ctx = store.ctx;

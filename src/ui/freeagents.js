@@ -136,6 +136,8 @@ function statusChip(row) {
   return `<span class="schip ${waivers ? "schip-wv" : "schip-free"}">${escapeHtml(waiverChipText(row))}</span>`;
 }
 
+// Wave 2 (design §13.8 step 2): the stat row gains the WS-D score components the engine will
+// put on each row (`insurancePerWeek`, `riskPenalty`, `consensusGap`) — they do not exist yet.
 function card(env, row, i) {
   const ctx = store.ctx;
   const p = ctx.players.get(row.add) || { name: row.add, pos: "", team: "" };

@@ -2,7 +2,7 @@
 
 import { store, set, setIn, subscribe } from "./store.js";
 import { services, MOCK, ServicesError, isSetupRequired, stripDeepLink } from "./services.js";
-import { toast, closeTopSheet, closeAllSheets, syncThemeColor } from "./components.js";
+import { toast, closeTopSheet, closeAllSheets, syncThemeColor, keyboardState } from "./components.js";
 import { escapeHtml, clockTime, relTime, clip } from "./format.js";
 import { APP_NAME } from "../config.js";
 
@@ -203,6 +203,47 @@ function installForegroundRefresh() {
   window.addEventListener("focus", maybeRefreshOnForeground);
   window.addEventListener("pageshow", maybeRefreshOnForeground);
   window.addEventListener("online", maybeRefreshOnForeground);
+}
+
+/* ----------------------------------------------------- keyboard / viewport guard (§13.2 A1)
+   The shell is `position: fixed`, so nothing in the document is meant to scroll. iOS does it
+   anyway: focusing an input scrolls the DOCUMENT to reveal the field, and after the keyboard
+   closes the page can stay scrolled — which drags the whole app up and leaves a strip of
+   background under the tab bar. Two rules fix it for good:
+     1. any document scroll is spurious → put it back to 0 (on focusout, on a visualViewport
+        resize, and once an orientation change has settled);
+     2. while the keyboard is up, `html.kb-open` slides the tab bar out, so the shrunken
+        viewport goes to the field being typed in rather than to navigation the keyboard is
+        covering anyway.
+   Nothing here is exported: this is shell behaviour, not an API. */
+
+function unscroll() {
+  if (window.scrollY !== 0 || window.scrollX !== 0) window.scrollTo(0, 0);
+}
+
+function installKeyboardGuard() {
+  const vv = window.visualViewport || null;
+  const root = document.documentElement;
+
+  const apply = () => {
+    const open = keyboardState(vv ? vv.height : window.innerHeight, window.innerHeight);
+    root.classList.toggle("kb-open", open);
+    // While the keyboard animates open iOS keeps nudging the document, and fighting every
+    // frame of that just causes jitter — so we only insist once it is closing or settled.
+    if (!open) unscroll();
+  };
+
+  // focusout fires before iOS has finished putting the keyboard away, hence the three passes.
+  document.addEventListener("focusout", () => {
+    unscroll();
+    requestAnimationFrame(() => { apply(); unscroll(); });
+    setTimeout(() => { apply(); unscroll(); }, 180);
+  });
+  document.addEventListener("focusin", apply);
+  if (vv) vv.addEventListener("resize", () => { apply(); unscroll(); });
+  window.addEventListener("orientationchange", () => setTimeout(() => { apply(); unscroll(); }, 200));
+  window.addEventListener("pageshow", () => { apply(); unscroll(); });
+  apply();
 }
 
 /* ======================================================== transactions + new trades
@@ -555,3 +596,6 @@ function offerUpdate(reg) {
 
 $("btn-refresh").addEventListener("click", refresh);
 subscribe((_, reason) => { if (reason === "refresh" || reason === "reload") paintHeader(); });
+// Installed outside the boot path on purpose: onboarding is the screen with the most typing
+// in it, and it renders before (and sometimes instead of) a successful load.
+installKeyboardGuard();

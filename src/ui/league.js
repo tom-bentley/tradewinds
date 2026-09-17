@@ -54,6 +54,9 @@ function standings() {
 
 /* ---------------------------------------------------------------- roster sheet */
 
+// Wave 2 (design §13.8 step 2): once the orchestrator exposes risk.js through services.js,
+// this sheet's KPI row gains starter share + fragility + band from `rosterRisk(ctx, r.players)`.
+// Nothing is stubbed here on purpose — the call does not exist in this worktree yet.
 function rosterSheet(rosterId) {
   const ctx = store.ctx;
   const r = ctx.rosters.find((x) => x.rosterId === rosterId);

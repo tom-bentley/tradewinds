@@ -12,7 +12,8 @@
   --theirs-soft: rgba(245, 158, 11, .13); --loss: #FB7185; --loss-dim: #FDA4AF; --loss-soft: rgba(251, 113, 133, .13);
   --ok: #34D399; --r-card: 14px; --r-row: 10px; --r-pill: 999px; --safe-t: env(safe-area-inset-top, 0px);
   --safe-b: env(safe-area-inset-bottom, 0px); --safe-l: env(safe-area-inset-left, 0px);
-  --safe-r: env(safe-area-inset-right, 0px); --pad: 12px; --tabh: 54px; --font: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, Roboto, sans-serif;
+  --safe-r: env(safe-area-inset-right, 0px); --pad: 12px; --tabh: 54px; --app-w: 560px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, Roboto, sans-serif;
 }
 
 /* Light palette: chosen explicitly in Settings, or inherited from the phone when set to
@@ -42,7 +43,11 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 
-html, body { margin: 0; padding: 0; }
+/* The document itself never scrolls and is never taller than the viewport: the app is a fixed
+   shell and the ONLY scroll container is #main (plus sheet bodies). That is what keeps the tab
+   bar welded to the bottom edge on iOS — a `100dvh` box in a scrollable document drifts as soon
+   as the keyboard-avoidance scroll or the Safari toolbar changes the viewport (design §13.2 A1). */
+html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
 
 body {
   background: var(--bg);
@@ -85,15 +90,21 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 
 /* ------------------------------------------------------------------ shell */
 
+/* `position: fixed` puts the shell in the viewport's coordinate space instead of the
+   document's, so a stray document scroll (iOS keyboard avoidance) cannot move it, and its
+   height follows the browser's visible area without depending on `dvh` resolving mid-gesture.
+   inset:0 + max-width + auto inline margins still centres it (CSS 2.1 §10.3.7). */
 #app {
+  position: fixed;
+  inset: 0;
+  height: 100%;
   display: grid;
   grid-template-rows: auto auto 1fr auto;
-  height: 100vh;
-  height: 100dvh;
-  max-width: 560px;
+  max-width: var(--app-w);
   margin-inline: auto;
   padding-left: var(--safe-l);
   padding-right: var(--safe-r);
+  overflow: hidden;
 }
 
 #hdr { padding: calc(var(--safe-t) + 9px) var(--pad) 7px; background: var(--bg); border-bottom: 1px solid var(--line-soft); }
@@ -134,10 +145,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .banner-bad { background: var(--loss-soft); color: var(--loss-dim); }
 .banner-warn { background: var(--theirs-soft); color: var(--theirs); }
 
-#main { overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 0 var(--pad); }
+/* min-height:0 lets the 1fr row actually shrink; without it a grid item's automatic minimum
+   size is its content, which pushes the tab bar off the bottom of a short viewport. */
+#main { min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 0 var(--pad); }
 .view { padding-bottom: 18px; }
 
-#tabs { display: grid; grid-template-columns: repeat(5, 1fr); background: var(--surface); border-top: 1px solid var(--line); padding-bottom: var(--safe-b); }
+#tabs {
+  display: grid; grid-template-columns: repeat(5, 1fr);
+  background: var(--surface); border-top: 1px solid var(--line);
+  padding-bottom: max(var(--safe-b), 0px);
+  transition: transform .18s ease-out;
+}
 #tabs a {
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
   min-height: var(--tabh); text-decoration: none; color: var(--ink-3); font-size: 14px; letter-spacing: -.01em;
@@ -146,6 +164,18 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 #tabs svg { width: 21px; height: 21px; }
 #tabs a.is-on { color: var(--mine); border-top-color: var(--mine); }
 #tabs a:active { background: var(--surface2); }
+
+/* While the on-screen keyboard is up (app.js sets the class off visualViewport) the tab bar
+   leaves the flow and slides out, so the shrunken viewport goes to the field being typed in
+   rather than to navigation the keyboard is covering anyway. */
+html.kb-open #tabs { position: absolute; left: 0; right: 0; bottom: 0; transform: translateY(100%); }
+html.kb-open #sheet-host { bottom: 0; }
+html.kb-open #toasts { bottom: calc(var(--safe-b) + 12px); }
+
+/* Tablet and desktop: one wider column, and the sheets follow it. */
+@media (min-width: 700px) {
+  :root { --app-w: 720px; --pad: 16px; }
+}
 
 /* ------------------------------------------------------------------ primitives */
 
@@ -245,6 +275,10 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
   padding: 4px 8px 3px; border-bottom: 1px solid var(--line-soft); margin-bottom: 3px;
 }
 .pgroup-n { font-weight: 500; font-variant-numeric: tabular-nums; }
+/* IR / taxi stashes: same rows, dashed rule and a dimmed name so "parked" reads at a glance
+   without spending a colour (colour is reserved for the two trade sides). */
+.pgroup-park .pgroup-h { border-bottom-style: dashed; }
+.pgroup-park .prow-name { color: var(--ink-2); }
 
 .owner { margin-left: 8px; color: var(--ink-3); }
 .owner-free { color: var(--mine); }
@@ -265,25 +299,59 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .rival.is-on { color: var(--ink); }
 .rival.is-on .av { border-color: var(--mine); }
 
-.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 6px; }
+/* --vbar-h is measured by analyze.js (ResizeObserver) so the last row of either column can
+   always be scrolled clear of the verdict bar — the bar is never allowed to hide a pick. */
+.analyze { --vbar-h: 56px; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 6px; padding-bottom: calc(var(--vbar-h) + 12px); }
 .col { min-width: 0; }
 .col-r { border-left: 1px solid var(--line-soft); padding-left: 6px; }
 .col-h { font-size: 15px; font-weight: 700; letter-spacing: -.01em; padding: 2px 0 0 2px; }
 .col-sub { font-size: 14px; color: var(--ink-3); padding: 0 0 8px 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .col-empty { font-size: 14px; color: var(--ink-3); padding: 10px 8px; }
 
+/* ---- verdict bar (design §13.2 A2): one row, 56 px, always on screen ---- */
+
 .vpanel {
   position: sticky; bottom: 0; z-index: 4;
-  margin: 14px calc(var(--pad) * -1) 0;
+  margin: 0 calc(var(--pad) * -1);
   border-top: 1px solid var(--line);
   background: var(--surface);
   box-shadow: 0 -16px 34px -22px rgba(0, 0, 0, .95);
 }
-.vp { padding: 10px var(--pad) 12px; max-height: 54dvh; overflow-y: auto; }
-.vp-msg { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 56px; }
-.vp-hint { font-size: 14px; color: var(--ink-2); }
-.vp-count { font-size: 14px; color: var(--ink-3); white-space: nowrap; }
+.vbar { position: relative; display: flex; align-items: center; min-height: 56px; }
+/* The verdict tone as a hairline, not as a wash: the bar still has to read as chrome. */
+.vbar[data-tone]::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; background: currentColor; opacity: .55; }
+.vbar[data-tone="even"]::before { opacity: .2; }
+.vbar-hit {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 9px;
+  min-height: 56px; padding: 0 2px 0 var(--pad);
+  background: none; border: 0; color: var(--ink); text-align: left; cursor: pointer;
+}
+.vbar-hit:active { background: var(--surface2); }
+.vbar-word { flex: none; font-size: 17px; font-weight: 800; letter-spacing: -.025em; white-space: nowrap; }
+.vbar-nums { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
+.vbar-n { font-size: 16px; font-weight: 700; letter-spacing: -.012em; }
+.vbar-u { font-size: 14px; font-weight: 500; color: var(--ink-3); margin-left: 3px; }
+.vbar-acc { display: flex; align-items: center; min-width: 0; font-size: 14px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vbar-acc .dot { flex: none; }
+.vbar-acc.yes { color: var(--mine); }
+.vbar-acc.yes .dot { background: var(--mine); }
+.vbar-acc.maybe { color: var(--theirs); }
+.vbar-acc.maybe .dot { background: var(--theirs); }
+.vbar-why { min-width: 0; font-size: 14px; color: var(--theirs); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vbar-more { flex: none; margin-left: auto; display: flex; align-items: center; gap: 1px; padding-left: 6px; font-size: 14px; font-weight: 650; color: var(--ink-2); }
+.vbar-chev { font-size: 17px; line-height: 1; color: var(--ink-3); }
+.vbar-x { flex: none; display: grid; place-items: center; width: 44px; height: 44px; margin-right: 2px; background: none; border: 0; border-radius: 50%; color: var(--ink-3); cursor: pointer; }
+.vbar-x:active { background: var(--surface2); }
+.vbar-x .ic { width: 16px; height: 16px; }
+.vbar-msg { justify-content: space-between; gap: 10px; padding: 0 4px 0 var(--pad); }
+.vbar-msg .vbar-x { margin-right: -2px; }
+.vbar-hint { min-width: 0; font-size: 14px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vbar-count { flex: none; font-size: 14px; color: var(--ink-3); white-space: nowrap; padding-right: 8px; }
 
+/* ---- the same verdict, in full, inside the Details sheet ---- */
+
+.vp { padding-top: 2px; }
 .vp-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .verdict-word { font-size: 30px; font-weight: 800; letter-spacing: -.032em; line-height: 1.05; }
 .vp-accept { font-size: 14px; text-align: right; flex: none; max-width: 42%; }
@@ -324,7 +392,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .flag-warn { background: var(--theirs-soft); color: var(--theirs); }
 
 .vp-head { font-size: 14px; color: var(--ink-2); line-height: 1.4; margin: 8px 0 10px; }
-.vp-acts { display: flex; gap: 8px; }
+.vp-acts { display: flex; gap: 8px; margin-top: 14px; }
 .vp-acts .btn { flex: 1; min-height: 44px; padding: 0 8px; font-size: 14px; }
 
 .vp-det { border-top: 1px solid var(--line-soft); margin-top: 12px; padding-top: 10px; }
@@ -449,7 +517,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 .sheet-wrap { position: absolute; inset: 0; display: flex; align-items: flex-end; justify-content: center; }
 .sheet-scrim { position: absolute; inset: 0; background: rgba(2, 6, 16, .66); }
 .sheet {
-  position: relative; width: 100%; max-width: 560px; max-height: 88dvh;
+  position: relative; width: 100%; max-width: var(--app-w); max-height: 88%;
   display: flex; flex-direction: column;
   background: var(--surface); border-top: 1px solid var(--line);
   border-radius: 20px 20px 0 0; animation: rise .22s cubic-bezier(.2, .7, .3, 1);
@@ -631,6 +699,19 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
   .stats { gap: 11px; }
   .verdict-word { font-size: 26px; }
   .rival { width: 56px; }
+}
+
+/* Landscape phones: ~390 px of height has to carry the header, a usable scroller and the tab
+   bar, so the chrome gets shorter rather than the content getting cut off. */
+@media (orientation: landscape) and (max-height: 460px) {
+  :root { --tabh: 44px; }
+  #hdr { padding-top: calc(var(--safe-t) + 5px); padding-bottom: 5px; }
+  .rail { margin-top: 5px; }
+  #tabs a { flex-direction: row; gap: 6px; }
+  #tabs svg { width: 18px; height: 18px; }
+  .rivals { padding: 6px 0 2px; }
+  .rival { min-height: 58px; }
+  .vbar, .vbar-hit { min-height: 48px; }
 }
 
 /* ================================================================== v1.2 — free agents */
