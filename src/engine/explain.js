@@ -192,8 +192,13 @@ function badge(ctx, id) {
 }
 
 /**
- * The week this player is expected back, from the injury-duration table (§12.2). `absence.mean`
- * counts GAMES missed from `ctx.week` inclusive, so a bye in between pushes the date out a week.
+ * The week this player is expected back, from the injury-duration table (§12.2). Games are counted
+ * from `ctx.week` INCLUSIVE, so a bye in between pushes the date out a week.
+ *
+ * The statistic is the MEDIAN branch, not `absence.mean`: every reserve-list distribution carries
+ * a season-ending tail (`SEASON_GAMES` = 99), and a 10 % chance of that drags the mean of a
+ * four-to-eight-week injury past the end of the season. The median is what a manager means by
+ * "when is he back".
  * @param {object} ctx
  * @param {string} id
  * @returns {{week:number|null, seasonOver:boolean, games:number}} week = null when the estimate is
@@ -202,7 +207,13 @@ function badge(ctx, id) {
 export function expectedReturn(ctx, id) {
   const p = playerOf(ctx, id);
   const absence = absenceOf(ctx, p);
-  const games = absence.mean;
+  let games = 0;
+  let cumulative = 0;
+  for (const branch of absence.branches || []) {
+    games = branch.games;
+    cumulative += branch.p;
+    if (cumulative >= 0.5) break;
+  }
   if (absence.seasonOver || games >= SEASON_GAMES) return { week: null, seasonOver: true, games };
   let remaining = Math.round(games);
   if (remaining <= 0) return { week: null, seasonOver: false, games };
@@ -372,6 +383,27 @@ export function explain(ctx, result, opts = {}) {
         });
       }
     }
+  }
+
+  // IR — an arrival who parks on a reserve slot frees a bench spot the body count alone does not
+  // explain, so say where the spot went and who fills it (§13.4 C2/C4).
+  const counts = me.rosterCount || {};
+  const freedSpots = (Number(counts.before) || 0) - (Number(counts.after) || 0);
+  const bodySpots = result.give.length - result.get.length;
+  if (freedSpots > bodySpots) {
+    const parked = (me.irLanding || []).filter((entry) => entry.ir);
+    const extra = freedSpots - bodySpots;
+    const filler = (me.backfillDetail || []).slice(-extra)[0] || null;
+    lines.push({
+      kind: "ir_spot",
+      text:
+        `${parked.length ? namesOf(ctx, parked.map((entry) => entry.id)) : "The arrival"} ` +
+        `${parked.length === 1 ? "goes" : "go"} straight to IR, so ${v.aPossLower} roster lands at ` +
+        `${counts.after} of ${counts.max}` +
+        (filler
+          ? ` and ${nameOf(ctx, filler.id)} fills the freed bench spot.`
+          : ` with ${extra} bench spot${extra === 1 ? "" : "s"} open.`),
+    });
   }
 
   // LINEUP — "starters" is plural in both voices, so the verb never takes an -s here

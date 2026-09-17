@@ -642,7 +642,11 @@ test("IR: the injury flag says how long he is out (§13.4 C4)", () => {
   const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
   const inj = r.flags.find((f) => f.type === "injury" && f.id === REED);
   assert.ok(inj);
-  assert.match(inj.text, /Jayden Reed is IR — expected (back ~week \d+|out for the season)\./);
+  // Hand-checked: IR with no body part is the irMin4 row {4:.4, 6:.3, 8:.2, season:.1}, whose
+  // MEDIAN is 6 games. The fixture sits in week 1 and his bye is week 11, so weeks 1-6 are six
+  // real games missed and week 7 is the first he plays. (The MEAN of that row is 14.9 games —
+  // the 10 % season-ending tail alone — which is why the median is the statistic used.)
+  assert.equal(inj.text, "Jayden Reed is IR — expected back ~week 7.");
 
   // a season-ending body part says so instead of naming a week
   const torn = make(
@@ -668,4 +672,27 @@ test("IR: the injury flag says how long he is out (§13.4 C4)", () => {
   );
   assert.ok(q);
   assert.equal(q.text, "Tee Higgins is Questionable.");
+});
+
+test("IR: the explanation says where the freed bench spot went", () => {
+  const r = evaluateTrade(ctx, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [HENDERSON] });
+  const line = r.reasons.find((l) => l.kind === "ir_spot");
+  assert.ok(line, "a 1-for-1 that frees a roster spot has to explain itself");
+  assert.match(
+    line.text,
+    /TreVeyon Henderson goes straight to IR, so your roster lands at 16 of 17 and .+ fills the freed bench spot\./
+  );
+
+  // a 1-for-1 between two healthy players says nothing of the kind
+  const plain = evaluateTrade(ctx, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
+  assert.ok(!plain.reasons.some((l) => l.kind === "ir_spot"));
+
+  // and the sentence keeps the third-person voice for somebody else's trade
+  const mine = rosterById(ctx, 1).players.find((id) => ctx.players.get(id).pos === "WR");
+  const names = sideNames(ctx, 1, 4);
+  const third = evaluateTrade(ctx, { myRosterId: 1, theirRosterId: 4, give: [mine], get: [HENDERSON] }, { names });
+  const thirdLine = third.reasons.find((l) => l.kind === "ir_spot");
+  assert.ok(thirdLine);
+  assert.doesNotMatch(thirdLine.text, /\b[Yy]our\b/);
+  assert.match(thirdLine.text, new RegExp(names.aPoss.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });

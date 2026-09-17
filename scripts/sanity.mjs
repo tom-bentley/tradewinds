@@ -438,6 +438,17 @@ for (const s of stashes.slice(0, 12)) {
         `— availability scaling is WS-D's lineup.js/injuries.js (§13.5 D1)`
     );
   }
+  // R3 §b charges every player received one W[pos], because he "occupies a roster spot you could
+  // otherwise have filled from the wire for free". A player who parks on IR occupies no roster
+  // spot, so that charge is the wrong one for him — worth knowing how much it moves.
+  if (irEligibleStatus(ctx, p.inj) && s.mv.mAdj != null) {
+    const charged = Math.max(s.mv.mAdj - ctx.settings.rho * (W[p.pos] || 0), 0);
+    out(
+      `      surplus charged ${charged.toFixed(0)} (mAdj − ρ·W[${p.pos}] ${Math.round(W[p.pos] || 0)}); ` +
+        `he takes an IR slot, not a roster spot, so the wire alternative he displaces is worth ~0 ` +
+        `→ an IR-aware surplus would be ${s.mv.mAdj.toFixed(0)}`
+    );
+  }
   // R3 §d puts the injury discount on the market axis because "market values lag". When the
   // market has ALREADY crashed him, δ lands on top of a price that priced the same news.
   const raw = s.mv.sourcesRaw && s.mv.sourcesRaw.fc_redraft;
