@@ -304,3 +304,12 @@ test("slot eligibility is dedicated-subset-of-FLEX", () => {
   assert.deepEqual(slotEligibility("FLEX"), ["RB", "WR", "TE"]);
   assert.deepEqual(slotEligibility("BN"), []);
 });
+
+test("v1.4 settings blocks merge key by key like the older ones", () => {
+  const merged = mergeSettings({ streaming: { enabled: false }, risk: { lambda: 0.4 }, availability: {} });
+  assert.equal(merged.streaming.enabled, false);
+  assert.deepEqual(merged.streaming.frictionByPos, DEFAULTS.streaming.frictionByPos, "a partial patch keeps the friction table");
+  assert.equal(merged.risk.lambda, 0.4);
+  assert.equal(merged.availability.scaleFutureWeeks, DEFAULTS.availability.scaleFutureWeeks);
+  assert.ok(Object.keys(merged.risk).length > 1, "the rest of the risk block survives");
+});

@@ -35,7 +35,18 @@ export const QB_SLOTS = Object.freeze(["QB", "SUPER_FLEX"]);
 export const NO_DEADLINE = 99;
 
 /** Settings keys whose values are objects and must be merged key-by-key, not replaced wholesale. */
-const NESTED_SETTING_KEYS = ["weights", "dynastyWeights", "injuryDiscount", "finder", "freeAgents", "alerts"];
+const NESTED_SETTING_KEYS = [
+  "weights",
+  "dynastyWeights",
+  "injuryDiscount",
+  "finder",
+  "freeAgents",
+  "alerts",
+  // v1.4 (§13.5): a patch like `{ streaming: { enabled: false } }` must keep `frictionByPos`
+  "availability",
+  "streaming",
+  "risk",
+];
 
 /** Sleeper `waiver_type` for a FAAB league (0 = rolling/reverse standings, 1 = reverse, 2 = FAAB). */
 export const FAAB_WAIVER_TYPE = 2;

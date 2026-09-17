@@ -417,6 +417,26 @@ export function explain(ctx, result, opts = {}) {
     text: `${v.aPossStart} starters ${dpw >= 0 ? "gain" : "lose"} ${fmt1(Math.abs(dpw))} pts/week${playoffClause}.`,
   });
 
+  // PROFILE — the risk axis in one line (design §13.5 D4): floor-adjusted points, how much of the
+  // roster's value starts, and injury exposure, all before → after from side A's seat.
+  const risk = result.risk;
+  if (risk && risk.me && risk.me.before && risk.me.after) {
+    const ce = Number(risk.deltaCertaintyEquivalent) || 0;
+    const shareBefore = Number(risk.me.before.concentration && risk.me.before.concentration.starterShare) || 0;
+    const shareAfter = Number(risk.me.after.concentration && risk.me.after.concentration.starterShare) || 0;
+    const fragBefore = Number(risk.me.before.fragility && risk.me.before.fragility.expectedLossPerWeek) || 0;
+    const fragAfter = Number(risk.me.after.fragility && risk.me.after.fragility.expectedLossPerWeek) || 0;
+    const cePhrase = Math.abs(ce) < EVEN_DELTA_PW
+      ? "floor-adjusted points unchanged"
+      : `floor-adjusted points ${ce >= 0 ? "+" : "-"}${fmt1(Math.abs(ce))}/week`;
+    const sharePhrase = `${fmt0(shareBefore * 100)}% → ${fmt0(shareAfter * 100)}% of ${v.aPossLower} value starts`;
+    const fragDelta = fragAfter - fragBefore;
+    const fragPhrase = Math.abs(fragDelta) < EVEN_DELTA_PW
+      ? "injury exposure unchanged"
+      : `injury exposure ${fragDelta > 0 ? "up" : "down"} ${fmt1(Math.abs(fragDelta))} pts/week`;
+    lines.push({ kind: "profile", text: `Risk: ${cePhrase}; ${sharePhrase}; ${fragPhrase}.` });
+  }
+
   // RISK — one line per non-block flag that names a player
   for (const flag of result.flags || []) {
     if (flag.severity === "block") continue;

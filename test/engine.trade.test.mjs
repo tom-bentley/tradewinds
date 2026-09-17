@@ -15,6 +15,7 @@ import {
   edgeBand,
   edgePct,
   evaluateTrade,
+  finalizeExplanation,
   rosterLanding,
 } from "../src/engine/trade.js";
 import { seasonLineup } from "../src/engine/lineup.js";
@@ -703,4 +704,47 @@ test("IR: the explanation says where the freed bench spot went", () => {
   assert.ok(thirdLine);
   assert.doesNotMatch(thirdLine.text, /\b[Yy]our\b/);
   assert.match(thirdLine.text, new RegExp(names.aPoss.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+/* ---------------------------------------------------------------- v1.4 risk axis (§13.5 D4, §13.8) */
+
+test("risk: an explained trade carries tradeRisk on result.risk, the finder hot path does not", () => {
+  const c = make({});
+  const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
+  assert.ok(r.risk, "explained results carry the risk axis");
+  for (const side of ["me", "them"]) {
+    for (const when of ["before", "after"]) {
+      const rr = r.risk[side][when];
+      assert.ok(Number.isFinite(rr.concentration.starterShare), `${side}.${when} starterShare`);
+      assert.ok(rr.concentration.starterShare >= 0 && rr.concentration.starterShare <= 1);
+      assert.ok(Number.isFinite(rr.fragility.expectedLossPerWeek) && rr.fragility.expectedLossPerWeek >= 0);
+      assert.ok(Number.isFinite(rr.certaintyEquivalent));
+      assert.ok(rr.certaintyEquivalent <= rr.weekly.mean + 1e-9, "certainty equivalent never beats the mean");
+      assert.ok(["low", "moderate", "high", "severe"].includes(rr.band));
+    }
+  }
+  assert.ok(Number.isFinite(r.risk.deltaCertaintyEquivalent));
+  assert.ok(Number.isFinite(r.risk.deltaStarterShare));
+  assert.ok(Number.isFinite(r.risk.deltaFragility));
+  assert.ok(
+    Math.abs(r.risk.deltaCertaintyEquivalent - (r.risk.me.after.certaintyEquivalent - r.risk.me.before.certaintyEquivalent)) < 1e-9
+  );
+  assert.ok(r.reasons.some((x) => x.kind === "profile" && /^Risk: /.test(x.text)), "explain adds one profile line");
+  assert.deepEqual(r.me.beforeIds.slice().sort(), r.risk.me.before.concentration.starters
+    .map((s) => s.id).concat(r.risk.me.before.concentration.bench.map((b) => b.id)).sort(),
+    "before-risk is measured on the same pool the before-lineup used");
+
+  const fast = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] }, { withExplain: false });
+  assert.equal(fast.risk, undefined, "the finder pays for risk only on its shortlist");
+  finalizeExplanation(c, fast);
+  assert.ok(fast.risk, "finalizeExplanation fills it in");
+  assert.ok(Math.abs(fast.risk.deltaCertaintyEquivalent - r.risk.deltaCertaintyEquivalent) < 1e-9);
+});
+
+test("risk: an invalid trade reports risk null and no profile line", () => {
+  const c = make({});
+  const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 3, give: [REED], get: [WORTHY] });
+  assert.equal(r.verdict.code, "invalid");
+  assert.equal(r.risk, null);
+  assert.ok(!r.reasons.some((x) => x.kind === "profile"));
 });

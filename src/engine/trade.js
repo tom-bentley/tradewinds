@@ -30,6 +30,7 @@ import {
   TREND_FLAG,
   UNSETTLED_SHARE,
 } from "./explain.js";
+import { tradeRisk } from "./risk.js";
 
 /** Edge% band boundaries (R3 §e). */
 export const EDGE_BANDS = Object.freeze({ steal: 25, clearWin: 10, slightWin: 4, fair: -4, slightLoss: -10, clearLoss: -25 });
@@ -406,6 +407,9 @@ function evaluateSide(ctx, rosterId, give, get, involved) {
     dropSuggestion,
     shortDetail,
     afterIds,
+    // the lineup pool the before-numbers were measured on (spots + IR) — risk.js compares
+    // before/after over the same bodies (§13.8)
+    beforeIds: before,
     spotIds,
     irIds,
     irLanding: counts.landing,
@@ -604,6 +608,21 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
 }
 
 /**
+ * `tradeRisk` that can never take the verdict down with it: a risk sweep is advisory, so a bad
+ * history row or a fixture without projections yields `null`, not a thrown grade.
+ * @param {object} ctx
+ * @param {object} result TradeResult
+ * @returns {object|null}
+ */
+export function safeTradeRisk(ctx, result) {
+  try {
+    return tradeRisk(ctx, result);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fill `reasons` and every flag's `text` from the R3 §g templates. evaluateTrade calls this
  * unless the caller opted out for speed; the finder calls it on its final shortlist.
  * @param {object} ctx
@@ -620,6 +639,10 @@ export function finalizeExplanation(ctx, result, names) {
   for (const flag of result.flags) {
     if (!flag.text) flag.text = flagText(ctx, flag, resolved);
   }
+  // The risk axis (design §13.5 D4) rides on the explained result only: the finder's hot path
+  // skips it (withExplain=false) and gets it here on its shortlist, so tens of thousands of
+  // candidates never pay for four rosterRisk sweeps each.
+  if (result.risk === undefined) result.risk = safeTradeRisk(ctx, result);
   const rendered = explain(ctx, result, { names: resolved });
   result.reasons = rendered.lines;
   result.headline = rendered.headline;
@@ -694,6 +717,7 @@ function invalidResult(ctx, proposal, problems) {
     flags: problems.map((text) => ({ type: "coverage", severity: "block", text })),
     reasons: problems.map((text) => ({ kind: "block", text })),
     best: { id: null, side: null },
+    risk: null,
     headline: `Invalid — ${problems[0]}`,
   };
   return result;

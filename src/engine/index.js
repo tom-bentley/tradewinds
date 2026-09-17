@@ -63,8 +63,26 @@ export {
   weekPoints,
   weekVector,
   isBye,
+  settingsBlock,
+  streamerTable,
+  streamerFor,
+  streamBudget,
   WEEK_ZERO_STATUSES,
 } from "./lineup.js";
+
+// v1.4 risk axis (design §13.5 D4): per-player risk, starter/bench concentration, fragility,
+// roster risk and the before/after delta a trade makes. `historyWeekly` stays internal to risk.js
+// — context.js already exports a function of that name.
+export {
+  historyOf,
+  durabilityOf,
+  playerRisk,
+  lineupConcentration,
+  rosterFragility,
+  rosterRisk,
+  tradeRisk,
+  consensusGaps,
+} from "./risk.js";
 
 export {
   evaluateTrade,

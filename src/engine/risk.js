@@ -643,14 +643,23 @@ export function rosterRisk(ctx, ids) {
  */
 export function tradeRisk(ctx, result) {
   if (!result || !result.me || !result.them) return null;
-  const sideOf = (rosterId, afterIds) => {
+  const sideOf = (rosterId, side) => {
     const roster = rosterById(ctx, rosterId);
-    const beforeIds = roster ? activePlayers(roster) : [];
+    // trade.js evaluates lineups over roster spots + IR (never taxi) on BOTH sides and reports
+    // that pool as `beforeIds`; use it so before/after are measured on the same bodies. Older
+    // results without it fall back to the roster-spot occupants.
+    const beforeIds =
+      Array.isArray(side && side.beforeIds) && side.beforeIds.length
+        ? side.beforeIds
+        : roster
+          ? activePlayers(roster)
+          : [];
+    const afterIds = side && side.afterIds;
     const after = Array.isArray(afterIds) && afterIds.length ? afterIds : beforeIds;
     return { before: rosterRisk(ctx, beforeIds), after: rosterRisk(ctx, after) };
   };
-  const me = sideOf(result.myRosterId, result.me.afterIds);
-  const them = sideOf(result.theirRosterId, result.them.afterIds);
+  const me = sideOf(result.myRosterId, result.me);
+  const them = sideOf(result.theirRosterId, result.them);
   return {
     me,
     them,
