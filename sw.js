@@ -100,12 +100,182 @@ self.addEventListener("activate", (event) => {
   );
 });
 
-self.addEventListener("message", (event) => {
-  if (event.data && event.data.type === "SKIP_WAITING") self.skipWaiting();
-});
+/* ──────────────────────────── receipts + subscription log (design §13.3 B1) ────────────────────
+ * The sender's logs say "sent"; only this worker knows whether anything was ever SHOWN. Every
+ * push writes a receipt here and the Settings card reads them back, which is the whole difference
+ * between "alerts are on" (a local flag) and "alerts are working" (evidence).
+ *
+ * Raw IndexedDB, because the SW is a classic script and cannot import src/idb.js. Every call is
+ * wrapped: a browser with IDB blocked (private mode, storage pressure) must still show the
+ * notification — the log is diagnostics, never a precondition.
+ */
+
+const RECEIPT_DB = "tradewinds-sw";
+const RECEIPT_DB_VERSION = 1;
+/** Receipts: one record per push this worker handled. */
+const RECEIPT_STORE = "pushes";
+/** One record, key "last": the most recent `pushsubscriptionchange`. */
+const SUBSCRIPTION_STORE = "subscription";
+/** Enough to cover several days of a ten-minute cron without growing without bound. */
+const RECEIPT_LIMIT = 50;
+/** The single record key in SUBSCRIPTION_STORE — the page only ever wants the latest. */
+const SUBSCRIPTION_KEY = "last";
+/** How long a write waits for its transaction to commit before giving up on the confirmation. */
+const COMMIT_TIMEOUT_MS = 2000;
+
+/** Promise-wrap one IDBRequest. */
+function idbRequest(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+  });
+}
+
+/** Open (and migrate) the diagnostics database. Rejects rather than throwing synchronously. */
+function openReceiptDb() {
+  return new Promise((resolve, reject) => {
+    const factory = self.indexedDB;
+    if (!factory) {
+      reject(new Error("IndexedDB is unavailable"));
+      return;
+    }
+    let request;
+    try {
+      request = factory.open(RECEIPT_DB, RECEIPT_DB_VERSION);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      // Auto-incrementing keys, not the timestamp: two pushes can land in the same millisecond
+      // and a receipt that overwrites another would hide exactly the case we are chasing.
+      if (!db.objectStoreNames.contains(RECEIPT_STORE)) {
+        db.createObjectStore(RECEIPT_STORE, { keyPath: "seq", autoIncrement: true });
+      }
+      if (!db.objectStoreNames.contains(SUBSCRIPTION_STORE)) db.createObjectStore(SUBSCRIPTION_STORE);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB open failed"));
+    request.onblocked = () => reject(new Error("IndexedDB open blocked"));
+  });
+}
+
+/** Run `work(store)` in one transaction and settle when the transaction does. Never throws. */
+async function withStore(name, mode, work) {
+  let db = null;
+  try {
+    db = await openReceiptDb();
+    const tx = db.transaction(name, mode);
+    // The commit handlers go on NOW, before the first request: a transaction auto-commits as soon
+    // as its last request settles, and a handler attached after that never fires. Waiting for the
+    // commit matters because a worker killed between a successful write and the commit loses the
+    // receipt. The timeout is the backstop — a hung `waitUntil` would be worse than a missing row.
+    const committed =
+      mode === "readwrite"
+        ? new Promise((resolve) => {
+            let timer = null;
+            const finish = () => {
+              if (timer !== null) {
+                clearTimeout(timer);
+                timer = null;
+              }
+              resolve();
+            };
+            tx.oncomplete = finish;
+            tx.onerror = finish;
+            tx.onabort = finish;
+            if (typeof setTimeout === "function") timer = setTimeout(finish, COMMIT_TIMEOUT_MS);
+          })
+        : null;
+    const result = await work(tx.objectStore(name));
+    if (committed) await committed;
+    return result;
+  } catch (error) {
+    return undefined;
+  } finally {
+    try {
+      if (db && typeof db.close === "function") db.close();
+    } catch {
+      /* already closed */
+    }
+  }
+}
+
+/** Append one receipt and trim the log back to RECEIPT_LIMIT. Never throws. */
+async function recordReceipt(receipt) {
+  return withStore(RECEIPT_STORE, "readwrite", async (store) => {
+    await idbRequest(store.add(receipt));
+    const keys = await idbRequest(store.getAllKeys());
+    const excess = (keys || []).length - RECEIPT_LIMIT;
+    for (let i = 0; i < excess; i += 1) await idbRequest(store.delete(keys[i]));
+    return true;
+  });
+}
+
+/** The newest receipts first, at most `limit`. Never throws; [] when the log is unreadable. */
+async function readReceipts(limit = RECEIPT_LIMIT) {
+  const rows = await withStore(RECEIPT_STORE, "readonly", (store) => idbRequest(store.getAll()));
+  if (!Array.isArray(rows)) return [];
+  return rows.slice(-limit).reverse();
+}
+
+/** Remember a subscription rotation so the page can say "re-pair" instead of guessing. */
+async function recordSubscriptionChange(record) {
+  return withStore(SUBSCRIPTION_STORE, "readwrite", (store) =>
+    idbRequest(store.put(record, SUBSCRIPTION_KEY)),
+  );
+}
+
+/** The last recorded rotation, or null. */
+async function readSubscriptionChange() {
+  const record = await withStore(SUBSCRIPTION_STORE, "readonly", (store) =>
+    idbRequest(store.get(SUBSCRIPTION_KEY)),
+  );
+  return record ?? null;
+}
+
+/**
+ * The device id the alerts job files this endpoint under: first 16 hex of SHA-256(endpoint).
+ * Byte-identical to `deviceIdOf` in pipeline/alerts.mjs and src/push.js — the three have to
+ * agree or "is this phone in the sender's list?" is unanswerable.
+ * @param {string|null|undefined} endpoint
+ * @returns {Promise<string|null>}
+ */
+async function deviceIdOf(endpoint) {
+  const value = typeof endpoint === "string" ? endpoint : "";
+  const subtle = self.crypto && self.crypto.subtle;
+  if (!value || !subtle) return null;
+  try {
+    const digest = await subtle.digest("SHA-256", new TextEncoder().encode(value));
+    return [...new Uint8Array(digest)]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 16);
+  } catch {
+    return null;
+  }
+}
+
+/** Post to every page under our scope. Never throws. */
+async function postToClients(message) {
+  let windows = [];
+  try {
+    windows = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
+  } catch {
+    return;
+  }
+  for (const client of windows) {
+    try {
+      client.postMessage(message);
+    } catch {
+      /* a client going away mid-post is not an error worth propagating */
+    }
+  }
+}
 
 /* ──────────────────────────────── push notifications ────────────────────────────────
- * Payload (pipeline/alerts.mjs, design §11.3): { title, body, tag, url, icon }.
+ * Payload (pipeline/alerts.mjs, design §11.3): { title, body, tag, url, icon, kind }.
  * A push that is not JSON still has to show something, or iOS shows its own
  * "this site was updated in the background" notice and the subscription is at risk.
  */
@@ -137,21 +307,175 @@ function readPushPayload(data) {
   }
 }
 
-self.addEventListener("push", (event) => {
-  const payload = readPushPayload(event.data);
+/** What kind of alert this was, for the receipt log: the payload says so, else the tag does. */
+function kindOf(payload, tag) {
+  if (typeof payload.kind === "string" && payload.kind) return payload.kind;
+  // Tags are `<kind>-<key>` for single alerts and the bare kind for a batch (pipeline/alerts.mjs).
+  // "tradewinds" — this worker's own fallback tag — is deliberately not a trade.
+  const name = String(tag || "");
+  const head = name.split("-")[0];
+  if (head === "test") return "test";
+  if (head === "advice") return "advice";
+  if (head === "deal" || head === "deals") return "deals";
+  if (head === "fa") return "fa";
+  if (head === "trade" || head === "trades") return "trades";
+  return "other";
+}
+
+/**
+ * Show the notification and write the receipt. `showNotification` is wrapped because a rejected
+ * one is invisible from the sender's side — the job logs a 201 and the phone shows nothing, which
+ * is precisely the failure this release exists to expose. A failure still tries the simplest
+ * possible notification: `userVisibleOnly` means a push with nothing on screen costs the app its
+ * push permission.
+ */
+async function showAndRecord(payload) {
   const title = payload.title || NOTIFICATION_FALLBACK_TITLE;
+  const tag = payload.tag || "tradewinds";
   const url = payload.url || appScope();
-  event.waitUntil(
-    self.registration.showNotification(title, {
+  const receipt = { at: Date.now(), title, tag, kind: kindOf(payload, tag), shown: false, error: null };
+
+  try {
+    await self.registration.showNotification(title, {
       body: payload.body || "",
-      tag: payload.tag || "tradewinds",
+      tag,
       icon: NOTIFICATION_ICON,
       badge: NOTIFICATION_ICON,
       data: { url },
       // Alerts about the same league reuse a tag; replacing quietly beats buzzing twice.
       renotify: false,
-    }),
-  );
+    });
+    receipt.shown = true;
+  } catch (error) {
+    receipt.error = String((error && error.message) || error);
+    try {
+      await self.registration.showNotification(NOTIFICATION_FALLBACK_TITLE, {
+        body: payload.body || title,
+        tag,
+      });
+      receipt.shown = true;
+      receipt.error += " (fallback notification shown)";
+    } catch (fallbackError) {
+      receipt.error += ` · fallback failed: ${String((fallbackError && fallbackError.message) || fallbackError)}`;
+    }
+  }
+
+  await recordReceipt(receipt);
+  return receipt;
+}
+
+self.addEventListener("push", (event) => {
+  event.waitUntil(showAndRecord(readPushPayload(event.data)));
+});
+
+/* ─────────────────────── pushsubscriptionchange (design §13.3 B1) ───────────────────────
+ * iOS rotates a push subscription on its own schedule (app update, storage eviction, an OS
+ * upgrade). The old endpoint keeps returning 201 to the sender for a while, so the GitHub job
+ * cheerfully reports "3/3 sent" to an endpoint nothing is listening on. The worker re-subscribes
+ * immediately and records the rotation; the page turns that into "re-pair this phone".
+ *
+ * The key literal below MUST stay equal to `VAPID_PUBLIC_KEY` in src/config.js (and to the copy
+ * in pipeline/alerts.mjs) — a classic worker cannot import it. Public by design (design §11.1).
+ */
+const VAPID_PUBLIC_KEY =
+  "BHRrun9caaSWpO0KOYVBrEHU7lo0SJ2qNQ203fkbMP24VIyZTa1Rssxk2XpiFekMscVSUBlj6TakzQ8Xu0l5CQo";
+
+/** base64url → the Uint8Array `pushManager.subscribe` wants (same code as src/push.js). */
+function vapidKeyBytes(base64String) {
+  const input = String(base64String || "").trim();
+  const padded = input + "=".repeat((4 - (input.length % 4)) % 4);
+  const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+  const raw = self.atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
+  return bytes;
+}
+
+async function handleSubscriptionChange(event) {
+  const oldSubscription = (event && event.oldSubscription) || null;
+  const oldEndpointHash = await deviceIdOf(oldSubscription && oldSubscription.endpoint);
+
+  let subscription = (event && event.newSubscription) || null;
+  let error = null;
+  if (!subscription) {
+    try {
+      subscription = await self.registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: vapidKeyBytes(VAPID_PUBLIC_KEY),
+      });
+    } catch (subscribeError) {
+      error = String((subscribeError && subscribeError.message) || subscribeError);
+    }
+  }
+
+  const newSub =
+    subscription && typeof subscription.toJSON === "function"
+      ? subscription.toJSON()
+      : subscription
+        ? { endpoint: subscription.endpoint }
+        : null;
+  const record = {
+    at: Date.now(),
+    oldEndpointHash,
+    newEndpointHash: await deviceIdOf(newSub && newSub.endpoint),
+    newSub,
+    error,
+  };
+  await recordSubscriptionChange(record);
+  await postToClients({
+    type: "push-subscription-changed",
+    at: record.at,
+    oldEndpointHash: record.oldEndpointHash,
+    newEndpointHash: record.newEndpointHash,
+    error: record.error,
+  });
+  return record;
+}
+
+self.addEventListener("pushsubscriptionchange", (event) => {
+  event.waitUntil(handleSubscriptionChange(event));
+});
+
+/* ──────────────────────────────── messages from the page ──────────────────────────────── */
+
+/** Answer a `push-receipts` request on the MessageChannel port, the source client, or broadcast. */
+async function replyWithReceipts(event) {
+  const reply = {
+    type: "push-receipts",
+    at: Date.now(),
+    receipts: await readReceipts(),
+    subscriptionChange: await readSubscriptionChange(),
+  };
+  const port = event.ports && event.ports[0];
+  if (port && typeof port.postMessage === "function") {
+    try {
+      port.postMessage(reply);
+      return reply;
+    } catch {
+      /* the page went away — fall through to a broadcast */
+    }
+  }
+  const source = event.source;
+  if (source && typeof source.postMessage === "function") {
+    try {
+      source.postMessage(reply);
+      return reply;
+    } catch {
+      /* same */
+    }
+  }
+  await postToClients(reply);
+  return reply;
+}
+
+self.addEventListener("message", (event) => {
+  const data = event.data;
+  if (!data || typeof data !== "object") return;
+  if (data.type === "SKIP_WAITING") {
+    self.skipWaiting();
+    return;
+  }
+  if (data.type === "push-receipts") event.waitUntil(replyWithReceipts(event));
 });
 
 /** Focus the app if it is already open (and tell it where to go), otherwise open it. */
