@@ -1,9 +1,16 @@
 // src/engine/index.js — one import surface for the UI layer.
 export {
   buildContext,
+  buildHistory,
   mergeSettings,
   activePlayers,
   activeCount,
+  tradeablePlayers,
+  isReserve,
+  isTaxi,
+  irEligibleStatus,
+  historyRow,
+  historyWeekly,
   playerOf,
   rosterById,
   rosteredIds,
@@ -21,6 +28,7 @@ export {
   SLOT_ELIGIBILITY,
   BENCH_SLOTS,
   QB_SLOTS,
+  IR_ALWAYS_STATUSES,
 } from "./context.js";
 
 export {
