@@ -217,3 +217,83 @@ test("the finder works for every roster in the league", () => {
     for (const d of deals) assert.notEqual(d.theirRosterId, roster.rosterId);
   }
 });
+
+// --- §13.4 C3 — IR/taxi players in the trade pool ----------------------------------------------
+
+const TAYLOR = "6813"; // RB, roster 5, the most valuable asset on that team
+const DELL = "9502"; // WR, roster 2, already on IR in the fixture and waiver-grade
+
+const clone = (x) => JSON.parse(JSON.stringify(x));
+
+/** Park `ids` on `rosterId`'s reserve list with `status`; `zeroProj` kills their projections. */
+function stash(input, rosterId, ids, status, opts = {}) {
+  const rosters = clone(input.rosters);
+  const row = rosters.find((r) => r.roster_id === rosterId);
+  row.reserve = [...(row.reserve || []), ...ids];
+  const players = { ...input.players, players: { ...input.players.players } };
+  const projections = { ...input.projections, players: { ...input.projections.players } };
+  for (const id of ids) {
+    if (!row.players.includes(id)) row.players.push(id);
+    players.players[id] = { ...players.players[id], inj: status };
+    if (opts.zeroProj) projections.players[id] = new Array(18).fill(0);
+  }
+  return { ...input, rosters, players, projections };
+}
+
+test("stage 0 keeps an IR stash worth more than the wire, and still drops waiver-grade ones", () => {
+  const plain = make({});
+  assert.ok(tradePool(plain, 5).includes(TAYLOR), "he is a roster-spot occupant to begin with");
+  // the same player, now on IR with no projections left: his market value carries the haircut,
+  // and that is what decides whether he is worth proposing
+  const parked = buildContext(stash(INPUT, 5, [TAYLOR], "IR", { zeroProj: true }), {});
+  assert.ok(!activePlayers(rosterById(parked, 5)).includes(TAYLOR));
+  assert.ok(tradePool(parked, 5).includes(TAYLOR), "a buy-low IR star is a real trade target");
+  assert.ok(surplus(parked, TAYLOR) > 0);
+
+  // roster 2's fixture stash is genuinely waiver-grade, so stage 0 still prunes him
+  assert.ok(rosterById(plain, 2).reserve.includes(DELL));
+  assert.equal(surplus(plain, DELL), 0);
+  assert.ok(!tradePool(plain, 2).includes(DELL));
+
+  // taxi stashes join the pool on the same terms
+  const rosters = clone(INPUT.rosters);
+  rosters.find((r) => r.roster_id === 5).taxi = [TAYLOR];
+  assert.ok(tradePool(buildContext({ ...INPUT, rosters }, {}), 5).includes(TAYLOR));
+});
+
+test("findTrades reports how many IR players change hands", () => {
+  // Out with his projections intact — WS-D scales those weeks by P(available), which is 1 again
+  // a few weeks out, so this stays a buy-low target after §13.5 D1 lands
+  const ctx = buildContext(stash(INPUT, 5, [TAYLOR], "Out"), {});
+  const reserveOf = (rosterId) => new Set(rosterById(ctx, rosterId).reserve || []);
+
+  let boughtLow = 0;
+  let sold = 0;
+  for (const roster of ctx.rosters) {
+    const deals = findTrades(ctx, { myRosterId: roster.rosterId, maxResults: 10, perRival: 2 });
+    for (const d of deals) {
+      assert.equal(typeof d.irIn, "number");
+      assert.equal(typeof d.irOut, "number");
+      assert.equal(
+        d.irIn,
+        d.get.filter((id) => reserveOf(d.theirRosterId).has(id)).length,
+        "irIn counts the arrivals sitting on the rival's IR today"
+      );
+      assert.equal(
+        d.irOut,
+        d.give.filter((id) => reserveOf(roster.rosterId).has(id)).length,
+        "irOut counts the departures sitting on my IR today"
+      );
+      if (d.irIn > 0) {
+        boughtLow += 1;
+        assert.ok(d.get.includes(TAYLOR));
+        // and the result explains where he lands
+        assert.ok(d.result.me.rosterCount.irMax === 2);
+        assert.ok(d.result.me.irIds.includes(TAYLOR) || d.result.me.spotIds.includes(TAYLOR));
+      }
+      if (d.irOut > 0) sold += 1;
+    }
+  }
+  assert.ok(boughtLow > 0, "somebody in the league should want the discounted star");
+  assert.ok(sold > 0, "and the team holding him should be shopping him");
+});
