@@ -1,15 +1,20 @@
-// Tradewinds — Analyze tab. Side A chip -> rival strip -> two roster columns -> sticky verdict.
+// Tradewinds — Analyze tab. Side A chip -> rival strip -> two roster columns -> verdict bar.
 //
 // v1.1: side A is any team in the league, not only mine (design §10.5). Every string the panel
 // renders goes through `sideNames(ctx, aId, bId)`, so a trade between two other managers reads
 // "hobbezilla wins by 7%", never "you win". Second person survives only while side A is me.
-// The panel recomputes evaluateTrade on every selection change (debounced 50 ms) and is the
+// The bar recomputes evaluateTrade on every selection change (debounced 50 ms) and is the
 // only aria-live region in the app.
+//
+// v1.4 (design §13.2 A2): the verdict is ONE row. The half-screen sticky panel it replaces
+// covered 60 % of the scroller and 13 of 35 player rows at 390x844 — the picker the tab exists
+// for was unreachable the moment a trade was graded. Everything the panel used to show moved
+// into a bottom sheet the user opens on purpose; nothing auto-opens on a selection change.
 
 import { store, resetAnalyze, toggleSide } from "./store.js";
 import {
-  avatar, teamName, playerRow, positionGroups, verdictWord, valueBars, bestBadge, flagChips,
-  statStrip, icon, empty, toast, copyText, openSheet, openTeamSheet, teamChip,
+  avatar, teamName, playerRow, positionGroups, verdictWord, verdictBarText, valueBars, bestBadge,
+  flagChips, statStrip, icon, empty, toast, copyText, openSheet, openTeamSheet, teamChip,
 } from "./components.js";
 import { escapeHtml, fmtPct, fmtPts, fmtNum, fmtValue, fmtFull, clip, acceptPhrase } from "./format.js";
 
@@ -17,6 +22,7 @@ export const title = "Analyze";
 
 let env = null;
 let timer = null;
+let barObserver = null;
 
 export function mount(el, e) {
   env = e;
@@ -32,13 +38,39 @@ export function mount(el, e) {
       <input type="search" id="an-q" class="srch-in" placeholder="Filter both rosters" aria-label="Filter both rosters" value="${escapeHtml(a.q)}" autocomplete="off">
     </div>
     <div class="cols" id="an-cols">${columns(ctx, a)}</div>
-    <div class="vpanel" id="an-panel" aria-live="polite">${panel(ctx, a)}</div>
+    <div class="vpanel" id="an-panel" aria-live="polite">${bar(ctx, a)}</div>
   </div>`;
 
   el.addEventListener("click", onClick);
   el.addEventListener("input", onInput);
+  trackBarHeight(el.querySelector(".analyze"));
   scheduleEval();
-  return { destroy() { if (timer) clearTimeout(timer); } };
+  return {
+    destroy() {
+      if (timer) clearTimeout(timer);
+      if (barObserver) { barObserver.disconnect(); barObserver = null; }
+    },
+  };
+}
+
+/**
+ * The bar is sticky, so the last rows of both columns would sit under it. `--vbar-h` is
+ * measured rather than assumed: the hint row, the graded row and the invalid row are all
+ * different heights, and a 320 px screen wraps where a 430 px one does not.
+ */
+function trackBarHeight(root) {
+  if (!root) return;
+  const panel = root.querySelector("#an-panel");
+  if (!panel) return;
+  const apply = () => {
+    const h = Math.round(panel.getBoundingClientRect().height);
+    if (h > 0) root.style.setProperty("--vbar-h", h + "px");
+  };
+  apply();
+  if (typeof ResizeObserver === "function") {
+    barObserver = new ResizeObserver(apply);
+    barObserver.observe(panel);
+  }
 }
 
 /**
@@ -124,50 +156,106 @@ function columns(ctx, a) {
     </section>`;
 }
 
-function panel(ctx, a) {
-  if (a.error) return `<div class="vp vp-msg"><p class="vp-hint">Could not grade this trade: ${escapeHtml(a.error)}</p></div>`;
+const counter = (a) =>
+  `<p class="vbar-count"><span class="num">${a.give.length}</span> out · <span class="num">${a.get.length}</span> in</p>`;
+
+/** The one row that is always on screen: verdict · edge · Δ pts/wk · acceptance · Details · ×. */
+function bar(ctx, a) {
+  if (a.error) {
+    return `<div class="vbar vbar-msg"><p class="vbar-hint">Could not grade this trade: ${escapeHtml(a.error)}</p>${clearBtn()}</div>`;
+  }
   if (!a.give.length || !a.get.length) {
     const n = a.give.length + a.get.length;
-    return `<div class="vp vp-msg">
-      <p class="vp-hint">${n === 0 ? "Tap a player on each side to grade the trade." : "Now tap a player on the " + (a.give.length ? "right" : "left") + " side."}</p>
-      <p class="vp-count"><span class="num">${a.give.length}</span> out · <span class="num">${a.get.length}</span> in</p>
+    return `<div class="vbar vbar-msg">
+      <p class="vbar-hint">${n === 0 ? "Tap a player on each side to grade the trade." : "Now tap a player on the " + (a.give.length ? "right" : "left") + " side."}</p>
+      ${counter(a)}
     </div>`;
   }
   const r = a.result;
-  if (!r) return `<div class="vp vp-msg"><p class="vp-hint">Grading…</p></div>`;
+  if (!r) return `<div class="vbar vbar-msg"><p class="vbar-hint">Grading…</p>${counter(a)}</div>`;
+
+  const t = verdictBarText(r.verdict, names(ctx, a));
+  const mid = t.invalid
+    ? `<span class="vbar-why">${escapeHtml(t.reason)}</span>`
+    : `<span class="vbar-nums">
+        <span class="vbar-n num" data-tone="${escapeHtml(t.edgeTone)}">${escapeHtml(t.edge)}</span>
+        <span class="vbar-n num" data-tone="${escapeHtml(t.deltaTone)}">${escapeHtml(t.delta)}<span class="vbar-u">${escapeHtml(t.unit)}</span></span>
+      </span>
+      <span class="vbar-acc ${escapeHtml(t.acceptCls)}"><i class="dot"></i>${escapeHtml(t.accept)}</span>`;
+
+  return `<div class="vbar" data-tone="${escapeHtml(t.tone)}">
+    <button type="button" class="vbar-hit" data-act="details" aria-haspopup="dialog" title="Open the full verdict">
+      <span class="vbar-word" data-tone="${escapeHtml(t.tone)}">${escapeHtml(t.word)}</span>
+      ${mid}
+      <span class="vbar-more">Details<span class="vbar-chev" aria-hidden="true">›</span></span>
+    </button>
+    ${clearBtn()}
+  </div>`;
+}
+
+const clearBtn = () =>
+  `<button type="button" class="vbar-x" data-act="clear" aria-label="Clear this trade">${icon("close")}</button>`;
+
+/** Everything the old half-screen panel showed, now behind `Details` (design §13.2 A2). */
+function sheetBody(ctx, r, nm) {
   const v = r.verdict;
-  const nm = names(ctx, a);
+  const dead = v.code === "invalid"; // every number in an invalid result is a zero
   const mvBest = r.best ? env.svc.marketValue(ctx, r.best.id) : null;
   const headline = env.svc.explain ? safeExplain(ctx, r, nm).headline : "";
   const acc = acceptPhrase(v, nm);
 
-  return `<div class="vp" data-tone="${v.code}">
+  return `<div class="vp" data-tone="${escapeHtml(v.code)}">
     <div class="vp-top">
       ${verdictWord(v)}
-      ${v.code === "invalid" ? "" : `<span class="vp-accept ${acc.cls}">${escapeHtml(acc.long)}</span>`}
+      ${dead ? "" : `<span class="vp-accept ${acc.cls}">${escapeHtml(acc.long)}</span>`}
     </div>
-    ${statStrip(v)}
-    ${valueBars(r.me, nm)}
-    ${bestBadge(ctx, r.best, mvBest, nm)}
+    ${dead ? "" : statStrip(v)}
+    ${dead ? "" : valueBars(r.me, nm)}
+    ${dead ? "" : bestBadge(ctx, r.best, mvBest, nm)}
     ${flagChips(r.flags)}
     <p class="vp-head">${escapeHtml(headline)}</p>
+    ${dead ? `<ul class="reasons">${(r.reasons || []).map((x) => `<li>${escapeHtml(x.text)}</li>`).join("")}</ul>` : details(ctx, r, nm, headline)}
     <div class="vp-acts">
-      <button type="button" class="btn btn-ghost" data-act="toggle-details" aria-expanded="${a.expanded}">${a.expanded ? "Hide details" : "Details"}</button>
       <button type="button" class="btn btn-ghost" data-act="copy">Copy summary</button>
       <button type="button" class="btn btn-ghost" data-act="clear">Clear</button>
     </div>
-    ${a.expanded ? details(ctx, r, nm) : ""}
   </div>`;
 }
 
-function details(ctx, r, nm) {
+/**
+ * Opened only when the user asks. Selections survive it (the sheet is a view of the same
+ * store slice), so closing the scrim puts the user back on the pickers with the trade intact.
+ */
+function openVerdictSheet() {
+  const ctx = store.ctx;
+  const a = store.analyze;
+  const r = a.result;
+  if (!r) return;
+  openSheet({
+    title: "Trade details",
+    body: sheetBody(ctx, r, names(ctx, a)),
+    onMount(el, close) {
+      el.addEventListener("click", (e) => {
+        const t = e.target.closest("[data-act]");
+        if (!t) return;
+        if (t.dataset.act === "copy") { doCopy(); return; }
+        if (t.dataset.act === "clear") { close(); clearSelection(); }
+      });
+    },
+  });
+}
+
+function details(ctx, r, nm, headline = "") {
   const me = r.me;
   const drop = me.dropSuggestion ? ctx.players.get(me.dropSuggestion) : null;
   const add = (me.backfillDetail || []).map((b) => ctx.players.get(b.id)?.name).filter(Boolean);
   const poss = nm.first ? "Your" : nm.aPoss;
   const po = ctx.playoffWeeks || [];
+  // explain() promotes its strongest reason to the headline, so printing the list verbatim
+  // under it says the same sentence twice.
+  const reasons = (r.reasons || []).filter((x) => x.text !== headline);
   return `<div class="vp-det">
-    <ul class="reasons">${(r.reasons || []).map((x) => `<li>${escapeHtml(x.text)}</li>`).join("")}</ul>
+    <ul class="reasons">${reasons.map((x) => `<li>${escapeHtml(x.text)}</li>`).join("")}</ul>
     <table class="mini">
       <caption>Starting lineup, weeks ${ctx.week}–${ctx.lastWeek}</caption>
       <tbody>
@@ -245,15 +333,23 @@ function onClick(e) {
     return;
   }
 
-  if (act === "toggle-details") { a.expanded = !a.expanded; renderPanel(); return; }
-  if (act === "clear") {
-    const root = t.closest(".analyze");
-    resetAnalyze(a.theirRosterId, a.aRosterId);
-    root.querySelectorAll(".prow.is-sel").forEach((b) => { b.classList.remove("is-sel"); b.setAttribute("aria-pressed", "false"); });
-    renderPanel();
-    return;
-  }
+  if (act === "details") { openVerdictSheet(); return; }
+  if (act === "clear") { clearSelection(); return; }
   if (act === "copy") { doCopy(); }
+}
+
+/** Drop both sides and repaint the rows in place — no re-mount, so the scroll position holds. */
+function clearSelection() {
+  const a = store.analyze;
+  resetAnalyze(a.theirRosterId, a.aRosterId);
+  const root = document.querySelector(".analyze");
+  if (root) {
+    root.querySelectorAll(".prow.is-sel").forEach((b) => {
+      b.classList.remove("is-sel");
+      b.setAttribute("aria-pressed", "false");
+    });
+  }
+  renderPanel();
 }
 
 function scheduleEval() {
@@ -284,7 +380,7 @@ function runEval() {
 
 function renderPanel() {
   const host = document.getElementById("an-panel");
-  if (host) host.innerHTML = panel(store.ctx, store.analyze);
+  if (host) host.innerHTML = bar(store.ctx, store.analyze);
 }
 
 async function doCopy() {
@@ -322,6 +418,8 @@ export function prefill({ aRosterId, theirRosterId, give, get }) {
     theirRosterId,
     give: (give || []).slice(),
     get: (get || []).slice(),
+    // `expanded` is vestigial since the details moved into a sheet; the field stays because
+    // store.js's resetAnalyze writes the same shape and the two must not diverge.
     q: "", result: null, expanded: false, error: null,
   };
 }
