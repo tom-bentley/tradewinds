@@ -1066,6 +1066,9 @@ export const api = {
   evaluateTrade, findTrades, findLeagueTrades, explain, sideNames,
   // §11.4 — demo mode is an iOS Safari tab, so alerts are "not installed" here on purpose.
   alertsSupported, alertsStatus, enableAlerts, disableAlerts, updatePrefs, pairingCode,
+  // §13.3 B2/B5 — the alerts diagnostics and self-pairing seam.
+  deviceIdOf, pushReceipts, testNotification, clearProbeCache,
+  ensureSubscription, sendPairing, dispatchToGithub, storedToken, saveToken, maskToken,
   // §12.2/§12.4 — one hand-built advisory (the real Bowers case) so the tab is populated.
   advise, adviseAll, standingIssues, diffStatuses, statusKey, applyStatuses, absenceOf,
   refreshStatuses, markAdviceSeen, unseenAdviceKeys,
@@ -1083,7 +1086,70 @@ export function alertsSupported() {
 }
 
 export async function alertsStatus() {
-  return { supported: false, reason: "not-installed", permission: "default", subscribed: false, pairing: null };
+  return {
+    supported: false,
+    reason: "not-installed",
+    permission: "default",
+    subscribed: false,
+    pairing: null,
+    // §13.3 B2 — the diagnostics keys exist here too, so the card renders one shape in both
+    // modes. Demo mode never got as far as a subscription, so every answer is "nothing to tell".
+    endpoint: null,
+    deviceId: null,
+    pairedDeviceId: null,
+    endpointChanged: false,
+    serverPaired: null,
+    server: null,
+    lastRunAt: null,
+    lastRun: null,
+    receipts: { count24h: 0, count: 0, lastAt: null, lastShown: null, failed: 0, items: [], source: null, subscriptionChange: null },
+    probed: false,
+  };
+}
+
+/** SHA-256(endpoint) → 16 hex; the same id pipeline/alerts.mjs keys its device state by. */
+export async function deviceIdOf(endpoint) {
+  const value = typeof endpoint === "string" ? endpoint.trim() : "";
+  if (!value || !globalThis.crypto?.subtle) return null;
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
+
+/** Demo mode is a Safari tab: nothing ever reached a service worker here. */
+export async function pushReceipts() {
+  return { count24h: 0, count: 0, lastAt: null, lastShown: null, failed: 0, items: [], source: null, subscriptionChange: null };
+}
+
+export async function testNotification() {
+  return { ok: false, reason: "no-service-worker" };
+}
+
+export function clearProbeCache() {}
+
+/* §13.3 B5 — demo mode never subscribes, so the self-healing path has nothing to heal. */
+export async function ensureSubscription() {
+  return { subscription: null, resubscribed: false, rotated: false, pairing: null, error: null };
+}
+
+export async function sendPairing() {
+  return { ok: false, reason: "Demo mode cannot pair a device." };
+}
+
+export async function dispatchToGithub() {
+  return { ok: false, status: null, reason: "Demo mode cannot talk to GitHub." };
+}
+
+export function storedToken() {
+  return "";
+}
+
+export function saveToken() {
+  return false;
+}
+
+export function maskToken(token) {
+  const value = String(token || "");
+  return value ? `${value.slice(0, 2)}…${value.slice(-2)}` : "";
 }
 
 export async function enableAlerts() {

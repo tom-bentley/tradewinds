@@ -80,6 +80,13 @@ export const DEFAULTS = Object.freeze({
     rivalNews: false,
     minDealScore: 2, // FinderScore floor for "a new deal worth proposing"
     minFaGain: 1, // pts/week floor for "a free agent worth a drop"
+    // v1.4 (design §13.3 B3). Seventy "new deal to propose" pushes in eight days is how a phone
+    // learns to ignore this app. Cooldowns are per device per kind, applied by the job's
+    // `normalizePrefs`, so a device paired before v1.4 inherits them with no re-paste. Advice and
+    // completed trades are never throttled: they expire at kickoff.
+    dealsCooldownHours: 6,
+    faCooldownHours: 6,
+    maxDealsPerPush: 1, // above 1 deal in a run, send one digest ("N new deals — best: …")
   }),
 
   // --- Injury duration table (design §12.2) -------------------------------------------------

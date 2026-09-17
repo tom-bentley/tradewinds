@@ -164,7 +164,7 @@ async function loadLive() {
     findFreeAgents: (waiver && waiver.findFreeAgents) || null,
     gradeTransaction: (waiver && waiver.gradeTransaction) || null,
 
-    // ---- src/push.js (§11.4) -----------------------------------------------------------
+    // ---- src/push.js (§11.4, diagnostics §13.3 B2) ---------------------------------------
     alertsSupported: (push && push.alertsSupported) || null,
     alertsStatus: (push && push.alertsStatus) || null,
     enableAlerts: (push && push.enableAlerts) || null,
@@ -172,6 +172,18 @@ async function loadLive() {
     updatePrefs: (push && push.updatePrefs) || null,
     pairingCode: (push && push.pairingCode) || null,
     reasonText: (push && push.reasonText) || null,
+    deviceIdOf: (push && push.deviceIdOf) || null,
+    pushReceipts: (push && push.pushReceipts) || null,
+    testNotification: (push && push.testNotification) || null,
+    clearProbeCache: (push && push.clearProbeCache) || null,
+    // §13.3 B5 — the self-healing pairing path. Absent push.js means the manual paste, which is
+    // what `decorate()` falls back to.
+    ensureSubscription: (push && push.ensureSubscription) || null,
+    sendPairing: (push && push.sendPairing) || null,
+    dispatchToGithub: (push && push.dispatchToGithub) || null,
+    storedToken: (push && push.storedToken) || null,
+    saveToken: (push && push.saveToken) || null,
+    maskToken: (push && push.maskToken) || null,
 
     // ---- src/data.js transactions (§11.4) ----------------------------------------------
     getTransactionsWithNew: mods.data.getTransactionsWithNew || null,
@@ -621,6 +633,11 @@ function writePairing(p) {
   } catch { /* private mode */ }
 }
 
+/**
+ * The stand-in status. It carries the §13.3 keys with "we did not check" values (`serverPaired:
+ * null`, `probed: false`) rather than omitting them: a card that renders this must fall back to
+ * the old wording, never invent a verdict push.js would have had to earn.
+ */
 export async function alertsStatusLocal() {
   const sup = alertsSupportedLocal();
   const pairing = readPairing();
@@ -630,7 +647,53 @@ export async function alertsStatusLocal() {
     permission: "Notification" in window ? Notification.permission : "default",
     subscribed: !!pairing,
     pairing,
+    endpoint: (pairing && pairing.sub && pairing.sub.endpoint) || null,
+    deviceId: null,
+    pairedDeviceId: null,
+    endpointChanged: false,
+    serverPaired: null,
+    server: null,
+    lastRunAt: null,
+    lastRun: null,
+    receipts: { count24h: 0, count: 0, lastAt: null, lastShown: null, failed: 0, items: [], source: null, subscriptionChange: null },
+    probed: false,
   };
+}
+
+/** SHA-256(endpoint) → 16 hex, the id the alerts job files a device under (design §13.3 B2). */
+export async function deviceIdOfLocal(endpoint) {
+  const value = typeof endpoint === "string" ? endpoint.trim() : "";
+  if (!value || !globalThis.crypto?.subtle) return null;
+  try {
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+  } catch {
+    return null;
+  }
+}
+
+/** No receipt log without push.js — say "unknown", never "none". */
+export async function pushReceiptsLocal() {
+  return { count24h: 0, count: 0, lastAt: null, lastShown: null, failed: 0, items: [], source: null, subscriptionChange: null };
+}
+
+/** A local notification, the one alerts check that needs neither GitHub nor the network. */
+export async function testNotificationLocal(options = {}) {
+  if (!("Notification" in window) || Notification.permission !== "granted") {
+    return { ok: false, reason: Notification?.permission === "denied" ? "denied" : "permission" };
+  }
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (!reg) return { ok: false, reason: "no-service-worker" };
+    await reg.showNotification(options.title ?? "Tradewinds test", {
+      body: options.body ?? "If you can see this, this phone can show alerts.",
+      tag: "test-local",
+      icon: "./icons/icon-192.png",
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: String(error?.message ?? error) };
+  }
 }
 
 function urlBase64ToUint8Array(base64) {
@@ -705,6 +768,32 @@ export function updatePrefsLocal(patch = {}) {
   return next;
 }
 
+/* §13.3 B5 — the token lives only in this browser's localStorage; the three helpers below are
+   the stand-ins for push.js's, so the Settings card renders the same either way. */
+
+export const GITHUB_TOKEN_KEY = "tradewinds.gh.v1";
+
+export function storedTokenLocal() {
+  try { return String(localStorage.getItem(GITHUB_TOKEN_KEY) || ""); } catch { return ""; }
+}
+
+export function saveTokenLocal(token) {
+  try {
+    const value = String(token || "").trim();
+    if (value) localStorage.setItem(GITHUB_TOKEN_KEY, value);
+    else localStorage.removeItem(GITHUB_TOKEN_KEY);
+    return true;
+  } catch { return false; }
+}
+
+/** Never render a token in full, not even on the owner's own phone. */
+export function maskTokenLocal(token) {
+  const value = String(token || "");
+  if (!value) return "";
+  if (value.length <= 12) return `${value.slice(0, 2)}…${value.slice(-2)}`;
+  return `${value.slice(0, 8)}…${value.slice(-4)}`;
+}
+
 /** Compact JSON — one line, no spaces: this string is pasted into a GitHub secret by hand. */
 export function pairingCodeLocal(pairing) {
   return pairing ? JSON.stringify(pairing) : "";
@@ -753,6 +842,22 @@ export function decorate(api) {
   if (!has("updatePrefs")) api.updatePrefs = updatePrefsLocal;
   if (!has("pairingCode")) api.pairingCode = pairingCodeLocal;
   if (!has("reasonText")) api.reasonText = reasonTextLocal;
+  // §13.3 B2 — the diagnostics seam. Without push.js these answer "we could not check", which is
+  // what the card is built to render; they never fake a verdict.
+  if (!has("deviceIdOf")) api.deviceIdOf = deviceIdOfLocal;
+  if (!has("pushReceipts")) api.pushReceipts = pushReceiptsLocal;
+  if (!has("testNotification")) api.testNotification = testNotificationLocal;
+  if (!has("clearProbeCache")) api.clearProbeCache = () => {};
+  // §13.3 B5 — without push.js there is no crypto for the sealed pairing, so every stand-in says
+  // "not available here" and the card keeps showing the manual pairing code.
+  if (!has("ensureSubscription")) {
+    api.ensureSubscription = async () => ({ subscription: null, resubscribed: false, rotated: false, pairing: null, error: null });
+  }
+  if (!has("sendPairing")) api.sendPairing = async () => ({ ok: false, reason: "Automatic re-pairing is not available in this build." });
+  if (!has("dispatchToGithub")) api.dispatchToGithub = async () => ({ ok: false, status: null, reason: "Not available in this build." });
+  if (!has("storedToken")) api.storedToken = storedTokenLocal;
+  if (!has("saveToken")) api.saveToken = saveTokenLocal;
+  if (!has("maskToken")) api.maskToken = maskTokenLocal;
 
   return api;
 }
