@@ -932,3 +932,78 @@ html.kb-open #toasts { bottom: calc(var(--safe-b) + 12px); }
   #tabs a { font-size: 12px; }
   .adv-why, .adv-acts, .adv-move .deal-stats { padding-left: 0; }
 }
+
+/* ================================================================== v1.4 — risk axis (§13.5) */
+
+/* The band is the one word every risk surface ends on, so it is one chip everywhere: League
+   rows, the team sheet, the Analyze risk table, free-agent cards and the Players sheet. It
+   carries the verdict palette through `data-tone`, so low reads as a gain and severe as a loss. */
+.band {
+  display: inline-flex; align-items: center; padding: 1px 8px; border-radius: var(--r-pill);
+  background: var(--surface2); border: 1px solid var(--line);
+  font-size: 14px; font-weight: 650; line-height: 1.35; white-space: nowrap;
+}
+/* The chip stays neutral and lets `data-tone` colour only the word: a free-agent card already
+   spends teal on "free agent", and three tinted chips in a row is a colour argument. */
+.band[data-tone="loss-dim"], .band[data-tone="loss"] { border-color: rgba(251, 113, 133, .35); }
+
+/* One line under a standings row: what starts, what an absence costs, and the band. */
+.rrisk-row td { padding: 0 6px 7px; border-bottom: 1px solid var(--line-soft); }
+.rrisk-row:not(.is-me) td { background: none; }
+.rrisk:empty { display: none; }
+.rstrip { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 14px; color: var(--ink-3); line-height: 1.35; }
+.rstrip-t { min-width: 0; }
+.rstrip .num { color: var(--ink-2); font-weight: 650; }
+.rstrip .band { padding: 0 7px; }
+/* One hairline between teams, not two: the strip row carries it for the pair. */
+.stand tbody tr:has(+ .rrisk-row) td { border-bottom: 0; }
+
+/* Starters against bench on one track — the picture behind "77% of value starts". */
+.sbar { margin: 10px 0 2px; }
+.sbar-track {
+  position: relative; height: 10px; border-radius: 3px; overflow: hidden;
+  background: var(--surface2); border: 1px solid var(--line-soft);
+}
+.sbar-s { display: block; height: 100%; background: linear-gradient(90deg, var(--mine) 65%, var(--mine-dim)); }
+.sbar-key { margin-top: 6px; font-size: 14px; color: var(--ink-3); }
+.sbar-key .num { color: var(--ink-2); font-weight: 650; }
+.sbar-d { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin: 0 5px 0 0; vertical-align: middle; }
+.sbar-d-s { background: var(--mine); }
+.sbar-d-b { background: var(--surface2); border: 1px solid var(--line); margin-left: 12px; }
+
+/* The engine's own sentences, quoted rather than paraphrased. */
+.risk-notes { margin: 10px 0 0; color: var(--ink-3); }
+.risk-lead { font-size: 14px; color: var(--ink-3); margin: 8px 0 10px; }
+.risk-lead b { font-size: 19px; font-weight: 700; letter-spacing: -.02em; margin-right: 2px; }
+
+/* Free-agent score, in its parts. Dim on purpose: the headline gain stays the loudest number. */
+.fa-comp { display: block; margin-top: 6px; font-size: 14px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.schip-stream { color: var(--ink-3); font-weight: 600; }
+.fa-chips .band { padding: 3px 9px; border-radius: var(--r-pill); }
+
+/* ---- alerts: the classes WS-B left for this stylesheet (§13.3 B2) ---- */
+
+.al-pat { display: grid; gap: 6px; border-top: 1px solid var(--line-soft); padding-top: 10px; }
+.al-pat .swrow-l { padding-bottom: 2px; }
+.al-pat-set { align-items: center; }
+.al-pat-set .btn { flex: none; }
+.al-pat-mask {
+  flex: 1; min-width: 0; max-height: none; padding: 9px 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink-2);
+}
+.al-pat-in { flex: 1; }
+
+/* Diagnose sheet: evidence rows, not settings — no tap target, tighter, hairline-separated. */
+.diagnose { gap: 14px; }
+.diagnose > .swrow-l { margin-bottom: -6px; color: var(--ink-2); }
+.dg-group { border-top: 0; padding-top: 0; }
+.dg-row {
+  min-height: 0; padding: 7px 0; cursor: default; align-items: flex-start;
+  border-bottom: 1px solid var(--line-soft);
+}
+.dg-group .dg-row:last-child { border-bottom: 0; }
+.dg-row .swrow-l { font-size: 14px; font-weight: 600; }
+.dg-row .swrow-h { line-height: 1.35; }
+.dg-row .tag { flex: none; margin-left: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diagnose .steps { margin-bottom: 2px; }
+.diagnose .codeblock { font-size: 12px; }
