@@ -145,15 +145,29 @@ async function loadLive() {
 
   // §11.2 / §11.4 / §12.2 — shipped by other agents in parallel. Absent modules fall through to
   // the stand-ins in `decorate()`; every real export takes precedence the moment it exists.
-  const [waiver, push, advisor, injuries] = await Promise.all([
+  const [waiver, push, advisor, injuries, risk] = await Promise.all([
     optional("../engine/waiver.js"),
     optional("../push.js"),
     optional("../engine/advisor.js"),
     optional("../engine/injuries.js"),
+    optional("../engine/risk.js"),
   ]);
 
   return {
     mode: "live",
+
+    // ---- src/engine/risk.js (§13.5 D4) ------------------------------------------------------
+    // The risk axis: per-player floor/ceiling/durability, starter-vs-bench concentration,
+    // fragility and the before/after a trade makes. Optional — a UI surface feature-detects each
+    // one and hides its risk row when the module is missing (demo mode ships without it).
+    playerRisk: (risk && risk.playerRisk) || null,
+    rosterRisk: (risk && risk.rosterRisk) || null,
+    lineupConcentration: (risk && risk.lineupConcentration) || null,
+    rosterFragility: (risk && risk.rosterFragility) || null,
+    tradeRisk: (risk && risk.tradeRisk) || null,
+    consensusGaps: (risk && risk.consensusGaps) || null,
+    durabilityOf: (risk && risk.durabilityOf) || null,
+    historyOf: (risk && risk.historyOf) || null,
 
     // ---- src/engine/waiver.js (§11.2) -------------------------------------------------
     // waiver.js `freeAgentPool` is a FLAT id array; the stand-in finder wants them grouped, so
