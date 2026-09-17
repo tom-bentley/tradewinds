@@ -20,7 +20,9 @@
 //
 // Env: PUSH_SUBSCRIPTIONS (JSON array of pairing payloads, §11.4), VAPID_PUBLIC_KEY,
 //      VAPID_PRIVATE_KEY, VAPID_SUBJECT (defaults to the Pages URL), ALERT_TEST,
-//      ALERT_DRY / ALERT_DRY_LEAGUE / ALERT_DRY_USER.
+//      ALERT_DRY / ALERT_DRY_LEAGUE / ALERT_DRY_USER,
+//      ALERT_WEBHOOKS (optional, §13.3 B3: a JSON array of Discord/Slack/ntfy/plain-JSON URLs
+//      treated as extra devices, so an alert the phone never shows still lands somewhere).
 // Exit codes: 0 = ran (including "nothing paired"), 1 = misconfigured or every league failed.
 //
 // Everything above main() is pure: composeAlerts(ctx, device, state, options) decides WHAT to say,
@@ -79,6 +81,29 @@ export const NOTIFICATION_ICON = "icons/icon-192.png";
 /** Drop a push the phone never picked up rather than delivering a stale deal an hour later. */
 export const PUSH_TTL_SECONDS = 3600;
 
+/**
+ * How long the push service should hold a notification for a phone that is off or out of
+ * coverage, per kind (design §13.3 B3). Advice is the only kind worth four hours — a lineup hole
+ * still matters when the phone wakes up before kickoff. A trade idea two hours stale is noise.
+ */
+export const TTL_BY_KIND = Object.freeze({ advice: 4 * 3600, trades: 2 * 3600, deals: 2 * 3600, fa: 2 * 3600 });
+
+/**
+ * `Urgency` (RFC 8030 §5.3). Apple throttles background wakeups for low-urgency pushes; advice is
+ * the one kind that should wake the phone now, so everything else stays "normal" rather than
+ * competing with it.
+ */
+export const URGENCY_BY_KIND = Object.freeze({ advice: "high" });
+
+/**
+ * TTL + urgency for one notification kind.
+ * @param {string} kind
+ * @returns {{TTL: number, urgency: string}}
+ */
+export function deliveryOptions(kind) {
+  return { TTL: TTL_BY_KIND[kind] ?? PUSH_TTL_SECONDS, urgency: URGENCY_BY_KIND[kind] ?? "normal" };
+}
+
 /** Push-service replies that mean "this endpoint is dead, stop sending" (§11.3). */
 export const GONE_STATUS_CODES = new Set([404, 410]);
 
@@ -91,6 +116,12 @@ export const DEFAULT_PREFS = Object.freeze({
   rivalNews: false,
   minDealScore: 2,
   minFaGain: 1,
+  // v1.4 noise control (design §13.3 B3). Between 2026-09-09 and 2026-09-17 this job sent ~70
+  // "New deal to propose" pushes to one phone. A cooldown per kind plus a digest is the
+  // difference between an alert and a nag. Advice and completed trades are never throttled.
+  dealsCooldownHours: 6,
+  faCooldownHours: 6,
+  maxDealsPerPush: 1,
 });
 
 /** How deep to look before thresholds and the per-run cap trim the list. */
@@ -152,6 +183,16 @@ export function deviceKey(endpoint) {
 }
 
 /**
+ * The same function under the name the app and the service worker use (design §13.3 B2). The
+ * three implementations must agree byte for byte or the phone cannot ask "am I in the sender's
+ * device list?" — the shared test vector is `https://web.push.apple.com/QF2c-token` →
+ * `ee64af5d15e243bb`, asserted here and in `test/data.push.test.mjs`.
+ * @param {string} endpoint
+ * @returns {string} 16 hex characters
+ */
+export const deviceIdOf = deviceKey;
+
+/**
  * Fill in the §11.4/§12.3 defaults for a partial (or missing) prefs object. `advice` is on by
  * default (it is the reason the job runs every ten minutes); `rivalNews` is off, because a rival's
  * injury is interesting, not actionable.
@@ -161,7 +202,8 @@ export function deviceKey(endpoint) {
  */
 export function normalizePrefs(prefs) {
   const raw = prefs && typeof prefs === "object" ? prefs : {};
-  const num = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+  const num = (value, fallback) =>
+    value != null && Number.isFinite(Number(value)) ? Number(value) : fallback;
   return {
     trades: raw.trades !== false,
     deals: raw.deals !== false,
@@ -170,6 +212,11 @@ export function normalizePrefs(prefs) {
     rivalNews: raw.rivalNews === true,
     minDealScore: num(raw.minDealScore, DEFAULT_PREFS.minDealScore),
     minFaGain: num(raw.minFaGain, DEFAULT_PREFS.minFaGain),
+    // The point of filling these here: the pairing code already in PUSH_SUBSCRIPTIONS predates
+    // v1.4 and says nothing about cooldowns. It gets them anyway, with no re-paste.
+    dealsCooldownHours: Math.max(0, num(raw.dealsCooldownHours, DEFAULT_PREFS.dealsCooldownHours)),
+    faCooldownHours: Math.max(0, num(raw.faCooldownHours, DEFAULT_PREFS.faCooldownHours)),
+    maxDealsPerPush: Math.max(1, Math.round(num(raw.maxDealsPerPush, DEFAULT_PREFS.maxDealsPerPush))),
   };
 }
 
@@ -293,6 +340,27 @@ export function canonicalState(state) {
       seenAdvice: [...(entry.seenAdvice || [])].slice(-HISTORY_LIMIT),
       lastNotifiedAt: entry.lastNotifiedAt ?? null,
     };
+    // The §13.3 B3 server view. Written ONLY once a send has happened, so a device entry from
+    // before v1.4 — and every quiet run afterwards — still serializes byte for byte as it did.
+    if (entry.lastSentAt) device.lastSentAt = entry.lastSentAt;
+    if (entry.sentCount != null && Number.isFinite(Number(entry.sentCount))) {
+      device.sentCount = Number(entry.sentCount);
+    }
+    if (entry.lastResult && typeof entry.lastResult === "object") {
+      device.lastResult = {
+        status: entry.lastResult.status ?? null,
+        at: entry.lastResult.at ?? null,
+        ...(entry.lastResult.detail ? { detail: String(entry.lastResult.detail) } : {}),
+      };
+    }
+    if (entry.lastKindAt && typeof entry.lastKindAt === "object") {
+      /** @type {Record<string, string>} */
+      const lastKindAt = {};
+      for (const kind of Object.keys(entry.lastKindAt).sort()) {
+        if (entry.lastKindAt[kind]) lastKindAt[kind] = String(entry.lastKindAt[kind]);
+      }
+      if (Object.keys(lastKindAt).length) device.lastKindAt = lastKindAt;
+    }
     if (entry.expired === true) device.expired = true;
     devices[deviceId] = device;
   }
@@ -311,7 +379,18 @@ export function canonicalState(state) {
  */
 export function applyState(state, update = {}) {
   const next = canonicalState(state);
-  const { leagueId, week, status, statusAt, deviceId, seen = {}, notifiedAt = null, expired } = update;
+  const {
+    leagueId,
+    week,
+    status,
+    statusAt,
+    deviceId,
+    seen = {},
+    notifiedAt = null,
+    expired,
+    sent = null,
+    lastKindAt = null,
+  } = update;
 
   if (leagueId) {
     const entry = next.leagues[leagueId] || { seenTradeIds: [], week: null, status: {}, statusAt: null };
@@ -329,6 +408,8 @@ export function applyState(state, update = {}) {
       (seen.fa && seen.fa.length) ||
       (seen.advice && seen.advice.length) ||
       Boolean(notifiedAt) ||
+      Boolean(sent) ||
+      Boolean(lastKindAt && Object.keys(lastKindAt).length) ||
       expired === true;
     if (previous || touched) {
       const entry = previous || { seenDeals: [], seenFa: [], seenAdvice: [], lastNotifiedAt: null };
@@ -336,6 +417,18 @@ export function applyState(state, update = {}) {
       if (seen.fa && seen.fa.length) entry.seenFa = bounded(entry.seenFa, seen.fa);
       if (seen.advice && seen.advice.length) entry.seenAdvice = bounded(entry.seenAdvice, seen.advice);
       if (notifiedAt) entry.lastNotifiedAt = notifiedAt;
+      // The server view (§13.3 B3): what the sender believes it did for this device, so the app
+      // can compare it against what the phone actually showed.
+      if (sent) {
+        if (sent.at) entry.lastSentAt = sent.at;
+        if (Number.isFinite(Number(sent.count)) && Number(sent.count) > 0) {
+          entry.sentCount = Number(entry.sentCount || 0) + Number(sent.count);
+        }
+        if (sent.result) entry.lastResult = sent.result;
+      }
+      if (lastKindAt && Object.keys(lastKindAt).length) {
+        entry.lastKindAt = { ...(entry.lastKindAt || {}), ...lastKindAt };
+      }
       if (expired === true) entry.expired = true;
       next.devices[deviceId] = entry;
     }
@@ -599,6 +692,9 @@ export function payloadOf(notification) {
     tag: notification.tag,
     url: notification.url,
     icon: NOTIFICATION_ICON,
+    // §13.3 B1: the worker files its receipt under this, so the Diagnose sheet can say WHICH
+    // kind of alert this phone did and did not show.
+    kind: notification.kind ?? null,
   };
 }
 
@@ -850,6 +946,32 @@ function batchOf(kind, items, url) {
 /** notification.kind -> the seen-bucket that remembers it. */
 const SEEN_BUCKETS = Object.freeze({ trades: "trades", deals: "deals", fa: "fa", advice: "advice" });
 
+/** Kinds a cooldown applies to, and the pref that sets it (design §13.3 B3). */
+const COOLDOWN_PREF = Object.freeze({ deals: "dealsCooldownHours", fa: "faCooldownHours" });
+
+/**
+ * Is this kind still inside its cooldown for this device?
+ *
+ * Only `deals` and `fa` are ever throttled: they are standing suggestions that will be just as
+ * true in six hours. Advice expires at kickoff and a completed trade is news, so neither waits.
+ *
+ * @param {string} kind
+ * @param {object} prefs normalized
+ * @param {Record<string, string>|undefined} lastKindAt ISO timestamps from the device state
+ * @param {number} now ms
+ * @returns {{cooling: boolean, until: number|null}}
+ */
+export function cooldownState(kind, prefs, lastKindAt, now) {
+  const prefKey = COOLDOWN_PREF[kind];
+  if (!prefKey) return { cooling: false, until: null };
+  const hours = Number(prefs?.[prefKey]);
+  if (!Number.isFinite(hours) || hours <= 0) return { cooling: false, until: null };
+  const last = Date.parse(String((lastKindAt || {})[kind] ?? ""));
+  if (Number.isNaN(last)) return { cooling: false, until: null };
+  const until = last + hours * 3600 * 1000;
+  return { cooling: now < until, until };
+}
+
 /**
  * @returns {{ trades: string[], deals: string[], fa: string[], advice: string[] }}
  */
@@ -873,10 +995,11 @@ function emptySeen() {
  * @param {{ id: string, leagueId?: string, rosterId?: number|null, prefs?: object,
  *   subject?: string, label?: string }} device pairing payload; `subject` sets the deep-link base
  * @param {object} state the run's pre-run alerts state (never mutated)
- * @param {{ status?: Record<string, string>, seeding?: boolean }} [options]
+ * @param {{ status?: Record<string, string>, seeding?: boolean, now?: number }} [options]
+ *   `now` drives the per-kind cooldowns (§13.3 B3); the engine still never reads a clock itself.
  * @returns {{ notifications: object[], advisories: object[], baseline: string[],
  *   seen: { trades: string[], deals: string[], fa: string[], advice: string[] },
- *   seeding: boolean, deferred: number, problems: string[] }}
+ *   seeding: boolean, deferred: number, cooled: Record<string, number>, problems: string[] }}
  */
 export function composeAlerts(ctx, device, state, options = {}) {
   /** @type {string[]} */
@@ -913,6 +1036,11 @@ export function composeAlerts(ctx, device, state, options = {}) {
     }
   }
 
+  const now = Number.isFinite(options.now) ? Number(options.now) : Date.now();
+  const lastKindAt = deviceState.lastKindAt || {};
+  /** @type {Record<string, number>} */
+  const cooled = {};
+
   /** @type {{ kind: string, items: object[] }[]} */
   const groups = [];
   if (prefs.advice && !seeding) {
@@ -931,6 +1059,20 @@ export function composeAlerts(ctx, device, state, options = {}) {
   let deferred = 0;
   for (const group of groups) {
     if (!group.items.length) continue;
+
+    // Cooldown: hold the whole kind back WITHOUT marking anything seen, so the same suggestions
+    // are offered again once it lapses rather than being silently burned.
+    const cooldown = cooldownState(group.kind, prefs, lastKindAt, now);
+    if (cooldown.cooling) {
+      cooled[group.kind] = group.items.length;
+      continue;
+    }
+
+    // One digest instead of N pushes for the kind that produced 70 of them in eight days.
+    if (group.kind === "deals" && group.items.length > prefs.maxDealsPerPush) {
+      group.items = [batchOf("deals", group.items, group.items[0].url)];
+    }
+
     const remaining = MAX_PER_DEVICE - notifications.length;
     if (remaining <= 0) {
       // No slot left this run: leave these unseen so the next run can deliver them.
@@ -953,7 +1095,7 @@ export function composeAlerts(ctx, device, state, options = {}) {
   // news: remember them so the next run only speaks up about what actually changed.
   const baseline = seeding ? advisories.map((advisory) => advisory.key).filter(Boolean) : [];
 
-  return { notifications, advisories, baseline, seen, seeding, deferred, problems };
+  return { notifications, advisories, baseline, seen, seeding, deferred, cooled, problems };
 }
 
 /**
@@ -1075,23 +1217,215 @@ export function isGoneError(error) {
 }
 
 /**
+ * Apple returns the notification's id in `apns-id`; the RFC 8030 answer is a `location` URL.
+ * Logging whichever exists turns "the job says it sent" into something that can be correlated
+ * with a phone that never buzzed (design §13.3 B3).
+ * @param {any} result the push service's response, as web-push resolves it
+ * @returns {string|null}
+ */
+export function receiptIdOf(result) {
+  const headers = result?.headers;
+  if (!headers) return null;
+  const read = (name) =>
+    typeof headers.get === "function" ? headers.get(name) : headers[name] ?? headers[name.toLowerCase()];
+  const apns = read("apns-id");
+  if (apns) return String(apns);
+  const location = read("location");
+  return location ? String(location) : null;
+}
+
+/**
  * Build the real sender. web-push is imported dynamically so importing this module (tests, `--check`)
  * never requires the dependency to be installed.
+ *
+ * TTL and urgency arrive per notification. Urgency travels as a raw header rather than web-push's
+ * own `urgency` option: `options.headers` is copied through verbatim by every 3.x release, while
+ * an unknown top-level key makes `sendNotification` throw.
+ *
  * @param {{ subject: string, publicKey: string, privateKey: string }} vapid
- * @returns {Promise<(subscription: object, payload: string) => Promise<any>>}
+ * @returns {Promise<(subscription: object, payload: string, options?: object) => Promise<any>>}
  */
 export async function defaultSender(vapid) {
   const module = await import("web-push");
   const webpush = module.default ?? module;
-  return (subscription, payload) =>
+  return (subscription, payload, options = {}) =>
     webpush.sendNotification(subscription, payload, {
       vapidDetails: {
         subject: vapid.subject,
         publicKey: vapid.publicKey,
         privateKey: vapid.privateKey,
       },
-      TTL: PUSH_TTL_SECONDS,
+      TTL: Number.isFinite(Number(options.TTL)) ? Number(options.TTL) : PUSH_TTL_SECONDS,
+      headers: { Urgency: options.urgency || "normal" },
     });
+}
+
+/* --- fallback channels (design §13.3 B3) ------------------------------------------------------
+ *
+ * Web Push to one iPhone is a single point of failure that nobody can see fail. `ALERT_WEBHOOKS`
+ * adds channels that DO report failure: a Discord/Slack/ntfy/plain-JSON endpoint is treated as
+ * just another device, with the same composition, the same dedupe and the same state entry, so an
+ * alert that never reaches the phone still lands somewhere Tom reads.
+ */
+
+/** @typedef {{ url: string, kind: "discord"|"slack"|"ntfy"|"generic", label: string }} Webhook */
+
+/**
+ * Which flavour of endpoint this is, from the URL alone — nothing here needs a secret to say so.
+ * @param {string} url
+ * @returns {"discord"|"slack"|"ntfy"|"generic"}
+ */
+export function webhookKind(url) {
+  let host = "";
+  let path = "";
+  try {
+    const parsed = new URL(String(url));
+    host = parsed.host.toLowerCase();
+    path = parsed.pathname.toLowerCase();
+  } catch {
+    return "generic";
+  }
+  if (host.endsWith("discord.com") && path.startsWith("/api/webhooks")) return "discord";
+  if (host.endsWith("discordapp.com") && path.startsWith("/api/webhooks")) return "discord";
+  if (host === "hooks.slack.com") return "slack";
+  if (host === "ntfy.sh" || host.startsWith("ntfy.") || host.endsWith(".ntfy.sh")) return "ntfy";
+  return "generic";
+}
+
+/**
+ * Parse `ALERT_WEBHOOKS`: a JSON array of URLs, or of `{url, label, prefs, leagueId, userId}`.
+ * Never throws — a malformed entry is reported and skipped, exactly like a bad pairing.
+ * @param {unknown} raw
+ * @returns {{ webhooks: object[], problems: string[] }}
+ */
+export function parseWebhooks(raw) {
+  /** @type {string[]} */
+  const problems = [];
+  const text = raw == null ? "" : String(raw).trim();
+  if (text === "") return { webhooks: [], problems };
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return { webhooks: [], problems: [`ALERT_WEBHOOKS is not valid JSON: ${error.message}`] };
+  }
+
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  /** @type {object[]} */
+  const webhooks = [];
+  /** @type {Set<string>} */
+  const seen = new Set();
+
+  rows.forEach((row, index) => {
+    const entry = typeof row === "string" ? { url: row } : row && typeof row === "object" ? row : {};
+    const url = typeof entry.url === "string" ? entry.url.trim() : "";
+    if (!/^https?:\/\//i.test(url)) {
+      problems.push(`webhook[${index}]: needs an http(s) url`);
+      return;
+    }
+    const id = deviceIdOf(url);
+    if (seen.has(id)) {
+      problems.push(`webhook[${index}]: duplicate url (device ${id})`);
+      return;
+    }
+    seen.add(id);
+    const kind = webhookKind(url);
+    webhooks.push({
+      id,
+      webhook: { url, kind, label: String(entry.label ?? "").trim() || kind },
+      sub: null,
+      endpoint: url,
+      leagueId: entry.leagueId == null ? null : String(entry.leagueId),
+      userId: entry.userId == null ? null : String(entry.userId),
+      label: String(entry.label ?? "").trim() || `${kind} webhook`,
+      prefs: normalizePrefs(entry.prefs),
+      createdAt: entry.createdAt ?? null,
+    });
+  });
+
+  return { webhooks, problems };
+}
+
+/**
+ * The HTTP request one notification becomes, per channel flavour. Pure, so every shape is a test
+ * rather than a hopeful POST.
+ * @param {Webhook} webhook
+ * @param {{ title: string, body: string, tag: string, url: string, kind?: string }} notification
+ * @returns {{ url: string, init: { method: string, headers: Record<string, string>, body: string } }}
+ */
+export function webhookRequest(webhook, notification) {
+  const json = (payload) => ({
+    url: webhook.url,
+    init: {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  });
+
+  if (webhook.kind === "discord") {
+    return json({
+      username: "Tradewinds",
+      embeds: [{ title: notification.title, description: notification.body, url: notification.url }],
+    });
+  }
+  if (webhook.kind === "slack") {
+    return json({ text: `*${notification.title}*\n${notification.body}\n${notification.url}` });
+  }
+  if (webhook.kind === "ntfy") {
+    // ntfy carries the title and the tap target in headers; the body is the message itself.
+    // Header values must be Latin-1, and composed text here is full of "·" and "⇄".
+    return {
+      url: webhook.url,
+      init: {
+        method: "POST",
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+          Title: asciiHeader(notification.title),
+          Tags: notification.kind || "tradewinds",
+          Click: notification.url,
+        },
+        body: notification.body || notification.title,
+      },
+    };
+  }
+  return json({
+    title: notification.title,
+    body: notification.body,
+    url: notification.url,
+    tag: notification.tag,
+    kind: notification.kind ?? null,
+  });
+}
+
+/** Header values are Latin-1 only; "Trade: a ⇄ b" would be rejected outright. */
+function asciiHeader(text) {
+  return String(text ?? "")
+    .replace(/[⇄↔]/g, "<->")
+    .replace(/·/g, "-")
+    .replace(/[^\x20-\x7E]/g, "")
+    .trim() || "Tradewinds";
+}
+
+/**
+ * POST one notification to one channel. Throws an error carrying `statusCode` on a non-2xx, so
+ * the send loop's existing 404/410 handling treats a dead webhook exactly like a dead endpoint.
+ * @param {Webhook} webhook
+ * @param {object} notification
+ * @param {{ fetchImpl: Function }} deps
+ * @returns {Promise<{statusCode: number, headers: any}>}
+ */
+export async function sendWebhook(webhook, notification, deps) {
+  const { url, init } = webhookRequest(webhook, notification);
+  const response = await deps.fetchImpl(url, init);
+  const statusCode = Number(response?.status ?? 0);
+  if (!(statusCode >= 200 && statusCode < 300)) {
+    const error = new Error(`${webhook.kind} webhook replied ${statusCode || "nothing"}`);
+    error.statusCode = statusCode;
+    throw error;
+  }
+  return { statusCode, headers: response?.headers ?? null };
 }
 
 // --- live inputs -------------------------------------------------------------------------------
@@ -1229,15 +1563,39 @@ export async function main(options = {}) {
     const parsed = parseSubscriptions(env.PUSH_SUBSCRIPTIONS);
     for (const problem of parsed.problems) status("warn", "subscriptions", problem);
     devices = parsed.devices;
+    if (devices.length) {
+      status("ok", "subscriptions", `${devices.length} device(s): ${devices.map((d) => d.label).join(", ")}`);
+    }
+
+    // Fallback channels ride the same pipeline as a phone (§13.3 B3): same composition, same
+    // dedupe, same state entry. No secret → no webhooks, and the job behaves exactly as before.
+    const hooks = parseWebhooks(env.ALERT_WEBHOOKS);
+    for (const problem of hooks.problems) status("warn", "webhooks", problem);
+    if (hooks.webhooks.length) {
+      // A channel usually mirrors the phone, so it inherits its league unless it named one.
+      const inherit = devices[0] || null;
+      for (const hook of hooks.webhooks) {
+        const leagueId = hook.leagueId || inherit?.leagueId || "";
+        if (!leagueId) {
+          status("warn", "webhooks", `${hook.label}: no leagueId (and no paired device to inherit one from)`);
+          continue;
+        }
+        devices.push({ ...hook, leagueId, userId: hook.userId ?? inherit?.userId ?? null });
+      }
+      status("ok", "webhooks", `${hooks.webhooks.length} channel(s): ${hooks.webhooks.map((h) => `${h.label} (${h.webhook.kind})`).join(", ")}`);
+    }
+
     if (!devices.length) {
       status("ok", "subscriptions", "nothing paired");
       return 0;
     }
-    status("ok", "subscriptions", `${devices.length} device(s): ${devices.map((d) => d.label).join(", ")}`);
   }
 
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const needsPush = devices.some((device) => device.sub);
+
   let sender = options.sender;
-  if (!sender && !dry) {
+  if (!sender && !dry && needsPush) {
     if (!privateKey) {
       status("fail", "vapid", "VAPID_PRIVATE_KEY is not set — cannot sign a push");
       return 1;
@@ -1250,15 +1608,24 @@ export async function main(options = {}) {
     }
   }
 
+  /**
+   * One notification to one device — a Web Push subscription or a fallback channel. The two
+   * report the same way, so the send loop, the logging and the expiry handling stay single-path.
+   */
+  const deliver = (device, notification) => {
+    if (device.webhook) return sendWebhook(device.webhook, notification, { fetchImpl });
+    return sender(device.sub, JSON.stringify(payloadOf(notification)), deliveryOptions(notification.kind));
+  };
+
   // --- ALERT_TEST: one push per device, state untouched ------------------------------------------
   if (!dry && isEnabled(env.ALERT_TEST)) {
-    const payload = JSON.stringify(testPayload(subject));
+    const notification = { ...testPayload(subject), kind: "test" };
     let sent = 0;
     for (const device of devices) {
       try {
-        await sender(device.sub, payload);
+        const result = await deliver(device, notification);
         sent += 1;
-        status("ok", "test push", device.label);
+        status("ok", "test push", `${device.label} · ${result?.statusCode ?? "?"}${receiptIdOf(result) ? ` · ${receiptIdOf(result)}` : ""}`);
       } catch (error) {
         status("warn", "test push", `${device.label}: ${statusCodeOf(error) ?? ""} ${error.message}`.trim());
       }
@@ -1416,6 +1783,7 @@ export async function main(options = {}) {
       const ctx = contexts.get(key);
       const composed = composeAlerts(ctx, { ...device, subject, rosterId: ctx.myRosterId }, stateIn, {
         status: snapshot,
+        now,
         // A dry run has no stored snapshot to seed, and a preview that prints nothing is useless.
         // ALERT_FULL (workflow input `full`) does the same for a real run: the roster's standing
         // issues are pushed once instead of being baselined silently — the way to hear about a
@@ -1441,41 +1809,66 @@ export async function main(options = {}) {
       /** @type {object[]} */
       const delivered = [];
       let expired = false;
+      /** @type {{status: number|string, at: string}|null} */
+      let lastResult = null;
       for (const notification of composed.notifications) {
         if (dry) {
           delivered.push(notification);
           notified += 1;
-          log(`[dry] ${notification.title} — ${notification.body}`);
+          const { TTL, urgency } = deliveryOptions(notification.kind);
+          log(`[dry] ${notification.title} — ${notification.body} · ttl ${TTL}s · ${urgency}`);
           continue;
         }
         try {
-          await sender(device.sub, JSON.stringify(payloadOf(notification)));
+          const result = await deliver(device, notification);
           delivered.push(notification);
           notified += 1;
-          status("ok", "push", `${device.label} · ${notification.title} — ${notification.body}`);
+          const code = result?.statusCode ?? null;
+          const receiptId = receiptIdOf(result);
+          lastResult = { status: code ?? "sent", at: isoTimestamp(new Date(now)) };
+          status(
+            "ok",
+            "push",
+            `${device.label} · ${code ?? "?"} · ${notification.title} — ${notification.body}${receiptId ? ` · ${receiptId}` : ""}`,
+          );
         } catch (error) {
+          const code = statusCodeOf(error);
+          lastResult = { status: code ?? "error", at: isoTimestamp(new Date(now)), detail: error.message };
           if (isGoneError(error)) {
             expired = true;
             status(
               "warn",
               "push",
-              `${device.label}: endpoint gone (${statusCodeOf(error)}) — marking expired; edit PUSH_SUBSCRIPTIONS by hand`,
+              `${device.label}: endpoint gone (${code}) — marking expired; edit PUSH_SUBSCRIPTIONS by hand`,
             );
             break;
           }
-          status("warn", "push", `${device.label}: send failed (${statusCodeOf(error) ?? "no status"}) — ${error.message}`);
+          status("warn", "push", `${device.label}: send failed (${code ?? "no status"}) — ${error.message}`);
         }
       }
 
       if (!dry) {
         const seen = seenOf(delivered);
         if (composed.baseline.length) seen.advice = [...seen.advice, ...composed.baseline];
+        // Cooldowns start when something actually SHIPPED, not when it was composed — a failed
+        // send must not buy the next six hours of silence.
+        /** @type {Record<string, string>} */
+        const lastKindAt = {};
+        for (const notification of delivered) {
+          if (notification.kind === "deals" || notification.kind === "fa") {
+            lastKindAt[notification.kind] = isoTimestamp(new Date(now));
+          }
+        }
         stateOut = applyState(stateOut, {
           leagueId,
           week,
           deviceId: device.id,
           seen,
           notifiedAt: delivered.length ? isoTimestamp(new Date(now)) : null,
+          sent: lastResult
+            ? { at: delivered.length ? isoTimestamp(new Date(now)) : null, count: delivered.length, result: lastResult }
+            : null,
+          lastKindAt,
           expired: expired || undefined,
         });
       }
@@ -1483,7 +1876,14 @@ export async function main(options = {}) {
       const summary = composed.notifications.length
         ? `${delivered.length}/${composed.notifications.length} sent`
         : "nothing new";
-      status("ok", device.label, `${summary}${composed.deferred ? ` · ${composed.deferred} deferred` : ""}`);
+      const cooled = Object.entries(composed.cooled || {})
+        .map(([kind, count]) => `${count} ${kind} on cooldown`)
+        .join(", ");
+      status(
+        "ok",
+        device.label,
+        `${summary}${composed.deferred ? ` · ${composed.deferred} deferred` : ""}${cooled ? ` · ${cooled}` : ""}`,
+      );
     }
 
     // The snapshot belongs to the league, not to a device: record it once, even if every device

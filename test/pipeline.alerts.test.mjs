@@ -23,7 +23,10 @@ import {
   applyState,
   canonicalState,
   composeAlerts,
+  cooldownState,
   dealKey,
+  deliveryOptions,
+  deviceIdOf,
   deviceKey,
   dryRunDevice,
   emptyState,
@@ -34,11 +37,15 @@ import {
   normalizePrefs,
   normalizeTransaction,
   parseSubscriptions,
+  parseWebhooks,
   payloadOf,
+  sendWebhook,
   statusRowFromPlayer,
   statusRowsFromProjections,
   testPayload,
   watchSet,
+  webhookKind,
+  webhookRequest,
   weekPointRows,
 } from "../pipeline/alerts.mjs";
 
@@ -289,6 +296,8 @@ test("the first run announces the completed trade, the second says nothing", () 
     tag: trade.tag,
     url: trade.url,
     icon: NOTIFICATION_ICON,
+    // §13.3 B1 — the service worker files its receipt under this kind.
+    kind: "trades",
   });
   assert.deepEqual(first.seen.trades, [TRADE_ID]);
 
@@ -447,7 +456,7 @@ test("main sends once per new item, records state, then goes quiet", async () =>
   const tradePushes = first.sent.filter((s) => s.payload.tag === `trade-${TRADE_ID}`);
   assert.equal(tradePushes.length, 2, "both paired devices hear about the same league trade");
   for (const push of first.sent) {
-    assert.deepEqual(Object.keys(push.payload).sort(), ["body", "icon", "tag", "title", "url"]);
+    assert.deepEqual(Object.keys(push.payload).sort(), ["body", "icon", "kind", "tag", "title", "url"]);
     assert.equal(push.payload.icon, NOTIFICATION_ICON);
     assert.ok(push.payload.url.startsWith(SUBJECT));
   }
@@ -534,7 +543,11 @@ test("ALERT_TEST pushes once per subscription and leaves state alone", async () 
     sent.map((s) => s.endpoint).sort(),
     SUBSCRIPTIONS.map((s) => s.sub.endpoint).sort(),
   );
-  for (const push of sent) assert.deepEqual(push.payload, testPayload(SUBJECT));
+  // The test push rides the same payload shape as a real one (icon + kind), so a receipt for it
+  // proves exactly what a receipt for an advisory would.
+  for (const push of sent) {
+    assert.deepEqual(push.payload, { ...testPayload(SUBJECT), icon: NOTIFICATION_ICON, kind: "test" });
+  }
   assert.deepEqual(testPayload(SUBJECT), {
     title: "Tradewinds alerts are on",
     body: "You will hear about new trades and deals here.",
@@ -949,4 +962,345 @@ test("a run whose projections call fails still sends the rest", async () => {
   assert.ok(run.lines.some((line) => line.includes("no advice this run")));
   assert.ok(sent.some((push) => push.payload.tag === `trade-${TRADE_ID}`), "trades are unaffected");
   assert.deepEqual(validateAlertsState(run.state), []);
+});
+
+/* ───────────── v1.4: server view, TTL/urgency, cooldowns, webhooks (design §13.3 B3) ───────────── */
+
+test("deviceIdOf is the shared id the app and the service worker compute", () => {
+  // The SAME vector is asserted in test/data.push.test.mjs. If these two ever disagree, the phone
+  // can no longer ask "does the sender know about me?" and the whole diagnosis collapses.
+  assert.equal(deviceIdOf("https://web.push.apple.com/QF2c-token"), "ee64af5d15e243bb");
+  assert.equal(deviceIdOf("https://web.push.apple.com/QF2c-old"), "9131f5dc3c5f376c");
+  assert.equal(deviceIdOf("https://discord.com/api/webhooks/123/abc"), "e6b000f9a5947c2e");
+  assert.equal(deviceIdOf, deviceKey, "one implementation, two names");
+});
+
+test("normalizePrefs fills the v1.4 cooldowns, so a pre-v1.4 pairing needs no re-paste", () => {
+  const old = normalizePrefs({ trades: true, deals: true, freeAgents: true, minDealScore: 2, minFaGain: 1 });
+  assert.equal(old.dealsCooldownHours, 6);
+  assert.equal(old.faCooldownHours, 6);
+  assert.equal(old.maxDealsPerPush, 1);
+
+  // Explicit values win; nonsense falls back; the floors hold.
+  assert.equal(normalizePrefs({ dealsCooldownHours: 0 }).dealsCooldownHours, 0, "0 disables the cooldown");
+  assert.equal(normalizePrefs({ dealsCooldownHours: -4 }).dealsCooldownHours, 0);
+  assert.equal(normalizePrefs({ faCooldownHours: "nonsense" }).faCooldownHours, 6);
+  assert.equal(normalizePrefs({ maxDealsPerPush: 0 }).maxDealsPerPush, 1, "a digest of nothing is not a thing");
+  assert.equal(normalizePrefs({ maxDealsPerPush: 3 }).maxDealsPerPush, 3);
+  assert.equal(normalizePrefs({ minFaGain: null }).minFaGain, 1, "null is absent, not zero");
+});
+
+test("deliveryOptions: advice is held longer and marked urgent, nothing else is", () => {
+  // TTL 0 would be dropped outright whenever the phone is asleep (RFC 8030 / R5 §6.3).
+  assert.deepEqual(deliveryOptions("advice"), { TTL: 14400, urgency: "high" });
+  assert.deepEqual(deliveryOptions("deals"), { TTL: 7200, urgency: "normal" });
+  assert.deepEqual(deliveryOptions("fa"), { TTL: 7200, urgency: "normal" });
+  assert.deepEqual(deliveryOptions("trades"), { TTL: 7200, urgency: "normal" });
+  assert.deepEqual(deliveryOptions("test"), { TTL: 3600, urgency: "normal" });
+  assert.ok(deliveryOptions("anything").TTL > 0, "never zero");
+});
+
+test("cooldownState holds a kind back for its window and then lets it go", () => {
+  const prefs = normalizePrefs({});
+  const at = Date.parse("2026-09-17T06:00:00Z");
+  const lastKindAt = { deals: "2026-09-17T06:00:00Z" };
+
+  assert.equal(cooldownState("deals", prefs, lastKindAt, at + 3600_000).cooling, true, "1h in");
+  assert.equal(cooldownState("deals", prefs, lastKindAt, at + 6 * 3600_000).cooling, false, "exactly 6h out");
+  assert.equal(cooldownState("fa", prefs, lastKindAt, at + 3600_000).cooling, false, "kinds are independent");
+  assert.equal(cooldownState("advice", prefs, { advice: "2026-09-17T06:00:00Z" }, at).cooling, false, "advice is never throttled");
+  assert.equal(cooldownState("trades", prefs, { trades: "2026-09-17T06:00:00Z" }, at).cooling, false);
+  assert.equal(cooldownState("deals", normalizePrefs({ dealsCooldownHours: 0 }), lastKindAt, at).cooling, false);
+  assert.equal(cooldownState("deals", prefs, {}, at).cooling, false, "nothing sent yet, nothing to wait for");
+});
+
+test("composeAlerts: deals inside their cooldown are held WITHOUT being marked seen", () => {
+  const state = applyState(emptyState(), {
+    deviceId: "device0000000001",
+    lastKindAt: { deals: isoTimestamp(new Date(NOW - 3600_000)) },
+  });
+
+  const dealsOnly = device({ prefs: { advice: false, trades: false, freeAgents: false } });
+  const held = composeAlerts(CTX, dealsOnly, state, { status: {}, seeding: false, now: NOW });
+  assert.equal(held.notifications.filter((n) => n.kind === "deals").length, 0);
+  assert.ok(held.cooled.deals > 0, "the count is reported so the log can say why it was quiet");
+  assert.deepEqual(held.seen.deals, [], "nothing is burned — the same deals come back after the window");
+
+  // Six hours later the same deals are offered again.
+  const later = composeAlerts(CTX, dealsOnly, state, { status: {}, seeding: false, now: NOW + 7 * 3600_000 });
+  assert.ok(later.notifications.some((n) => n.kind === "deals"));
+  assert.ok(later.seen.deals.length);
+});
+
+test("composeAlerts: more than maxDealsPerPush collapses into one digest", () => {
+  const composed = composeAlerts(CTX, device({ prefs: { minDealScore: 0, advice: false, trades: false, freeAgents: false } }), emptyState(), {
+    status: {},
+    seeding: false,
+    now: NOW,
+  });
+  const deals = composed.notifications.filter((n) => n.kind === "deals");
+  assert.equal(deals.length, 1, "one push, not one per idea");
+  assert.equal(deals[0].batched, true);
+  assert.equal(deals[0].title, "New deals to propose");
+  assert.match(deals[0].body, /^\d+ new deals — best: /);
+  assert.ok(deals[0].keys.length > 1, "…and every idea in it is remembered, so it does not repeat");
+
+  // Under the limit they go one by one. Everything but the first two is already seen here, so the
+  // per-run cap (which batches on its own account) never gets a chance to interfere.
+  const seenAllButTwo = applyState(emptyState(), {
+    deviceId: "device0000000001",
+    seen: { deals: deals[0].keys.slice(2) },
+  });
+  const few = composeAlerts(
+    CTX,
+    device({ prefs: { minDealScore: 0, advice: false, trades: false, freeAgents: false, maxDealsPerPush: 99 } }),
+    seenAllButTwo,
+    { status: {}, seeding: false, now: NOW },
+  );
+  const individually = few.notifications.filter((n) => n.kind === "deals");
+  assert.equal(individually.length, 2, "no digest under the limit");
+  assert.ok(individually.every((n) => !n.batched));
+
+  // …and with maxDealsPerPush at its default of 1, those same two become one digest again.
+  const digested = composeAlerts(
+    CTX,
+    device({ prefs: { minDealScore: 0, advice: false, trades: false, freeAgents: false } }),
+    seenAllButTwo,
+    { status: {}, seeding: false, now: NOW },
+  );
+  const two = digested.notifications.filter((n) => n.kind === "deals");
+  assert.equal(two.length, 1);
+  assert.equal(two[0].batched, true);
+  assert.equal(two[0].keys.length, 2);
+});
+
+test("canonicalState carries the server view and stays byte-stable without one", () => {
+  // The workflow commits only when the file changes; a run that sends nothing must not rewrite it.
+  const legacy = {
+    v: 1,
+    leagues: {},
+    devices: { abc0000000000001: { seenDeals: ["a"], seenFa: [], seenAdvice: [], lastNotifiedAt: "2026-09-17T12:11:48Z" } },
+  };
+  assert.equal(JSON.stringify(canonicalState(legacy)), JSON.stringify(canonicalState(canonicalState(legacy))));
+  assert.equal(
+    JSON.stringify(canonicalState(legacy).devices.abc0000000000001),
+    JSON.stringify({ seenDeals: ["a"], seenFa: [], seenAdvice: [], lastNotifiedAt: "2026-09-17T12:11:48Z" }),
+    "an entry written before v1.4 serializes exactly as it did",
+  );
+
+  const withView = applyState(legacy, {
+    deviceId: "abc0000000000001",
+    sent: { at: "2026-09-17T13:00:00Z", count: 2, result: { status: 201, at: "2026-09-17T13:00:00Z" } },
+    lastKindAt: { deals: "2026-09-17T13:00:00Z" },
+  });
+  const entry = withView.devices.abc0000000000001;
+  assert.equal(entry.lastSentAt, "2026-09-17T13:00:00Z");
+  assert.equal(entry.sentCount, 2);
+  assert.deepEqual(entry.lastResult, { status: 201, at: "2026-09-17T13:00:00Z" });
+  assert.deepEqual(entry.lastKindAt, { deals: "2026-09-17T13:00:00Z" });
+  assert.deepEqual(validateAlertsState(canonicalState(withView)), [], "the contract accepts the new keys");
+
+  // sentCount accumulates across runs; a quiet run adds nothing.
+  const twice = applyState(withView, { deviceId: "abc0000000000001", sent: { at: "2026-09-17T14:00:00Z", count: 1, result: { status: 201, at: "2026-09-17T14:00:00Z" } } });
+  assert.equal(twice.devices.abc0000000000001.sentCount, 3);
+  const quiet = applyState(twice, { deviceId: "abc0000000000001" });
+  assert.equal(JSON.stringify(canonicalState(quiet)), JSON.stringify(canonicalState(twice)), "a quiet run is byte-identical");
+});
+
+test("main records what it sent per device, with the status code", async () => {
+  clearStateFile();
+  clearAdvisorFile();
+  const { sender, sent } = recordingSender();
+  const run = await runMain({
+    env: { PUSH_SUBSCRIPTIONS: subsEnv(phone()), VAPID_SUBJECT: SUBJECT, VAPID_PRIVATE_KEY: "test", ALERT_FULL: "1" },
+    sender,
+  });
+  assert.equal(run.code, 0);
+  assert.ok(sent.length > 0);
+
+  const id = deviceIdOf(phone()[0].sub.endpoint);
+  const entry = run.state.devices[id];
+  assert.equal(entry.sentCount, sent.length);
+  assert.ok(entry.lastSentAt, "the sender's own view of when it last delivered");
+  assert.equal(entry.lastResult.status, 201);
+  assert.deepEqual(validateAlertsState(run.state), []);
+
+  // …and the log names the status code, which is all the sender can honestly claim.
+  assert.ok(run.lines.some((line) => /\[ok {2}\] push .*· 201 · /.test(line)), run.lines.join("\n"));
+  clearStateFile();
+  clearAdvisorFile();
+});
+
+test("main passes TTL and urgency per notification kind", async () => {
+  clearStateFile();
+  clearAdvisorFile();
+  const seen = [];
+  const sender = async (subscription, payload, options) => {
+    seen.push({ kind: JSON.parse(payload).kind, options });
+    return { statusCode: 201, headers: { "apns-id": "9F2B-TEST" } };
+  };
+  const run = await runMain({
+    env: { PUSH_SUBSCRIPTIONS: subsEnv(phone()), VAPID_SUBJECT: SUBJECT, VAPID_PRIVATE_KEY: "test", ALERT_FULL: "1" },
+    sender,
+  });
+  assert.equal(run.code, 0);
+  assert.ok(seen.length);
+  for (const push of seen) assert.deepEqual(push.options, deliveryOptions(push.kind));
+  assert.ok(run.lines.some((line) => line.includes("9F2B-TEST")), "the apns-id is logged for correlation");
+  clearStateFile();
+  clearAdvisorFile();
+});
+
+/* --- fallback channels ------------------------------------------------------------------------ */
+
+test("webhookKind reads the flavour off the URL", () => {
+  assert.equal(webhookKind("https://discord.com/api/webhooks/123/abc"), "discord");
+  assert.equal(webhookKind("https://discordapp.com/api/webhooks/123/abc"), "discord");
+  assert.equal(webhookKind("https://hooks.slack.com/services/T/B/x"), "slack");
+  assert.equal(webhookKind("https://ntfy.sh/tradewinds-tom"), "ntfy");
+  assert.equal(webhookKind("https://ntfy.example.org/topic"), "ntfy");
+  assert.equal(webhookKind("https://example.com/hook"), "generic");
+  assert.equal(webhookKind("https://discord.com/channels/1/2"), "generic", "only the webhook path counts");
+  assert.equal(webhookKind("not a url"), "generic");
+});
+
+test("parseWebhooks takes bare URLs or objects, and skips what it cannot use", () => {
+  const { webhooks, problems } = parseWebhooks(
+    JSON.stringify([
+      "https://ntfy.sh/tradewinds-tom",
+      { url: "https://hooks.slack.com/services/T/B/x", label: "Team Slack", prefs: { deals: false } },
+      { url: "ftp://nope" },
+      "https://ntfy.sh/tradewinds-tom",
+    ]),
+  );
+  assert.equal(webhooks.length, 2);
+  assert.equal(webhooks[0].id, deviceIdOf("https://ntfy.sh/tradewinds-tom"), "a channel is a device, keyed the same way");
+  assert.equal(webhooks[0].webhook.kind, "ntfy");
+  assert.equal(webhooks[1].label, "Team Slack");
+  assert.equal(webhooks[1].prefs.deals, false, "per-channel prefs, normalized like any other device");
+  assert.equal(webhooks[1].prefs.dealsCooldownHours, 6);
+  assert.equal(problems.length, 2);
+  assert.match(problems[0], /http\(s\) url/);
+  assert.match(problems[1], /duplicate/);
+
+  assert.deepEqual(parseWebhooks("").webhooks, [], "no secret, no channels");
+  assert.deepEqual(parseWebhooks(undefined).webhooks, []);
+  assert.match(parseWebhooks("{oops").problems[0], /not valid JSON/);
+});
+
+test("webhookRequest shapes the body each service expects", () => {
+  const notification = {
+    title: "Trade: hobbezilla ⇄ speckledorf",
+    body: "hobbezilla gets Gibbs · speckledorf gets Nabers",
+    tag: "trade-1",
+    url: `${SUBJECT}#league`,
+    kind: "trades",
+  };
+
+  const discord = webhookRequest({ url: "https://discord.com/api/webhooks/1/x", kind: "discord" }, notification);
+  assert.equal(discord.init.method, "POST");
+  assert.deepEqual(JSON.parse(discord.init.body).embeds, [
+    { title: notification.title, description: notification.body, url: notification.url },
+  ]);
+
+  const slack = webhookRequest({ url: "https://hooks.slack.com/services/T/B/x", kind: "slack" }, notification);
+  assert.equal(JSON.parse(slack.init.body).text, `*${notification.title}*\n${notification.body}\n${notification.url}`);
+
+  const ntfy = webhookRequest({ url: "https://ntfy.sh/t", kind: "ntfy" }, notification);
+  assert.equal(ntfy.init.body, notification.body);
+  assert.equal(ntfy.init.headers.Click, notification.url);
+  assert.equal(ntfy.init.headers.Tags, "trades");
+  // Header values are Latin-1: "⇄" and "·" would make the request itself fail.
+  assert.equal(ntfy.init.headers.Title, "Trade: hobbezilla <-> speckledorf");
+  assert.ok(/^[\x20-\x7E]*$/.test(ntfy.init.headers.Title));
+
+  const generic = webhookRequest({ url: "https://example.com/hook", kind: "generic" }, notification);
+  assert.deepEqual(JSON.parse(generic.init.body), {
+    title: notification.title,
+    body: notification.body,
+    url: notification.url,
+    tag: notification.tag,
+    kind: "trades",
+  });
+});
+
+test("sendWebhook throws with the status code so a dead channel expires like a dead endpoint", async () => {
+  const ok = await sendWebhook(
+    { url: "https://ntfy.sh/t", kind: "ntfy" },
+    { title: "x", body: "y", tag: "t", url: SUBJECT },
+    { fetchImpl: async () => ({ status: 200 }) },
+  );
+  assert.equal(ok.statusCode, 200);
+
+  await assert.rejects(
+    sendWebhook({ url: "https://ntfy.sh/t", kind: "ntfy" }, { title: "x", body: "y", tag: "t", url: SUBJECT }, { fetchImpl: async () => ({ status: 410 }) }),
+    (error) => {
+      assert.equal(error.statusCode, 410);
+      assert.equal(isGoneError(error), true);
+      return true;
+    },
+  );
+});
+
+test("a webhook channel is a device: same composition, same state, no VAPID needed", async () => {
+  clearStateFile();
+  clearAdvisorFile();
+  const posts = [];
+  const run = await runMain({
+    env: {
+      // No PUSH_SUBSCRIPTIONS and no VAPID_PRIVATE_KEY at all: the channel still gets everything.
+      ALERT_WEBHOOKS: JSON.stringify([{ url: "https://ntfy.sh/tradewinds-tom", label: "ntfy", leagueId: LEAGUE_ID, userId: USER_ID }]),
+      VAPID_SUBJECT: SUBJECT,
+      ALERT_FULL: "1",
+    },
+    fetchImpl: async (url, init) => {
+      posts.push({ url, init });
+      return { status: 200, headers: {} };
+    },
+  });
+
+  assert.equal(run.code, 0);
+  assert.ok(posts.length > 0, "the channel was posted to");
+  assert.equal(posts[0].url, "https://ntfy.sh/tradewinds-tom");
+  assert.ok(posts[0].init.headers.Title);
+
+  const id = deviceIdOf("https://ntfy.sh/tradewinds-tom");
+  assert.ok(run.state.devices[id], "and it is remembered exactly like a phone");
+  assert.equal(run.state.devices[id].sentCount, posts.length);
+  assert.deepEqual(validateAlertsState(run.state), []);
+
+  // The dedupe is shared with the push path, so nothing a channel has already been told is
+  // repeated on the next run (what is left over is the per-run cap's deferred queue).
+  const firstBodies = posts.map((p) => String(p.init.body));
+  const secondPosts = [];
+  const second = await runMain({
+    env: {
+      ALERT_WEBHOOKS: JSON.stringify([{ url: "https://ntfy.sh/tradewinds-tom", label: "ntfy", leagueId: LEAGUE_ID, userId: USER_ID }]),
+      VAPID_SUBJECT: SUBJECT,
+    },
+    fetchImpl: async (url, init) => {
+      secondPosts.push({ url, init });
+      return { status: 200, headers: {} };
+    },
+  });
+  assert.equal(second.code, 0);
+  for (const post of secondPosts) {
+    assert.ok(!firstBodies.includes(String(post.init.body)), `repeated: ${post.init.body}`);
+  }
+  assert.equal(second.state.devices[id].sentCount, posts.length + secondPosts.length, "the count keeps accumulating");
+  clearStateFile();
+  clearAdvisorFile();
+});
+
+test("a webhook with no league and no phone to inherit one from is skipped, not fatal", async () => {
+  clearStateFile();
+  clearAdvisorFile();
+  const run = await runMain({
+    env: { ALERT_WEBHOOKS: JSON.stringify(["https://example.com/hook"]), VAPID_SUBJECT: SUBJECT },
+    fetchImpl: async () => ({ status: 200 }),
+  });
+  assert.equal(run.code, 0);
+  assert.ok(run.lines.some((line) => line.includes("no leagueId")));
+  clearStateFile();
+  clearAdvisorFile();
 });

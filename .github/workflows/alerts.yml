@@ -25,6 +25,16 @@ name: Alerts
 # - refresh-data.yml commits the same repo, so both workflows pull --rebase before pushing.
 # - A 410/404 from a push service marks the device expired in data/alerts-state.json; the secret
 #   itself has to be edited by hand.
+# - A 2xx from web.push.apple.com is NOT delivery. Apple answers 201 for a subscription it has
+#   already discarded (Apple Developer Forums 719990; research R5 section 6.2), so this job's
+#   "3/3 sent" means "accepted by Apple". The only proof of delivery is the service worker's
+#   receipt log on the phone: app -> Settings -> Alerts -> Diagnose, or scripts/alerts-doctor.mjs.
+# - ALERT_WEBHOOKS (optional secret) is a JSON array of fallback channels, each treated as another
+#   device with the same composition, dedupe and state entry:
+#     ["https://ntfy.sh/<your-topic>"]
+#     [{"url":"https://discord.com/api/webhooks/.../...","label":"Discord","prefs":{"deals":false}}]
+#   Discord webhooks, Slack incoming webhooks, ntfy topics and any plain JSON endpoint are
+#   recognised by host. No secret -> no channels, and the job behaves exactly as before.
 
 on:
   schedule:
@@ -78,6 +88,7 @@ jobs:
         env:
           PUSH_SUBSCRIPTIONS: ${{ secrets.PUSH_SUBSCRIPTIONS }}
           VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          ALERT_WEBHOOKS: ${{ secrets.ALERT_WEBHOOKS }}
           ALERT_TEST: ${{ inputs.test && '1' || '' }}
           ALERT_FULL: ${{ inputs.full && '1' || '' }}
 
