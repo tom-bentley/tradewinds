@@ -4,7 +4,7 @@
 // public through Sleeper's read-only API.
 
 export const APP_NAME = "Tradewinds";
-export const APP_VERSION = "0.4.1";
+export const APP_VERSION = "0.4.2";
 export const STORAGE_KEY = "tradewinds.settings.v1";
 
 /**
