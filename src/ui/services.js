@@ -198,6 +198,7 @@ async function loadLive() {
     storedToken: (push && push.storedToken) || null,
     saveToken: (push && push.saveToken) || null,
     maskToken: (push && push.maskToken) || null,
+    tokenLooksValid: (push && push.tokenLooksValid) || null,
 
     // ---- src/data.js transactions (§11.4) ----------------------------------------------
     getTransactionsWithNew: mods.data.getTransactionsWithNew || null,

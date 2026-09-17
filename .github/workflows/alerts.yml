@@ -25,7 +25,7 @@ name: Alerts
 #   its push subscription (design 13.3 B5): the app posts its pairing payload encrypted to the
 #   VAPID public key, this job opens it with VAPID_PRIVATE_KEY and files the ciphertext in
 #   data/alerts-state.json. Nothing readable ever reaches the public repository. That token is a
-#   fine-grained PAT on this repository only, with Actions: read and write.
+#   fine-grained PAT on this repository only, with Contents: read and write (repository_dispatch is a Contents permission — verified 2026-09-17).
 # - The app recomputes the same advice on open, so a late push never means a wrong decision.
 # - refresh-data.yml commits the same repo, so both workflows pull --rebase before pushing.
 # - A 410/404 from a push service marks the device expired in data/alerts-state.json; the secret

@@ -840,13 +840,40 @@ export function maskToken(token) {
   return `${value.slice(0, 8)}…${value.slice(-4)}`;
 }
 
-/** What a GitHub dispatch failure means, in words the card can print. */
+/**
+ * What a GitHub dispatch failure means, in words the card can print. Verified 2026-09-17 against
+ * api.github.com: a made-up token answers 401 "Bad credentials" — so 401 is about the token
+ * STRING, never about permissions — and `POST /repos/{owner}/{repo}/dispatches` needs the
+ * fine-grained permission **Contents: write** (GitHub docs, "Permissions required for
+ * fine-grained personal access tokens"), not Actions.
+ */
 export const DISPATCH_REASON_TEXT = Object.freeze({
-  401: "GitHub rejected the token (401). Paste a fresh fine-grained token.",
-  403: "The token is missing the Actions: read and write permission (403).",
-  404: "GitHub could not find the repository for this token (404) — check that it is scoped to tom-bentley/tradewinds.",
+  401: "GitHub does not recognise this token (401 Bad credentials). GitHub shows a token only once, on the page where you created it — the list page shows a shortened copy that does not work. Remove it here, create or regenerate the token, copy the whole github_pat_… string from that page and paste it again.",
+  403: "GitHub knows the token but it lacks permission (403): edit it to give Contents: Read and write on tom-bentley/tradewinds.",
+  404: "GitHub could not find the repository for this token (404) — its Repository access must include tom-bentley/tradewinds, with Contents: Read and write.",
   422: "GitHub refused the payload (422).",
 });
+
+/**
+ * Cheap shape check before a token is saved, so the card catches the two common paste mistakes
+ * — a shortened `github_pat_…` copied from the token LIST, or a name/label instead of the token —
+ * without a network round trip. Real validity is still GitHub's call.
+ * @param {string} token
+ * @returns {{ok: boolean, reason: string}}
+ */
+export function tokenLooksValid(token) {
+  const value = String(token ?? "").trim();
+  if (!value) return { ok: false, reason: "Paste the token first." };
+  if (!/^(github_pat_|ghp_|gho_|ghu_|ghs_|ghr_)/.test(value)) {
+    return { ok: false, reason: "A GitHub token starts with github_pat_ (fine-grained) or ghp_ (classic) — this does not." };
+  }
+  if (/[…]|\.\.\./.test(value)) {
+    return { ok: false, reason: "That is the shortened copy from GitHub's token list (it contains …). The full token is shown only once, on the page where it was created — regenerate it and copy from there." };
+  }
+  if (/\s/.test(value)) return { ok: false, reason: "The token has a space or line break inside it — paste it as one unbroken string." };
+  if (value.length < 40) return { ok: false, reason: "The token is too short to be complete — copy the whole string." };
+  return { ok: true, reason: "" };
+}
 
 /**
  * Ask GitHub to run the Alerts workflow with a payload, via `repository_dispatch`.

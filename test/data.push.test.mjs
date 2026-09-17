@@ -24,6 +24,7 @@ import {
   deviceLabel,
   disableAlerts,
   dispatchToGithub,
+  tokenLooksValid,
   enableAlerts,
   ensureSubscription,
   maskToken,
@@ -879,7 +880,7 @@ test("sendPairing posts a repository_dispatch and turns every failure into words
   assert.ok(body.client_payload.blob.length > 100);
   assert.ok(!calls[0].init.body.includes("web.push.apple.com"), "the dispatch body carries ciphertext only");
 
-  for (const [status, pattern] of [[401, /rejected the token/], [403, /Actions: read and write/], [404, /could not find the repository/]]) {
+  for (const [status, pattern] of [[401, /401 Bad credentials/], [403, /Contents: Read and write/], [404, /could not find the repository/]]) {
     const failed = await sendPairing({}, { ...ok.deps, fetchImpl: respond(status) });
     assert.equal(failed.ok, false);
     assert.match(failed.reason, pattern);
@@ -973,4 +974,15 @@ test("ensureSubscription does nothing it is not entitled to do", async () => {
   const failed = await ensureSubscription(failing.deps);
   assert.equal(failed.resubscribed, false);
   assert.match(failed.error, /subscription refused/);
+});
+
+test("tokenLooksValid catches the shortened-copy and wrong-string pastes before GitHub says 401", () => {
+  assert.equal(tokenLooksValid("github_pat_11ABCDEFG0aaaaaaaaaaaa_ZZZZbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").ok, true);
+  assert.equal(tokenLooksValid("ghp_" + "a".repeat(36)).ok, true, "classic tokens pass too");
+  assert.equal(tokenLooksValid("").ok, false);
+  assert.match(tokenLooksValid("github_pat_11AB…ZZZZ").reason, /shortened copy/, "the token list shows an ellipsis");
+  assert.match(tokenLooksValid("github_pat_11AB...ZZZZ").reason, /shortened copy/);
+  assert.match(tokenLooksValid("Tradewinds auto re-pair").reason, /starts with github_pat_/, "a token NAME is not a token");
+  assert.match(tokenLooksValid("github_pat_11AB CDEF" + "x".repeat(40)).reason, /space or line break/);
+  assert.match(tokenLooksValid("github_pat_short").reason, /too short/);
 });

@@ -96,9 +96,11 @@ function tokenOf() {
 }
 
 export const PAT_HELP =
-  "Optional. With a fine-grained GitHub token (this repository only, Actions: read and write) " +
-  "this phone re-pairs itself whenever iOS changes its push address — no copying codes. " +
-  "The token is stored on this phone only and is sent to api.github.com and nowhere else.";
+  "Optional. With a fine-grained GitHub token (Repository access: only tom-bentley/tradewinds; " +
+  "permission Contents: Read and write) this phone re-pairs itself whenever iOS changes its push " +
+  "address — no copying codes. Copy the whole github_pat_… string from the page shown right after " +
+  "you create the token; the token list only shows a shortened copy. The token is stored on this " +
+  "phone only and is sent to api.github.com and nowhere else.";
 
 export const PAT_URL = `${REPO}/settings/personal-access-tokens`;
 
@@ -597,6 +599,15 @@ function saveTokenFromField() {
   const field = document.getElementById("al-pat");
   const token = field ? String(field.value || "").trim() : "";
   if (!token) return toast("Paste the token first.", { tone: "warn" });
+  // Catch the shortened-copy and wrong-string mistakes before GitHub answers 401 to them.
+  try {
+    const shape = env.svc.tokenLooksValid ? env.svc.tokenLooksValid(token) : { ok: true };
+    if (shape && shape.ok === false) {
+      setIn("alerts", { problem: shape.reason });
+      paintAlerts();
+      return toast("That does not look like a complete token.", { tone: "warn" });
+    }
+  } catch { /* the shape check is advisory */ }
   if (!env.svc.saveToken || !env.svc.saveToken(token)) {
     return toast("This phone would not store the token.", { tone: "warn" });
   }

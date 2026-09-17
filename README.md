@@ -155,7 +155,7 @@ happens, so a manual re-paste is a chore that recurs. If you give the app a GitH
 re-pairs itself:
 
 1. github.com → Settings → Developer settings → **Fine-grained tokens** → Generate new token.
-   Repository access: **only** `tom-bentley/tradewinds`. Permissions: **Actions: Read and write**
+   Repository access: **only** `tom-bentley/tradewinds`. Permissions: **Contents: Read and write** (the `repository_dispatch` endpoint is a Contents permission, verified 2026-09-17; copy the full `github_pat_…` value from the page shown right after creation — the token list shows a shortened copy)
    (Metadata: Read is added automatically). Nothing else.
 2. In the app: Settings → Alerts → **Auto re-pair** → paste the token → **Save**.
 
