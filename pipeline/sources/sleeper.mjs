@@ -540,3 +540,206 @@ export async function collectSleeper(options) {
     },
   };
 }
+
+// ── Season history (data/history.json v1, design §13.6 F1) ───────────────────────────────────
+//
+// Endpoints (verified live 2026-09-17):
+//   /v1/stats/nfl/regular/{season}           season totals, ~8,200 rows: gp, gms_active, pts_std, rec
+//   /v1/stats/nfl/regular/{season}/{week}    one week, same row shape, gp === 1 when the player played
+//
+// Both are cache-busted. The file exists so the risk model can measure what a player ACTUALLY did
+// (durability, weekly variance) — it is not a scoring source: only `pts_std` and `rec` are kept, so
+// half-PPR = std + 0.5*rec and PPR = std + rec. Other reception bonuses (bonus_rec_te, rec_40p, …)
+// are deliberately ignored; league-exact points are projections.json v2's job (§10.1).
+
+/** Schema version stamped into data/history.json (design §13.6 F1). */
+export const HISTORY_VERSION = 1;
+
+/** Decimals kept on a weekly point total — one is plenty for a CV / floor-ceiling model. */
+export const HISTORY_DECIMALS = 1;
+
+/** Which raw Sleeper keys the two numbers of a `w` cell come from. Shipped inside the file. */
+export const HISTORY_SCORING = Object.freeze({ std: "pts_std", rec: "rec" });
+
+/**
+ * @typedef {{ gp: number, ga: number|null, w: ([number, number]|null)[] }} HistoryPlayer
+ * @typedef {{ weeks: number, players: Record<string, HistoryPlayer> }} HistorySeason
+ * @typedef {{ version: number, generated_at: string, scoring: { std: string, rec: string },
+ *   seasons: Record<string, HistorySeason> }} History
+ */
+
+/**
+ * Season totals for every NFL player. Dict of player_id -> row (DEF rows are keyed by team code).
+ * @param {string|number} season
+ * @returns {Promise<Record<string, any>>}
+ */
+export async function fetchSeasonStats(season) {
+  const url = `${SLEEPER_API}/v1/stats/nfl/regular/${season}`;
+  const raw = await fetchJson(url, { cacheBust: true });
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`unexpected season stats payload from ${url}`);
+  }
+  return /** @type {Record<string, any>} */ (raw);
+}
+
+/**
+ * One week of actuals, same row shape as the season totals. A week that has not been played yet
+ * answers `{}` — that is data, not an error, and becomes a column of nulls.
+ * @param {string|number} season
+ * @param {number} week
+ * @returns {Promise<Record<string, any>>}
+ */
+export async function fetchWeekStats(season, week) {
+  const url = `${SLEEPER_API}/v1/stats/nfl/regular/${season}/${week}`;
+  const raw = await fetchJson(url, { cacheBust: true });
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`unexpected week stats payload from ${url}`);
+  }
+  return /** @type {Record<string, any>} */ (raw);
+}
+
+/**
+ * One `w` cell from a raw weekly row: `[pts_std, rec]` when the player was active that week,
+ * else null. `gp === 1` is the activity test — a player who dressed but recorded nothing carries
+ * no `pts_std` key at all and must still read as ACTIVE with 0 points (that zero is exactly the
+ * kind of week a variance model has to see), so a missing number becomes 0.
+ * @param {unknown} row
+ * @returns {[number, number]|null}
+ */
+export function historyCell(row) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const played = numOrNull(/** @type {any} */ (row).gp);
+  if (played !== 1) return null;
+  return [
+    round(numOrNull(/** @type {any} */ (row).pts_std) ?? 0, HISTORY_DECIMALS),
+    round(numOrNull(/** @type {any} */ (row).rec) ?? 0, HISTORY_DECIMALS),
+  ];
+}
+
+/**
+ * Fold one season's raw payloads into a `seasons[<year>]` entry. Players with no active week at
+ * all are dropped (a 2026 rookie has no 2025 row to ship). `gp`/`ga` come from the season totals,
+ * the only place `gms_active` exists; a DEF row carries no `gms_active`, so its `ga` is null.
+ * @param {{ totals?: Record<string, any>|null, weekly?: (Record<string, any>|null)[],
+ *   allowedIds?: Iterable<string>|null }} input `weekly[0]` is week 1
+ * @returns {HistorySeason}
+ */
+export function buildHistorySeason(input) {
+  const { totals = {}, weekly = [], allowedIds = null } = input;
+  const ids = allowedIds
+    ? [...new Set(allowedIds)]
+    : [...new Set(weekly.flatMap((rows) => (rows ? Object.keys(rows) : [])))];
+  /** @type {Record<string, HistoryPlayer>} */
+  const players = {};
+  for (const id of ids.sort(compareIds)) {
+    const w = weekly.map((rows) => historyCell(rows?.[id]));
+    if (!w.some((cell) => cell !== null)) continue;
+    const row = totals?.[id] ?? {};
+    players[id] = {
+      gp: numOrNull(row.gp) ?? w.filter((cell) => cell !== null).length,
+      ga: numOrNull(row.gms_active),
+      w,
+    };
+  }
+  return { weeks: weekly.length, players };
+}
+
+/**
+ * Wrap season entries into the data/history.json v1 envelope.
+ * @param {{ seasons: Record<string, HistorySeason>, generatedAt: string }} input
+ * @returns {History}
+ */
+export function finalizeHistory(input) {
+  const { seasons, generatedAt } = input;
+  return {
+    version: HISTORY_VERSION,
+    generated_at: generatedAt,
+    scoring: { ...HISTORY_SCORING },
+    seasons: orderedByKey(seasons),
+  };
+}
+
+/**
+ * Which seasons the file covers and how many weeks of each: last season complete, this season up
+ * to the week before the current one (week N is still being played, so its rows are partial and
+ * its endpoint answers `{}` until the games are in).
+ * @param {{ season: string|number, week: number }} input `week` as data/meta.json reports it
+ * @returns {{ season: string, weeks: number }[]}
+ */
+export function historySeasonPlan(input) {
+  const current = Number(input.season);
+  const week = Math.max(1, Number(input.week) || 1);
+  const played = Math.min(SEASON_WEEKS, Math.max(0, week - 1));
+  return [
+    { season: String(current - 1), weeks: SEASON_WEEKS },
+    { season: String(current), weeks: played },
+  ];
+}
+
+/**
+ * Every player id on a league's rosters, in any list. Rostered players must keep their history
+ * even when they fall out of data/players.json (Sleeper flips a released or long-term-injured
+ * player to `active: false`, which is exactly the player a buy-low trade is about).
+ * @param {unknown} rosters raw Sleeper `/league/{id}/rosters` payload
+ * @returns {string[]}
+ */
+export function rosterPlayerIds(rosters) {
+  if (!Array.isArray(rosters)) return [];
+  /** @type {Set<string>} */
+  const ids = new Set();
+  for (const roster of rosters) {
+    for (const list of [roster?.players, roster?.reserve, roster?.taxi, roster?.starters]) {
+      if (!Array.isArray(list)) continue;
+      for (const id of list) if (typeof id === "string" && id !== "" && id !== "0") ids.add(id);
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * Fetch and transform every season in the plan. Sequential with POLITE_DELAY_MS between calls
+ * (~20 requests, ~10 s). A season that fails is recorded in `errors` and left out of `seasons`,
+ * so the last-good guard can carry the previous run's copy forward instead of shipping a hole.
+ * @param {{ season: string|number, week: number, allowedIds: Iterable<string>,
+ *   generatedAt: string, log?: (message: string) => void, delayMs?: number }} options
+ *   `delayMs` exists so the tests do not sit through 20 polite pauses; the pipeline never sets it.
+ * @returns {Promise<{ history: History, errors: Record<string, string>,
+ *   stats: Record<string, { weeks: number, players: number }> }>}
+ */
+export async function collectHistory(options) {
+  const { season, week, allowedIds, generatedAt, log = () => {}, delayMs = POLITE_DELAY_MS } = options;
+  const allowed = new Set(allowedIds);
+  /** @type {Record<string, HistorySeason>} */
+  const seasons = {};
+  /** @type {Record<string, string>} */
+  const errors = {};
+  /** @type {Record<string, { weeks: number, players: number }>} */
+  const stats = {};
+
+  for (const plan of historySeasonPlan({ season, week })) {
+    if (plan.weeks === 0) {
+      seasons[plan.season] = { weeks: 0, players: {} };
+      stats[plan.season] = { weeks: 0, players: 0 };
+      log(`history: ${plan.season} has no completed week yet`);
+      continue;
+    }
+    try {
+      const totals = await fetchSeasonStats(plan.season);
+      await sleep(delayMs);
+      /** @type {Record<string, any>[]} */
+      const weekly = [];
+      for (let w = 1; w <= plan.weeks; w += 1) {
+        weekly.push(await fetchWeekStats(plan.season, w));
+        await sleep(delayMs);
+      }
+      const built = buildHistorySeason({ totals, weekly, allowedIds: allowed });
+      seasons[plan.season] = built;
+      stats[plan.season] = { weeks: built.weeks, players: Object.keys(built.players).length };
+      log(`history: ${plan.season} ${Object.keys(built.players).length} players over ${built.weeks} week(s)`);
+    } catch (error) {
+      errors[plan.season] = error.message;
+    }
+  }
+
+  return { history: finalizeHistory({ seasons, generatedAt }), errors, stats };
+}

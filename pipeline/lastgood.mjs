@@ -135,3 +135,121 @@ export function applyLastGood(input) {
 
   return { sources, notes, kept, failed };
 }
+
+// ── data/history.json (design §13.6 F1) ──────────────────────────────────────────────────────
+//
+// Same rule as the value tables, one level down: the guard works PER SEASON, because the two
+// seasons come from independent fetches and a Sleeper hiccup on last season must not blank out
+// this season's actuals (or the other way round). A season that fails, or that comes back
+// suspiciously short, keeps the copy the previous run committed; the failure is reported through
+// data/meta.json `sources.history`, so the file itself always matches the v1 contract exactly.
+
+/**
+ * Player-row floors for one season of data/history.json. A complete 2025 measured 591 rows and a
+ * single 2026 week measured 481, so 150 flags a broken transform without ever false-failing a
+ * quiet week. A season with no completed week legitimately carries no rows at all.
+ */
+export const HISTORY_FLOORS = Object.freeze({ played: 150, unplayed: 0 });
+
+/**
+ * @typedef {{ weeks: number, players: Record<string, unknown> }} HistorySeason
+ * @typedef {{ version: number, generated_at: string, scoring: Record<string, string>,
+ *   seasons: Record<string, HistorySeason> }} History
+ */
+
+/**
+ * Rows a season actually carries.
+ * @param {HistorySeason|null|undefined} season
+ * @returns {number}
+ */
+export function historyPlayerCount(season) {
+  const players = season?.players;
+  return players && typeof players === "object" && !Array.isArray(players) ? Object.keys(players).length : 0;
+}
+
+/**
+ * The row floor a season has to clear.
+ * @param {number} weeks
+ * @param {{ played?: number, unplayed?: number }} [floors]
+ * @returns {number}
+ */
+export function historySeasonFloor(weeks, floors = HISTORY_FLOORS) {
+  return Number(weeks) > 0 ? (floors.played ?? 0) : (floors.unplayed ?? 0);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is History}
+ */
+function isHistory(value) {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    !!(/** @type {any} */ (value).seasons) &&
+    typeof (/** @type {any} */ (value).seasons) === "object" &&
+    !Array.isArray(/** @type {any} */ (value).seasons)
+  );
+}
+
+/**
+ * @param {string} file path to the existing data/history.json
+ * @returns {History|null} the previous file, or null when absent/unreadable/not a history file
+ */
+export function loadPreviousHistory(file) {
+  const previous = readJsonIfExists(file);
+  return isHistory(previous) ? previous : null;
+}
+
+/**
+ * Apply the last-good guard, season by season.
+ * @param {{ next?: History|null, errors?: Record<string, string>, previous?: History|null,
+ *   floors?: { played?: number, unplayed?: number } }} input `errors` is keyed by season, as
+ *   `collectHistory` reports them.
+ * @returns {{ history: History|null, kept: string[], failed: string[], notes: string[] }}
+ */
+export function resolveHistory(input) {
+  const { next = null, errors = {}, previous = null, floors = HISTORY_FLOORS } = input;
+  const nextSeasons = isHistory(next) ? next.seasons : {};
+  const previousSeasons = isHistory(previous) ? previous.seasons : {};
+  /** @type {Record<string, HistorySeason>} */
+  const seasons = {};
+  /** @type {string[]} */
+  const kept = [];
+  /** @type {string[]} */
+  const failed = [];
+  /** @type {string[]} */
+  const notes = [];
+
+  const years = [...new Set([...Object.keys(nextSeasons), ...Object.keys(previousSeasons), ...Object.keys(errors)])];
+  for (const year of years.sort()) {
+    const candidate = nextSeasons[year] ?? null;
+    const rows = historyPlayerCount(candidate);
+    const floor = historySeasonFloor(candidate?.weeks ?? 0, floors);
+    const reason =
+      errors[year] ??
+      (!candidate ? "season not fetched" : rows < floor ? `player count ${rows} below floor ${floor}` : null);
+
+    if (reason === null) {
+      seasons[year] = /** @type {HistorySeason} */ (candidate);
+      continue;
+    }
+    failed.push(year);
+    const fallback = previousSeasons[year];
+    if (fallback && historyPlayerCount(fallback) > 0) {
+      seasons[year] = fallback;
+      kept.push(year);
+      notes.push(
+        `history ${year}: kept last good season (${historyPlayerCount(fallback)} players over ` +
+          `${fallback.weeks} week(s)) — ${reason}`,
+      );
+      continue;
+    }
+    if (candidate) seasons[year] = candidate;
+    notes.push(`history ${year}: ${reason}; no previous season to fall back on`);
+  }
+
+  const envelope = isHistory(next) ? next : isHistory(previous) ? previous : null;
+  if (!envelope) return { history: null, kept, failed, notes };
+  return { history: { ...envelope, seasons }, kept, failed, notes };
+}

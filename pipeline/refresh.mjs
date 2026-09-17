@@ -3,7 +3,7 @@
 //
 //   node pipeline/refresh.mjs
 //
-// Writes data/{players,projections,values,schedule,meta}.json.
+// Writes data/{players,projections,values,schedule,history,meta}.json.
 // League-agnostic since design §10.6: nothing here reads a league. projections.json ships raw
 // stat lines (v2) and values.json ships one table per league shape, so the phone can score any
 // Sleeper league from the same committed files.
@@ -21,21 +21,51 @@ import {
   formatSize,
   isoTimestamp,
   orderedByKey,
+  readJsonIfExists,
   sleep,
   writeJsonFile,
 } from "./util.mjs";
 import { validateAll } from "./contract.mjs";
-import { ROW_FLOORS, applyLastGood, loadPreviousValueSources } from "./lastgood.mjs";
-import { buildNameIndex, collectSleeper, fetchState } from "./sources/sleeper.mjs";
+import {
+  HISTORY_FLOORS,
+  ROW_FLOORS,
+  applyLastGood,
+  historyPlayerCount,
+  loadPreviousHistory,
+  loadPreviousValueSources,
+  resolveHistory,
+} from "./lastgood.mjs";
+import {
+  buildNameIndex,
+  collectHistory,
+  collectSleeper,
+  fetchState,
+  rosterPlayerIds,
+} from "./sources/sleeper.mjs";
 import { FC_NUM_TEAMS, FC_PPR, FC_TABLES, fetchFantasyCalcTable } from "./sources/fantasycalc.mjs";
 import { DP_TABLES, fetchDynastyProcessTables } from "./sources/dynastyprocess.mjs";
 import { BC_FORMATS, fetchBorisChenTables } from "./sources/borischen.mjs";
 
-/** Total data/ budget; the run warns (does not fail) above it. Stat lines dominate it. */
-const SIZE_BUDGET_BYTES = 1_600_000;
+/**
+ * Total data/ budget; the run warns (does not fail) above it. Stat lines dominate it; raised from
+ * 1.6 MB when data/history.json (design §13.6) joined the set.
+ */
+const SIZE_BUDGET_BYTES = 1_800_000;
+
+/** Per-file budget for data/history.json alone (design §13.6 F1: "≤ 220 KB raw"). Warns only. */
+const HISTORY_SIZE_BUDGET_BYTES = 220_000;
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DATA_DIR = join(REPO_ROOT, "data");
+
+/**
+ * The fixture league's roster snapshot. The pipeline is league-agnostic (design §10.6) so it
+ * never fetches a league, yet history.json must not lose the one set of players the app is
+ * certain to ask about: Sleeper flips a released or long-term-injured player to `active: false`,
+ * which drops him out of data/players.json while he is still on somebody's roster (and is exactly
+ * the player an IR buy-low trade is about). Absent or unreadable, this simply adds nothing.
+ */
+const ROSTER_SNAPSHOT_FILE = join(REPO_ROOT, "test", "fixtures", "rosters.json");
 
 /**
  * Every value table this pipeline publishes -> its `variant` (design §10.2). Also the whitelist
@@ -155,6 +185,37 @@ export async function main() {
   const projectionCount = Object.keys(core.projections.players).length;
   const nameIndex = buildNameIndex(core.players.players);
 
+  // --- season history (design §13.6) ---------------------------------------
+  // ~20 sequential calls. Optional like the value tables: a failure keeps the committed season.
+  const historyIds = new Set(Object.keys(core.players.players));
+  for (const id of rosterPlayerIds(readJsonIfExists(ROSTER_SNAPSHOT_FILE))) historyIds.add(id);
+  await sleep(POLITE_DELAY_MS);
+  let historyRun = { history: null, errors: { history: "not attempted" }, stats: {} };
+  try {
+    historyRun = await collectHistory({
+      season,
+      week,
+      allowedIds: historyIds,
+      generatedAt,
+      log: (message) => status("ok", "sleeper_history", message.split(": ").slice(1).join(": ")),
+    });
+  } catch (error) {
+    status("warn", "sleeper_history", error.message);
+    historyRun = { history: null, errors: { [String(season)]: error.message }, stats: {} };
+  }
+  const guardedHistory = resolveHistory({
+    next: historyRun.history,
+    errors: historyRun.errors,
+    previous: loadPreviousHistory(join(DATA_DIR, "history.json")),
+    floors: HISTORY_FLOORS,
+  });
+  for (const note of guardedHistory.notes) status("warn", "lastgood", note);
+  const history = guardedHistory.history;
+  const historyRows = Object.values(history?.seasons ?? {}).reduce(
+    (total, entry) => total + historyPlayerCount(entry),
+    0,
+  );
+
   // --- optional value sources ----------------------------------------------
   status("ok", "fantasycalc_params", `numTeams=${FC_NUM_TEAMS} ppr=${FC_PPR} · numQbs 1 and 2`);
 
@@ -230,6 +291,23 @@ export async function main() {
   for (const id of Object.keys(PUBLISHED_TABLES)) {
     metaSources[id] = metaEntry(guarded.sources[id], attempts[id], generatedAt);
   }
+  if (history) {
+    // `count` is the total player rows across every season, so the phone can see at a glance
+    // whether the feed is worth reading; a season carried forward flips `ok` to false and names
+    // the seasons, because the file itself has nowhere to record its own staleness.
+    metaSources.history = {
+      ok: guardedHistory.failed.length === 0,
+      fetched_at: history.generated_at ?? generatedAt,
+      count: historyRows,
+      seasons: Object.fromEntries(
+        Object.entries(history.seasons).map(([year, entry]) => [year, historyPlayerCount(entry)]),
+      ),
+    };
+    if (guardedHistory.failed.length > 0) {
+      metaSources.history.error =
+        guardedHistory.notes.join("; ") || `season(s) ${guardedHistory.failed.join(", ")} failed`;
+    }
+  }
   const meta = {
     generated_at: generatedAt,
     season,
@@ -238,11 +316,16 @@ export async function main() {
     sources: orderedByKey(metaSources),
   };
 
+  // `history` is optional: a run that could not build one AND has no committed copy writes no
+  // file at all, and src/data.js treats "absent" as the ordinary case (design §13.6 F3).
+  // meta.json stays last so the build stamp is never newer than the files it describes.
+  /** @type {Record<string, any>} */
   const files = {
     players: core.players,
     projections: core.projections,
     values,
     schedule: core.schedule,
+    ...(history ? { history } : {}),
     meta,
   };
 
@@ -253,7 +336,9 @@ export async function main() {
     for (const problem of list.slice(0, 5)) status("warn", `contract:${name}`, problem);
     if (list.length > 5) status("warn", `contract:${name}`, `... and ${list.length - 5} more`);
   }
-  if (problemCount === 0) status("ok", "contract", "all five files valid");
+  if (problemCount === 0) {
+    status("ok", "contract", `all ${Object.keys(problems).length} files valid`);
+  }
 
   let totalBytes = 0;
   let totalGzip = 0;
@@ -262,6 +347,17 @@ export async function main() {
     totalBytes += size.bytes;
     totalGzip += size.gzip;
     status("ok", `write:${name}.json`, formatSize(size));
+    if (name === "history") {
+      const detail = Object.entries(value.seasons)
+        .map(([year, entry]) => `${year}: ${historyPlayerCount(entry)} players / ${entry.weeks} wk`)
+        .join(" · ");
+      status(
+        size.bytes > HISTORY_SIZE_BUDGET_BYTES ? "warn" : "ok",
+        "history",
+        `${detail} — ${size.bytes.toLocaleString("en-US")} B of a ` +
+          `${HISTORY_SIZE_BUDGET_BYTES.toLocaleString("en-US")} byte budget`,
+      );
+    }
   }
   status(
     totalBytes > SIZE_BUDGET_BYTES ? "warn" : "ok",
