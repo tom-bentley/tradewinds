@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- interactive-widget=resizes-content: the on-screen keyboard shrinks the LAYOUT viewport
+     instead of only the visual one, so the fixed shell re-lays-out above the keyboard rather
+     than being scrolled out from under it (design §13.2 A1). Ignored by browsers that predate it. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>Tradewinds — Sleeper trade analyzer</title>
 <meta name="description" content="On-the-spot Sleeper trade analyzer: consensus values, lineup impact, and the best trades to propose.">
 <meta name="color-scheme" content="dark light">
