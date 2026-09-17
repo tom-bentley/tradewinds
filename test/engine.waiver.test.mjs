@@ -2,7 +2,7 @@ import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 
-import { activePlayers, buildContext, rosterById } from "../src/engine/context.js";
+import { activePlayers, buildContext, rosPoints, rosterById } from "../src/engine/context.js";
 import { marketValue, surplus } from "../src/engine/values.js";
 import { seasonLineup, weekPoints } from "../src/engine/lineup.js";
 import { evaluateTrade } from "../src/engine/trade.js";
@@ -105,8 +105,11 @@ test("the free-agent pool excludes every rostered, reserve and taxi id", () => {
   assert.ok(pool.includes(MAHOMES), "Patrick Mahomes is unrostered in this league");
   assert.ok(pool.includes(NIX), "Bo Nix is unrostered in this league");
   // best-first, so the shortlist can just take the head of each position
-  const ros = (id) => seasonLineup(ctx, [id]).total;
-  for (let i = 1; i < pool.length; i += 1) assert.ok(ros(pool[i - 1]) >= ros(pool[i]) - 1e-9);
+  // best-first on `rosPoints`, which is what freeAgentPool sorts on. (A one-man seasonLineup is
+  // no longer a proxy for it: since 13.5 D2 the other ten slots carry a streaming credit.)
+  for (let i = 1; i < pool.length; i += 1) {
+    assert.ok(rosPoints(ctx, pool[i - 1]) >= rosPoints(ctx, pool[i]) - 1e-9);
+  }
 
   // one id set, memoized per ctx
   assert.equal(freeAgentPool(ctx), pool);
@@ -209,7 +212,15 @@ test("findFreeAgents caps, dedupes, sorts by score and clears the gain floor", (
     assert.ok(["free", "waivers"].includes(row.status));
     assert.ok(Array.isArray(row.why) && row.why.length >= 2);
     assert.ok(row.why[0].includes(ctx.players.get(row.add).name));
-    assert.ok(Math.abs(row.score - (row.gainPerWeek + 0.05 * (row.valueDelta / 100))) < 1e-9);
+    assert.ok(Number.isFinite(row.surplusDelta));
+    assert.ok(Number.isFinite(row.insurancePerWeek) && Number.isFinite(row.riskPenalty));
+    const cfg = ctx.settings.freeAgents;
+    const expected =
+      row.gainPerWeek +
+      cfg.valueWeight * (row.surplusDelta / 100) +
+      cfg.insuranceWeight * row.insurancePerWeek -
+      cfg.riskWeight * row.riskPenalty;
+    assert.ok(Math.abs(row.score - expected) < 1e-9, `${row.add}: ${row.score} vs ${expected}`);
   }
   for (let i = 1; i < rows.length; i += 1) assert.ok(rows[i - 1].score >= rows[i].score, "sorted by score");
 
@@ -293,7 +304,9 @@ test("FAAB bids are only for contested claims, and always fit the budget", () =>
   // put the whole wire on waivers so every row carries a bid
   const allDropped = freeAgentPool(ctx).map((id) => droppedNow(id));
   const contested = build({ transactions: allDropped });
-  const rows = findFreeAgents(contested, { rosterId: MINE, maxResults: 12 });
+  // The floor is relaxed here on purpose: this test is about BIDS, and since 13.5 D2 priced the
+  // wire into every empty slot only two adds on this fixture clear the 0.5 pts/wk default.
+  const rows = findFreeAgents(contested, { rosterId: MINE, maxResults: 12, minGainPerWeek: 0.01 });
   assert.ok(rows.length > 0);
 
   const remaining = contested.league.waiverBudget - rosterById(contested, MINE).waiverBudgetUsed;
@@ -346,7 +359,12 @@ test("K and DEF candidates are valued on points alone", () => {
   for (const row of kickers) {
     assert.equal(row.valueDelta, 0, "K/DEF never carry a market value");
     assert.equal(marketValue(ctx, row.add).m, null);
-    assert.equal(row.score, row.gainPerWeek, "so their score is pure lineup gain");
+    assert.equal(surplus(ctx, row.add), 0, "and no surplus over the wire either");
+    // 13.5 D3: the add is worth nothing on the market axis, but the DROP still costs what it
+    // costs — signing a kicker for a valued bench body is not free.
+    assert.ok(row.surplusDelta <= 0, `${row.add} surplusDelta ${row.surplusDelta}`);
+    if (row.drop) assert.ok(Math.abs(row.surplusDelta + surplus(ctx, row.drop)) < 1e-9);
+    else assert.equal(row.surplusDelta, 0);
   }
 });
 
@@ -477,5 +495,179 @@ test("the engine never reads the wall clock", () => {
     const source = readFileSync(new URL(name, dir), "utf8");
     assert.ok(!source.includes("Date.now"), `${name} reads the wall clock — ctx.now is the only clock`);
     assert.ok(!/\bfetch\s*\(/.test(source), `${name} fetches — the engine is pure`);
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
+// §13.5 D3/D5 — the anti-QB-bias case, on a purpose-built league
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A tiny, fully specified league: one QB slot, one FLEX, and a wire that holds both a startable
+ * quarterback and a mediocre flex body. Every projection here is a constant, so the arithmetic in
+ * the assertions below can be done on paper.
+ */
+function qbBiasLeague({ wireQb = 18, roster = {}, settings = {} } = {}) {
+  const slots = ["QB", "RB", "WR", "FLEX", "BN", "BN", "BN", "BN"];
+  const rows = [
+    // my roster: a QB1 on bye in week 3, and starters good enough that only a real upgrade helps
+    { id: "myqb", pos: "QB", pts: 20, bye: 3, roster: 1 },
+    { id: "myrb", pos: "RB", pts: 14, roster: 1 },
+    { id: "mywr", pos: "WR", pts: 13, roster: 1 },
+    { id: "myflex", pos: "WR", pts: 8, roster: 1 },
+    { id: "spare", pos: "WR", pts: 2, roster: 1 },
+    // a rival, so the league has two teams and a replacement level
+    { id: "hisqb", pos: "QB", pts: 19, roster: 2 },
+    { id: "hisrb", pos: "RB", pts: 13, roster: 2 },
+    { id: "hiswr", pos: "WR", pts: 12, roster: 2 },
+    { id: "hisflex", pos: "WR", pts: 9, roster: 2 },
+    { id: "hisspare", pos: "WR", pts: 3, roster: 2 },
+    // the wire: a backup QB, a startable streaming QB, and a flex body worth +1.5 a week
+    { id: "faqb2", pos: "QB", pts: 18, bye: 9, roster: 0 },
+    { id: "fastream", pos: "QB", pts: wireQb, bye: 11, roster: 0 },
+    { id: "faflex", pos: "WR", pts: 9.6, roster: 0 },
+    { id: "fajunk", pos: "WR", pts: 1, roster: 0 },
+    ...Object.entries(roster).map(([id, row]) => ({ id, roster: 0, ...row })),
+  ];
+  const weeks = 17;
+  const players = {};
+  const projections = { version: 1, players: {} };
+  const squads = { 1: [], 2: [] };
+  for (const row of rows) {
+    players[row.id] = {
+      id: row.id,
+      name: row.id,
+      pos: row.pos,
+      team: row.id.toUpperCase(),
+      inj: null,
+      injPart: null,
+      injNotes: null,
+      age: 26,
+      exp: 4,
+      dc: 1,
+      bye: row.bye ?? null,
+    };
+    projections.players[row.id] = Array.from({ length: weeks }, () => row.pts);
+    if (row.roster) squads[row.roster].push(row.id);
+  }
+  return buildContext(
+    {
+      league: {
+        league_id: "qb-bias",
+        name: "QB bias",
+        season: "2026",
+        roster_positions: slots,
+        scoring_settings: { rec: 0.5 },
+        settings: { num_teams: 2, playoff_week_start: 15, playoff_teams: 2, waiver_type: 0 },
+      },
+      users: [
+        { user_id: "u1", display_name: "me" },
+        { user_id: "u2", display_name: "rival" },
+      ],
+      rosters: [
+        { roster_id: 1, owner_id: "u1", players: squads[1], starters: squads[1].slice(0, 4) },
+        { roster_id: 2, owner_id: "u2", players: squads[2], starters: squads[2].slice(0, 4) },
+      ],
+      players: { players },
+      projections,
+      values: { sources: {} },
+      schedule: { byes: {} },
+      state: { week: 1, season: "2026", season_type: "regular" },
+    },
+    { userId: "u1", ...settings }
+  );
+}
+
+test("D3: a QB2 no longer beats a real flex upgrade, because the wire streams the bye", () => {
+  const league = qbBiasLeague();
+  const rows = findFreeAgents(league, { rosterId: 1, maxResults: 10, minGainPerWeek: -99 });
+  const byId = new Map(rows.map((r) => [r.add, r]));
+  const qb2 = byId.get("faqb2");
+  const flex = byId.get("faflex");
+  assert.ok(qb2 && flex, `both candidates must be scored: ${[...byId.keys()].join(", ")}`);
+
+  // the flex add is a genuine weekly upgrade: 9.6 replaces myflex's 8 in all 17 weeks
+  assert.ok(flex.gainPerWeek >= 1.5, `the flex add gains ${flex.gainPerWeek.toFixed(2)} pts/wk`);
+  // the QB2 only ever plays week 3, and the wire covers week 3 for free at 0.9 x 18 = 16.2,
+  // so his whole case is 18 - 16.2 = 1.8 points ONCE, or ~0.1 pts/wk over 17 weeks
+  assert.ok(qb2.gainPerWeek < 0.25, `the QB2 gains ${qb2.gainPerWeek.toFixed(2)} pts/wk`);
+  assert.ok(qb2.score < flex.score, `QB2 ${qb2.score.toFixed(3)} must rank below flex ${flex.score.toFixed(3)}`);
+  assert.equal(rows[0].add, "faflex", "and the flex add is the recommendation");
+
+  // R5 section 5.8 check 4: with a startable QB on the wire the QB2 insures nothing
+  assert.ok(Math.abs(qb2.insurancePerWeek) < 0.2, `insurance ${qb2.insurancePerWeek}`);
+  // R5 section 5.8 check 7: the engine says out loud that QB depth is not worth buying here
+  assert.ok(qb2.streamable.streamable, "the wire QB is as good as mine");
+  assert.ok(
+    qb2.why.some((line) => line.includes("the wire streams") || line.includes("Do not pay for depth at QB")),
+    qb2.why.join(" | ")
+  );
+});
+
+test("D3: switch the streaming credit off and the old QB bias comes straight back", () => {
+  // The regression guard. This is exactly the model Tom complained about: with an empty slot
+  // worth ZERO, the QB2 books his whole 18 points for the week-3 bye and buries a real upgrade.
+  const buggy = qbBiasLeague({ settings: { streaming: { enabled: false } } });
+  const rows = findFreeAgents(buggy, { rosterId: 1, maxResults: 10, minGainPerWeek: -99 });
+  const byId = new Map(rows.map((r) => [r.add, r]));
+  const qb2 = byId.get("faqb2");
+  const flex = byId.get("faflex");
+  // 18 points once over 17 weeks, playoff-weighted: ~0.9 pts/wk against the flex add's 1.6
+  assert.ok(qb2.gainPerWeek > 0.8, `unstreamed, the QB2 books ${qb2.gainPerWeek.toFixed(2)} pts/wk`);
+  assert.ok(qb2.gainPerWeek > 8 * findFreeAgents(qbBiasLeague(), { rosterId: 1, minGainPerWeek: -99 })
+    .find((r) => r.add === "faqb2").gainPerWeek, "the credit cuts his case by an order of magnitude");
+  assert.ok(flex.score > 0, "the flex add is still a real upgrade either way");
+});
+
+test("D3: a wire you cannot trust makes the same QB2 worth holding", () => {
+  // The answer tracks the WIRE — D2 is not an anti-quarterback rule. Same league, same players;
+  // only the friction changes (R5 section 5.5's one lever). At QB 0.9 the wire is nearly a real
+  // starter and holding a backup buys almost nothing; at QB 0.1 it is a lottery ticket and a
+  // rostered QB2 is genuine cover for the bye AND for an absence.
+  const pick = (league) =>
+    findFreeAgents(league, { rosterId: 1, maxResults: 10, minGainPerWeek: -99 }).find((r) => r.add === "faqb2");
+  const trusted = pick(qbBiasLeague());
+  const untrusted = pick(qbBiasLeague({ settings: { streaming: { frictionByPos: { QB: 0.1 } } } }));
+
+  // R5 section 5.8 check 4: insurance is ~0 while a startable QB sits on the wire
+  assert.ok(Math.abs(trusted.insurancePerWeek) < 0.2, `trusted wire insurance ${trusted.insurancePerWeek}`);
+  assert.ok(
+    untrusted.insurancePerWeek > trusted.insurancePerWeek + 0.5,
+    `untrusted ${untrusted.insurancePerWeek} vs trusted ${trusted.insurancePerWeek}`
+  );
+  assert.ok(untrusted.gainPerWeek > trusted.gainPerWeek, "and the bye-week gain grows with it");
+  assert.ok(untrusted.score > trusted.score);
+  assert.ok(trusted.streamable.streamable, "the position is streamable when the wire is good");
+});
+
+test("D3: every FaScore component is reported, and they sum to the score", () => {
+  const league = qbBiasLeague();
+  const cfg = league.settings.freeAgents;
+  for (const row of findFreeAgents(league, { rosterId: 1, maxResults: 10, minGainPerWeek: -99 })) {
+    const expected =
+      row.gainPerWeek +
+      cfg.valueWeight * (row.surplusDelta / 100) +
+      cfg.insuranceWeight * row.insurancePerWeek -
+      cfg.riskWeight * row.riskPenalty;
+    assert.ok(Math.abs(row.score - expected) < 1e-9, `${row.add}: ${row.score} vs ${expected}`);
+    assert.ok(row.insurancePerWeek <= cfg.insuranceCap + 1e-9, "insurance is capped (R5 section 4)");
+    assert.ok(Math.abs(row.riskPenalty - (row.risk.score / 100) * Math.max(0, row.gainPerWeek)) < 1e-9);
+    assert.ok(row.risk && row.risk.band, "the add's own risk row travels with him");
+    assert.ok(Number.isFinite(row.valueDelta) && Number.isFinite(row.surplusDelta));
+  }
+});
+
+test("D3: the drop is chosen on gain AND insurance, never gain alone", () => {
+  // `spare` is a 2-point body; `myflex` is the 8-point flex starter. The gain-maximizing drop
+  // must never be the starter, and the chosen drop must be legal.
+  const league = qbBiasLeague();
+  const starters = currentStarters(league, 1);
+  for (const row of findFreeAgents(league, { rosterId: 1, maxResults: 10, minGainPerWeek: -99 })) {
+    if (!row.drop) continue;
+    assert.ok(
+      !starters.has(row.drop) || league.players.get(row.drop).pos === row.pos,
+      `${row.drop} is a set starter at another position`
+    );
+    assert.ok(Number.isFinite(row.insurancePerWeek));
   }
 });
