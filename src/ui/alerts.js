@@ -116,14 +116,15 @@ function autoRepairBlock() {
   return `<div class="al-pat">
     <p class="swrow-l">Auto re-pair</p>
     ${token
-      ? `<div class="al-pat-set">
-          <code class="al-pat-mask">${escapeHtml(masked)}</code>
+      ? `<div class="al-pat-set" style="display:flex;align-items:center;gap:8px">
+          <code class="codeblock al-pat-mask">${escapeHtml(masked)}</code>
           <button type="button" class="btn btn-sm btn-ghost" data-act="al-pat-clear">Remove</button>
         </div>
         <p class="note">This phone will re-pair itself when its alert address changes.</p>`
-      : `<div class="al-pat-set">
+      : `<div class="al-pat-set" style="display:flex;align-items:center;gap:8px">
           <input type="password" class="nin al-pat-in" id="al-pat" inputmode="text" autocomplete="off"
-            spellcheck="false" placeholder="github_pat_…">
+            spellcheck="false" placeholder="github_pat_…"
+            style="width:100%;text-align:left;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
           <button type="button" class="btn btn-sm" data-act="al-pat-save">Save</button>
         </div>
         <p class="note">${escapeHtml(PAT_HELP)}
@@ -349,11 +350,15 @@ const YES = "yes";
 const NO = "no";
 const UNKNOWN = "could not check";
 
-/** One evidence row: what we asked, what came back. */
+/**
+ * One evidence row. Built out of the same `.swrow` markup the preference toggles use, so it is
+ * styled by the existing sheet CSS — styles.css belongs to WS-A and this card adds nothing to it.
+ */
 const row = (label, value, note) =>
-  `<tr><th scope="row">${escapeHtml(label)}</th><td>${escapeHtml(String(value))}${
-    note ? `<span class="dg-note">${escapeHtml(note)}</span>` : ""
-  }</td></tr>`;
+  `<div class="swrow dg-row"><span class="swrow-t">
+    <span class="swrow-l">${escapeHtml(label)}</span>
+    ${note ? `<span class="swrow-h">${escapeHtml(note)}</span>` : ""}
+  </span><span class="tag tag-mute">${escapeHtml(String(value))}</span></div>`;
 
 /** iOS version out of the UA string — the one thing the app cannot ask for directly. */
 export function iosVersion(ua = (typeof navigator !== "undefined" && navigator.userAgent) || "") {
@@ -381,35 +386,34 @@ export function diagnoseBody(st, now = Date.now()) {
 
   const items = (receipts.items || []).slice(0, 10);
   const log = items.length
-    ? `<ul class="dg-log">${items
-        .map(
-          (r) =>
-            `<li><span class="dg-when">${escapeHtml(relTime(r.at, now))}</span> ${escapeHtml(
-              r.title || "(no title)",
-            )} <span class="tag tag-mute">${escapeHtml(r.kind || "?")}</span>${
-              r.shown === false ? ` <span class="tag tag-bad">not shown</span>` : ""
-            }${r.error ? `<span class="dg-note">${escapeHtml(r.error)}</span>` : ""}</li>`,
+    ? items
+        .map((r) =>
+          row(
+            r.title || "(no title)",
+            relTime(r.at, now),
+            [r.kind || "?", r.shown === false ? "NOT SHOWN" : null, r.error || null].filter(Boolean).join(" · "),
+          ),
         )
-        .join("")}</ul>`
+        .join("")
     : `<p class="note note-warn">This phone has no record of ever receiving a push${
         receipts.source ? "" : " (and its receipt log could not be read)"
       }.</p>`;
 
-  return `<div class="diagnose">
-    ${steps.length ? `<ol class="steps dg-steps">${steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol>` : `<p class="note">Alerts are arriving on this phone. Nothing to fix.</p>`}
+  return `<div class="pair diagnose">
+    ${steps.length ? `<ol class="steps">${steps.map((s) => `<li>${escapeHtml(s)}</li>`).join("")}</ol>` : `<p class="pair-lead">Alerts are arriving on this phone. Nothing to fix.</p>`}
 
-    <h4>This phone</h4>
-    <table class="dg-table"><tbody>
+    <p class="swrow-l">This phone</p>
+    <div class="al-prefs dg-group">
       ${row("Device id", st.deviceId || UNKNOWN, "the id the alert job files this phone under")}
       ${row("Notification permission", st.permission || UNKNOWN)}
       ${row("Installed to Home Screen", standalone ? YES : NO, standalone ? "" : "iOS only pushes to installed web apps")}
       ${row("iOS version", iosVersion(ua) || UNKNOWN)}
       ${row("Push subscription live", st.subscribed ? YES : NO)}
       ${row("Address changed since pairing", st.endpointChanged ? YES : NO, st.endpointChanged ? "re-pair to fix" : "")}
-    </tbody></table>
+    </div>
 
-    <h4>The sender</h4>
-    <table class="dg-table"><tbody>
+    <p class="swrow-l">The sender</p>
+    <div class="al-prefs dg-group">
       ${row("Knows this phone", serverPaired, st.serverPaired === false ? "paste the pairing code into PUSH_SUBSCRIPTIONS" : "")}
       ${row("Last sent to it", server && server.lastSentAt ? relTime(server.lastSentAt, now) : "never")}
       ${row("Pushes sent all-time", server && server.sentCount != null ? server.sentCount : UNKNOWN)}
@@ -419,9 +423,9 @@ export function diagnoseBody(st, now = Date.now()) {
       )}
       ${row("Marked dead", server && server.expired ? YES : NO)}
       ${row("Alerts workflow last ran", st.lastRunAt ? relTime(st.lastRunAt, now) : UNKNOWN, st.lastRun && st.lastRun.conclusion ? String(st.lastRun.conclusion) : "")}
-    </tbody></table>
+    </div>
 
-    <h4>Shown on this phone (last 10)</h4>
+    <p class="swrow-l">Shown on this phone (last 10)</p>
     <p class="note">${escapeHtml(
       `${receipts.count24h || 0} in the last 24 hours · ${receipts.count || 0} on record${
         receipts.failed ? ` · ${receipts.failed} could not be displayed` : ""
@@ -456,12 +460,19 @@ export function nextSteps(st) {
     steps.push("Wait for the next Alerts run (about 10 minutes) and check this screen again.");
     return steps;
   }
+  // Ordered by how often each one is the answer (research R5 §6.4 item 4).
   const receipts = st.receipts || {};
   const server = st.server || null;
-  if (server && server.lastSentAt && !receipts.lastAt) {
-    steps.push("Tap “Test this phone”. If no notification appears, iOS is blocking them — check Settings → Notifications → Tradewinds (Allow Notifications, Lock Screen, Banners, Sounds).");
-    steps.push("Check Focus modes and Settings → Notifications → Scheduled Summary: Tradewinds must not be in a summary.");
-    steps.push("If the test notification DOES appear, re-pair (Show pairing code → paste into the secret) — the sender is pushing to an address this phone no longer uses.");
+  const sentAt = Date.parse(String(server?.lastSentAt ?? server?.lastNotifiedAt ?? ""));
+  const lastReceipt = receipts.lastAt != null && Number.isFinite(Number(receipts.lastAt)) ? Number(receipts.lastAt) : null;
+  const notDelivering = !Number.isNaN(sentAt) && (lastReceipt === null || lastReceipt < sentAt - 24 * 3600 * 1000);
+  if (notDelivering) {
+    steps.push("Turn off Do Not Disturb and any Focus mode, then tap “Test this phone”. DND is the single most common cause.");
+    steps.push("iOS Settings → Notifications → Tradewinds: Allow Notifications, Lock Screen, Banners and Sounds all on.");
+    steps.push("iOS Settings → Notifications → Scheduled Summary: Tradewinds must NOT be in a summary.");
+    steps.push("On iOS 18.4 or later, check the per-app Apple Intelligence notification settings — they can delay or summarise these.");
+    steps.push("If “Test this phone” DOES show a notification, re-pair: Show pairing code → paste it into the PUSH_SUBSCRIPTIONS secret. The sender is pushing to an address this phone no longer uses.");
+    steps.push("Still nothing? Delete the Tradewinds icon from the Home Screen and add it again — that rebuilds the service worker.");
     return steps;
   }
   if (receipts.failed) {
