@@ -7,6 +7,12 @@ import {
   activeCount,
   activePlayers,
   buildContext,
+  buildHistory,
+  historyRow,
+  historyWeekly,
+  irEligibleStatus,
+  isReserve,
+  isTaxi,
   mergeSettings,
   playerOf,
   resolveMyRosterId,
@@ -14,7 +20,9 @@ import {
   rosPoints,
   rosteredIds,
   slotEligibility,
+  tradeablePlayers,
 } from "../src/engine/context.js";
+import { STATUS_CHAIN, irEligible } from "../src/engine/advisor.js";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
 
@@ -102,6 +110,137 @@ test("active count is players minus reserve and taxi", () => {
   }
   assert.equal(activeCount(rosterById(ctx, 3)), 17, "no IR stash, so all 17 count against the cap");
   assert.equal(activeCount(rosterById(ctx, 1)), 17, "18 rostered, 1 on IR");
+});
+
+test("tradeablePlayers is every id a team holds — roster spots, IR and taxi (§13.4 C1)", () => {
+  const stashed = ctx.rosters.find((r) => r.reserve.length);
+  const parked = stashed.reserve[0];
+  assert.ok(!activePlayers(stashed).includes(parked), "an IR stash occupies no roster spot");
+  assert.ok(tradeablePlayers(stashed).includes(parked), "but he is still tradeable");
+  assert.equal(tradeablePlayers(stashed).length, stashed.players.length, "reserve is inside players");
+  assert.equal(new Set(tradeablePlayers(stashed)).size, tradeablePlayers(stashed).length, "no duplicates");
+  assert.ok(isReserve(stashed, parked));
+  assert.ok(!isTaxi(stashed, parked));
+
+  // a taxi id Sleeper did not also list in `players` still comes back exactly once
+  const withTaxi = { ...stashed, taxi: [parked, "taxi-only"] };
+  assert.equal(tradeablePlayers(withTaxi).filter((id) => id === parked).length, 1);
+  assert.ok(tradeablePlayers(withTaxi).includes("taxi-only"));
+  assert.ok(isTaxi(withTaxi, "taxi-only"));
+
+  assert.deepEqual(tradeablePlayers(null), [], "never throws on a missing roster");
+  assert.equal(isReserve(null, "x"), false);
+  assert.equal(isTaxi(null, "x"), false);
+});
+
+test("irEligibleStatus reads the league's own reserve_allow_* rules", () => {
+  assert.equal(irEligibleStatus(ctx, "IR"), true);
+  assert.equal(irEligibleStatus(ctx, "PUP"), true);
+  assert.equal(irEligibleStatus(ctx, "Reserve"), true);
+  assert.equal(irEligibleStatus(ctx, "Out"), true, "Boyball runs reserve_allow_out 1");
+  assert.equal(irEligibleStatus(ctx, "Doubtful"), false, "reserve_allow_doubtful 0");
+  assert.equal(irEligibleStatus(ctx, "NA"), false, "reserve_allow_na 0");
+  assert.equal(irEligibleStatus(ctx, "Questionable"), false);
+  assert.equal(irEligibleStatus(ctx, null), false);
+  assert.equal(irEligibleStatus({}, "IR"), true, "no league block is not a crash");
+
+  const strict = buildContext(
+    { ...INPUT, league: { ...INPUT.league, settings: { ...INPUT.league.settings, reserve_allow_out: 0 } } },
+    {}
+  );
+  assert.equal(irEligibleStatus(strict, "Out"), false);
+  const loose = buildContext(
+    {
+      ...INPUT,
+      league: {
+        ...INPUT.league,
+        settings: { ...INPUT.league.settings, reserve_allow_doubtful: 1, reserve_allow_na: 1 },
+      },
+    },
+    {}
+  );
+  assert.equal(irEligibleStatus(loose, "Doubtful"), true);
+  assert.equal(irEligibleStatus(loose, "NA"), true);
+});
+
+test("irEligibleStatus never drifts from advisor.irEligible", () => {
+  // context.js cannot import advisor.js (it is the base of the engine — the import would be
+  // circular), so the two copies of the rule are pinned together here instead.
+  const statuses = [
+    ...STATUS_CHAIN,
+    "PUP",
+    "Reserve",
+    "DNR",
+    "NA",
+    "COV",
+    "Sus",
+    "Suspended",
+    "Probable",
+    null,
+    "",
+  ];
+  for (const permissive of [0, 1]) {
+    const league = { ...INPUT.league, settings: { ...INPUT.league.settings } };
+    for (const key of ["out", "doubtful", "sus", "cov", "dnr", "na"]) {
+      league.settings[`reserve_allow_${key}`] = permissive;
+    }
+    const variant = buildContext({ ...INPUT, league }, {});
+    for (const status of statuses) {
+      assert.equal(
+        irEligibleStatus(variant, status),
+        irEligible(variant, status),
+        `${status} disagrees with advisor.irEligible (reserve_allow_* = ${permissive})`
+      );
+    }
+  }
+});
+
+test("ctx.history is an empty Map when no history file was loaded (§13.6 F1)", () => {
+  assert.ok(ctx.history instanceof Map);
+  assert.equal(ctx.history.size, 0);
+  assert.equal(historyRow(ctx, "4866"), null);
+  assert.deepEqual(historyWeekly(ctx, "4866"), []);
+  for (const bad of [null, undefined, 42, "nope", {}, { seasons: null }, { seasons: 7 }]) {
+    assert.equal(buildHistory(bad).size, 0);
+  }
+});
+
+test("ctx.history carries last season and this season, scored this league's way", () => {
+  const history = {
+    version: 1,
+    generated_at: "2026-09-17T00:00:00Z",
+    scoring: { std: "pts_std", rec: "rec" },
+    seasons: {
+      2025: { weeks: 18, players: { 4866: { gp: 16, ga: 17, w: [[20.4, 4], null, [8, 2]] } } },
+      2026: { weeks: 1, players: { 4866: { gp: 1, ga: 1, w: [[12, 6]] }, 11604: { gp: 1, ga: 1, w: [[9, 3]] } } },
+    },
+  };
+  const withHistory = buildContext({ ...INPUT, history }, { userId: TOMMY });
+  assert.equal(withHistory.history.size, 2);
+  const row = historyRow(withHistory, "4866");
+  assert.equal(row.id, "4866");
+  assert.equal(row.latest, "2026", "the newest season on record");
+  assert.equal(row.seasons["2025"].gp, 16);
+  assert.equal(row.seasons["2025"].ga, 17);
+  assert.equal(row.seasons["2025"].weeks, 18);
+
+  // half-PPR: std + 0.5 × rec, and a week he missed stays null rather than becoming a zero
+  assert.equal(withHistory.league.ppr, 0.5);
+  assert.deepEqual(historyWeekly(withHistory, "4866", "2025"), [22.4, null, 9]);
+  assert.deepEqual(historyWeekly(withHistory, "4866"), [15], "defaults to the newest season");
+  assert.deepEqual(historyWeekly(withHistory, "11604", "2025"), [], "no 2025 rows for him");
+  assert.deepEqual(historyWeekly(withHistory, "nobody"), []);
+
+  // the same file read by a full-PPR league scores the same weeks differently
+  const ppr = buildContext(
+    {
+      ...INPUT,
+      history,
+      league: { ...INPUT.league, scoring_settings: { ...INPUT.league.scoring_settings, rec: 1 } },
+    },
+    {}
+  );
+  assert.deepEqual(historyWeekly(ppr, "4866", "2025"), [24.4, null, 10]);
 });
 
 test("rosterOf indexes every rostered player exactly once", () => {

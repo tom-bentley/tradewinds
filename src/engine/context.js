@@ -119,6 +119,87 @@ export function activeCount(roster) {
 }
 
 /**
+ * Every player a team HOLDS, wherever Sleeper parks him: roster spots, the IR/reserve list and the
+ * taxi squad. This — not `activePlayers` — is the set a team may put in a trade (§13.4 C1).
+ * Sleeper lets you trade a stashed player; the receiver re-parks him on his own IR when his
+ * league allows that status and a slot is free, and otherwise takes him on the bench.
+ * @param {object} roster ctx-shaped roster
+ * @returns {string[]} ids, roster order first, then any reserve/taxi id not already listed
+ */
+export function tradeablePlayers(roster) {
+  const out = [];
+  const seen = new Set();
+  for (const id of [
+    ...((roster && roster.players) || []),
+    ...((roster && roster.reserve) || []),
+    ...((roster && roster.taxi) || []),
+  ]) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Is this player parked on the team's IR/reserve list (so he costs an IR slot, not a roster spot)?
+ * @param {object} roster ctx-shaped roster
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function isReserve(roster, id) {
+  return !!roster && ((roster.reserve || []).includes(id));
+}
+
+/**
+ * Is this player on the team's taxi squad (a dynasty stash that cannot be started)?
+ * @param {object} roster ctx-shaped roster
+ * @param {string} id
+ * @returns {boolean}
+ */
+export function isTaxi(roster, id) {
+  return !!roster && ((roster.taxi || []).includes(id));
+}
+
+/** Statuses every league lets you park on a reserve slot, whatever its `reserve_allow_*` say. */
+export const IR_ALWAYS_STATUSES = Object.freeze(["IR", "PUP", "Reserve"]);
+
+/**
+ * May THIS league park THIS status on a reserve slot? Read live from `reserve_allow_*`, never
+ * hard-coded: Boyball stashes Out but not Doubtful, another league does the opposite.
+ *
+ * The same rule as `advisor.irEligible`, deliberately duplicated rather than imported: context.js
+ * is the base of the engine (it imports nothing from ./), and advisor.js sits at the top of the
+ * graph, so importing it here would make the whole engine circular. `engine.context.test.mjs`
+ * asserts the two agree for every status in the chain, so they cannot drift.
+ * @param {object} ctx
+ * @param {string|null} inj Sleeper injury status
+ * @returns {boolean}
+ */
+export function irEligibleStatus(ctx, inj) {
+  if (!inj) return false;
+  if (IR_ALWAYS_STATUSES.includes(inj)) return true;
+  const allow = (ctx && ctx.league && ctx.league.reserveAllow) || {};
+  switch (inj) {
+    case "Out":
+      return !!allow.out;
+    case "Doubtful":
+      return !!allow.doubtful;
+    case "Sus":
+    case "Suspended":
+      return !!allow.sus;
+    case "COV":
+      return !!allow.cov;
+    case "DNR":
+      return !!allow.dnr;
+    case "NA":
+      return !!allow.na;
+    default:
+      return false;
+  }
+}
+
+/**
  * Inclusive week range.
  * @param {number} from
  * @param {number} to
@@ -369,12 +450,91 @@ export function buildContext(input, settings) {
     transactions: Array.isArray(input.transactions) ? input.transactions : [],
     // Sleeper trending adds: [{ player_id, count }] over the last 24 h. Absent → [].
     trending: Array.isArray(input.trending) ? input.trending : [],
+    // Last season's and this season's ACTUALS, keyed by player (§13.6 F1). Optional: a data layer
+    // that could not load `history.json` passes nothing and every reader sees an empty Map.
+    history: buildHistory(input.history),
     // Injected wall clock (ms). The engine never reads the clock itself — the caller owns it, so
     // every waiver window is reproducible in a test. null = no clock, nothing is on waivers.
     now: resolveNow(merged.now, input.now),
     settings: merged,
     memo: {},
   };
+}
+
+/**
+ * @typedef {{weeks:number, gp:number, ga:number, w:Array<[number, number]|null>}} HistorySeason
+ *   one season of actuals for one player: games played, games active, and `w[i]` = week i+1 as
+ *   `[pts_std, rec]` (null when he did not play that week).
+ * @typedef {{id:string, seasons:Object<string, HistorySeason>, latest:string|null}} HistoryRow
+ *   `latest` is the newest season this player has rows for.
+ */
+
+/**
+ * `data/history.json` (§13.6 F1) → `Map<id, HistoryRow>`. Anything missing or malformed collapses
+ * to an empty Map: history is an OPTIONAL input and no reader may throw without it.
+ * @param {object} [history] the parsed file
+ * @returns {Map<string, HistoryRow>}
+ */
+export function buildHistory(history) {
+  const out = new Map();
+  const seasons = history && typeof history === "object" ? history.seasons : null;
+  if (!seasons || typeof seasons !== "object") return out;
+  for (const season of Object.keys(seasons).sort()) {
+    const block = seasons[season];
+    const weeks = Number(block && block.weeks) || 0;
+    const rows = (block && block.players) || {};
+    if (!rows || typeof rows !== "object") continue;
+    for (const [id, row] of Object.entries(rows)) {
+      if (!row || typeof row !== "object") continue;
+      let entry = out.get(id);
+      if (!entry) {
+        entry = { id, seasons: {}, latest: null };
+        out.set(id, entry);
+      }
+      entry.seasons[season] = {
+        weeks,
+        gp: Number(row.gp) || 0,
+        ga: Number(row.ga) || 0,
+        w: Array.isArray(row.w) ? row.w : [],
+      };
+      // keys are walked in ascending season order, so the last one written is the newest
+      entry.latest = season;
+    }
+  }
+  return out;
+}
+
+/**
+ * This player's actuals, or null when history is absent or does not list him.
+ * @param {object} ctx
+ * @param {string} id
+ * @returns {HistoryRow|null}
+ */
+export function historyRow(ctx, id) {
+  const history = ctx && ctx.history;
+  return (history && history.get(id)) || null;
+}
+
+/**
+ * One season of weekly points scored THIS league's way: `pts_std + ppr × rec` (§13.6 F1 — other
+ * reception bonuses are not in the file and are ignored). A week he did not play is null, so a
+ * caller can tell "zero points" from "did not play".
+ * @param {object} ctx
+ * @param {string} id
+ * @param {string} [season] defaults to the newest season on record for him
+ * @returns {Array<number|null>} empty when there is nothing on record
+ */
+export function historyWeekly(ctx, id, season) {
+  const row = historyRow(ctx, id);
+  if (!row) return [];
+  const key = season != null ? String(season) : row.latest;
+  const block = key != null ? row.seasons[key] : null;
+  if (!block) return [];
+  const ppr = Number(ctx.league && ctx.league.ppr) || 0;
+  return block.w.map((week) => {
+    if (!Array.isArray(week)) return null;
+    return (Number(week[0]) || 0) + ppr * (Number(week[1]) || 0);
+  });
 }
 
 /**

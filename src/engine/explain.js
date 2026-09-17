@@ -8,6 +8,8 @@
 
 import { playerOf, rosterById } from "./context.js";
 import { marketValue, waiverReplacement } from "./values.js";
+import { isBye } from "./lineup.js";
+import { SEASON_GAMES, absenceOf } from "./injuries.js";
 
 /** A 30-day FantasyCalc move this large is worth calling out in the explanation. */
 export const TREND_FLAG = 400;
@@ -190,6 +192,55 @@ function badge(ctx, id) {
 }
 
 /**
+ * The week this player is expected back, from the injury-duration table (§12.2). Games are counted
+ * from `ctx.week` INCLUSIVE, so a bye in between pushes the date out a week.
+ *
+ * The statistic is the MEDIAN branch, not `absence.mean`: every reserve-list distribution carries
+ * a season-ending tail (`SEASON_GAMES` = 99), and a 10 % chance of that drags the mean of a
+ * four-to-eight-week injury past the end of the season. The median is what a manager means by
+ * "when is he back".
+ * @param {object} ctx
+ * @param {string} id
+ * @returns {{week:number|null, seasonOver:boolean, games:number}} week = null when the estimate is
+ *   "he plays this week" or runs past the last scoring week
+ */
+export function expectedReturn(ctx, id) {
+  const p = playerOf(ctx, id);
+  const absence = absenceOf(ctx, p);
+  let games = 0;
+  let cumulative = 0;
+  for (const branch of absence.branches || []) {
+    games = branch.games;
+    cumulative += branch.p;
+    if (cumulative >= 0.5) break;
+  }
+  if (absence.seasonOver || games >= SEASON_GAMES) return { week: null, seasonOver: true, games };
+  let remaining = Math.round(games);
+  if (remaining <= 0) return { week: null, seasonOver: false, games };
+  for (let w = ctx.week; w <= ctx.lastWeek; w += 1) {
+    if (!isBye(ctx, id, w)) remaining -= 1;
+    if (remaining <= 0) return { week: w + 1 <= ctx.lastWeek ? w + 1 : null, seasonOver: false, games };
+  }
+  return { week: null, seasonOver: false, games };
+}
+
+/**
+ * "Tee Higgins is Questionable." / "James Conner is IR — expected back ~week 6." — the status,
+ * plus what the duration table says it costs (§13.4 C4).
+ * @param {object} ctx
+ * @param {string} id
+ * @param {string} status
+ * @returns {string}
+ */
+function injuryText(ctx, id, status) {
+  const base = `${nameOf(ctx, id)} is ${status}`;
+  const back = expectedReturn(ctx, id);
+  if (back.seasonOver) return `${base} — expected out for the season.`;
+  if (back.week != null) return `${base} — expected back ~week ${back.week}.`;
+  return `${base}.`;
+}
+
+/**
  * Text for one flag, by type. Used by trade.js so flags and reasons speak the same language.
  * @param {object} ctx
  * @param {{type:string, [k:string]:any}} flag
@@ -218,7 +269,22 @@ export function flagText(ctx, flag, names) {
       return `${who} ${nameOf(ctx, flag.drop)} — ${whose} roster would hold ${flag.count} of ${flag.max}.`;
     }
     case "injury":
-      return `${nameOf(ctx, flag.id)} is ${flag.status}.`;
+      return injuryText(ctx, flag.id, flag.status);
+    case "ir_slot": {
+      const theirs = flag.side === "them";
+      const whose = theirs ? v.bPossLower : v.aPossLower;
+      if (flag.ir) {
+        return `${nameOf(ctx, flag.id)} can go straight to ${whose} IR — ${flag.used} of ${flag.max} slots used.`;
+      }
+      if (flag.reason === "status") {
+        return (
+          `${nameOf(ctx, flag.id)} is ${flag.status} — this league cannot park that on IR, ` +
+          `so he takes a bench spot.`
+        );
+      }
+      if (!flag.max) return `This league has no IR slots, so ${nameOf(ctx, flag.id)} takes a bench spot.`;
+      return `No IR slot for ${nameOf(ctx, flag.id)} — all ${flag.max} of ${whose} are full, so he takes a bench spot.`;
+    }
     case "bye":
       return `${nameOf(ctx, flag.id)} is on bye in week ${flag.week}.`;
     case "coverage":
@@ -319,6 +385,27 @@ export function explain(ctx, result, opts = {}) {
     }
   }
 
+  // IR — an arrival who parks on a reserve slot frees a bench spot the body count alone does not
+  // explain, so say where the spot went and who fills it (§13.4 C2/C4).
+  const counts = me.rosterCount || {};
+  const freedSpots = (Number(counts.before) || 0) - (Number(counts.after) || 0);
+  const bodySpots = result.give.length - result.get.length;
+  if (freedSpots > bodySpots) {
+    const parked = (me.irLanding || []).filter((entry) => entry.ir);
+    const extra = freedSpots - bodySpots;
+    const filler = (me.backfillDetail || []).slice(-extra)[0] || null;
+    lines.push({
+      kind: "ir_spot",
+      text:
+        `${parked.length ? namesOf(ctx, parked.map((entry) => entry.id)) : "The arrival"} ` +
+        `${parked.length === 1 ? "goes" : "go"} straight to IR, so ${v.aPossLower} roster lands at ` +
+        `${counts.after} of ${counts.max}` +
+        (filler
+          ? ` and ${nameOf(ctx, filler.id)} fills the freed bench spot.`
+          : ` with ${extra} bench spot${extra === 1 ? "" : "s"} open.`),
+    });
+  }
+
   // LINEUP — "starters" is plural in both voices, so the verb never takes an -s here
   const dpo = Number(verdict.deltaPlayoffPerWeek) || 0;
   const playoffs = ctx.playoffWeeks || [];
@@ -333,7 +420,9 @@ export function explain(ctx, result, opts = {}) {
   // RISK — one line per non-block flag that names a player
   for (const flag of result.flags || []) {
     if (flag.severity === "block") continue;
-    if (!["injury", "free_elsewhere", "trend", "bye", "coverage", "unsettled"].includes(flag.type)) continue;
+    if (!["injury", "ir_slot", "free_elsewhere", "trend", "bye", "coverage", "unsettled"].includes(flag.type)) {
+      continue;
+    }
     lines.push({ kind: "risk", text: flagText(ctx, flag, names) });
   }
 

@@ -5,7 +5,17 @@ import test, { before } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { buildContext, projectionPoints, resolveSlots, seasonShape } from "../src/engine/context.js";
+import {
+  activePlayers,
+  buildContext,
+  irEligibleStatus,
+  isReserve,
+  isTaxi,
+  projectionPoints,
+  resolveSlots,
+  seasonShape,
+  tradeablePlayers,
+} from "../src/engine/context.js";
 import { tableFor } from "../src/engine/values.js";
 import { bestLineup } from "../src/engine/lineup.js";
 import { evaluateTrade } from "../src/engine/trade.js";
@@ -404,4 +414,62 @@ test("resolveSlots keeps the flex family and drops what it cannot score", () => 
   assert.deepEqual(wrrb.flexEligible.sort(), ["RB", "WR"], "WRRB_FLEX does not flex tight ends");
   const none = resolveSlots(["QB", "RB", "WR", "BN"]);
   assert.deepEqual(none.flexEligible.sort(), ["RB", "TE", "WR"], "no flex slot falls back to the default");
+});
+
+test("IR and taxi follow the league's own rules, not Boyball's (§13.4 C1/C2)", () => {
+  const roster = [
+    { id: "qb1", pos: "QB", pts: 20 },
+    { id: "rb1", pos: "RB", pts: 15 },
+    { id: "wr1", pos: "WR", pts: 14 },
+    { id: "rb2", pos: "RB", pts: 9 },
+    { id: "wr2", pos: "WR", pts: 8 },
+    { id: "rook", pos: "WR", pts: 3 },
+    { id: "qb2", pos: "QB", pts: 19 },
+    { id: "rb3", pos: "RB", pts: 13 },
+    { id: "wr3", pos: "WR", pts: 12 },
+    { id: "rb4", pos: "RB", pts: 7 },
+    { id: "wr4", pos: "WR", pts: 6 },
+    { id: "hurt", pos: "RB", pts: 11 },
+  ];
+  const a = ["qb1", "rb1", "wr1", "rb2", "wr2", "rook"];
+  const b = ["qb2", "rb3", "wr3", "rb4", "wr4", "hurt"];
+  const payload = mini({
+    rosterPositions: ["QB", "RB", "WR", "FLEX", "BN", "BN"],
+    squads: [a, b],
+    roster,
+    // the inverse of Boyball: this league stashes Doubtful but not Out, and runs a taxi squad
+    settings: { taxi_slots: 2, reserve_slots: 1, reserve_allow_out: 0, reserve_allow_doubtful: 1 },
+  });
+  payload.rosters[0].taxi = ["rook"];
+  payload.rosters[1].reserve = ["hurt"];
+  payload.players.players.hurt.inj = "Doubtful";
+  const dyn = buildContext(payload, {});
+
+  assert.equal(dyn.league.maxRoster, 6);
+  assert.equal(dyn.league.irSlots, 1);
+  assert.equal(dyn.league.taxiSlots, 2);
+  assert.equal(irEligibleStatus(dyn, "Doubtful"), true, "this league allows it");
+  assert.equal(irEligibleStatus(dyn, "Out"), false, "…and refuses the one Boyball allows");
+
+  // both stashes are tradeable, neither occupies a roster spot
+  assert.deepEqual(activePlayers(dyn.rosters[0]).sort(), ["qb1", "rb1", "rb2", "wr1", "wr2"]);
+  assert.ok(tradeablePlayers(dyn.rosters[0]).includes("rook"));
+  assert.ok(isTaxi(dyn.rosters[0], "rook"));
+  assert.ok(isReserve(dyn.rosters[1], "hurt"));
+
+  const r = evaluateTrade(dyn, { myRosterId: 1, theirRosterId: 2, give: ["rook"], get: ["hurt"] });
+  assert.notEqual(r.verdict.code, "invalid");
+  assert.deepEqual(r.me.rosterCount, { before: 5, after: 5, max: 6, irBefore: 0, irAfter: 1, irMax: 1 });
+  assert.deepEqual(r.them.rosterCount, { before: 5, after: 6, max: 6, irBefore: 1, irAfter: 0, irMax: 1 });
+  assert.ok(r.flags.some((f) => f.type === "ir_slot" && f.id === "hurt" && f.ir === true));
+
+  // the same arrival in a league that refuses Doubtful takes a bench spot instead
+  const strict = buildContext(
+    { ...payload, league: { ...payload.league, settings: { ...payload.league.settings, reserve_allow_doubtful: 0 } } },
+    {}
+  );
+  const r2 = evaluateTrade(strict, { myRosterId: 1, theirRosterId: 2, give: ["rook"], get: ["hurt"] });
+  assert.equal(r2.me.rosterCount.irAfter, 0);
+  assert.equal(r2.me.rosterCount.after, 6, "he needs a roster spot here");
+  assert.ok(r2.flags.some((f) => f.type === "ir_slot" && f.reason === "status"));
 });

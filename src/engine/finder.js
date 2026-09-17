@@ -3,7 +3,7 @@
 // sweep of an 8-team league stays well inside a phone's patience budget.
 
 import { TRADEABLE } from "../config.js";
-import { activePlayers, playerOf, rosterById } from "./context.js";
+import { playerOf, rosterById, tradeablePlayers } from "./context.js";
 import { marketValue, surplus } from "./values.js";
 import { slotDemand } from "./lineup.js";
 import { edgePct, evaluateTrade, finalizeExplanation } from "./trade.js";
@@ -17,6 +17,10 @@ export const DEFAULT_SHAPES = Object.freeze(["1-1", "2-1", "1-2", "2-2"]);
 /**
  * Tradeable, non-waiver-grade players on a roster (R3 §f stage 0). A player worth no more than
  * the wire contributes nothing to either side's surplus, so proposing him is noise.
+ *
+ * The pool is every player the team HOLDS, IR and taxi stashes included (§13.4 C3): in an 8-team
+ * league a buy-low injured star is one of the few genuinely available assets, and his `mAdj`
+ * already carries the injury haircut, so the surplus filter prices him honestly.
  * @param {object} ctx
  * @param {number} rosterId
  * @returns {string[]} ids, best-first by injury-adjusted market value
@@ -27,7 +31,7 @@ export function tradePool(ctx, rosterId) {
   if (hit) return hit;
   const roster = rosterById(ctx, rosterId);
   const ids = roster
-    ? activePlayers(roster).filter((id) => {
+    ? tradeablePlayers(roster).filter((id) => {
         const p = playerOf(ctx, id);
         if (!TRADEABLE.includes(p.pos)) return false;
         return surplus(ctx, id) > 0;
@@ -82,7 +86,8 @@ function proposalKey(theirRosterId, give, get) {
  * @param {{myRosterId?:number, shapes?:string[], maxResults?:number, perRival?:number}} [opts]
  * @returns {Array<{theirRosterId:number, give:string[], get:string[], shape:string, score:number,
  *   myEdgePct:number, myDeltaPerWeek:number, theirEdgePct:number, theirDeltaPerWeek:number,
- *   why:string[], result:object}>}
+ *   irIn:number, irOut:number, why:string[], result:object}>}
+ *   `irIn`/`irOut` count the players in the deal who sit on an IR slot today (§13.4 C3).
  */
 export function findTrades(ctx, opts = {}) {
   const cfg = ctx.settings.finder || {};
@@ -98,6 +103,10 @@ export function findTrades(ctx, opts = {}) {
 
   const myPool = tradePool(ctx, myRosterId);
   if (!myPool.length) return [];
+  // Who is parked on an IR slot right now, on either side — the badge the UI puts on a deal that
+  // moves a stashed player (§13.4 C3). Where the arrivals LAND is in `result.me.rosterCount`.
+  const myRoster = rosterById(ctx, myRosterId);
+  const myReserve = new Set((myRoster && myRoster.reserve) || []);
   const mySurplus = positionalSurplus(ctx, myRosterId);
   // memoize per-player surplus once: the inner loops read it ~10^5 times
   const surplusOf = new Map();
@@ -121,6 +130,7 @@ export function findTrades(ctx, opts = {}) {
     const theirPool = tradePool(ctx, rival.rosterId);
     if (!theirPool.length) continue;
     noteIds(theirPool);
+    const theirReserve = new Set(rival.reserve || []);
 
     for (const shape of shapes) {
       const [nGive, nGet] = String(shape).split("-").map(Number);
@@ -194,6 +204,9 @@ export function findTrades(ctx, opts = {}) {
             theirEdgePct: result.them.edgePct,
             theirDeltaPerWeek: result.them.lineup.deltaPerWeek,
             acceptance: result.verdict.acceptance,
+            // players changing hands who are on an IR slot today
+            irIn: get.reduce((n, id) => n + (theirReserve.has(id) ? 1 : 0), 0),
+            irOut: give.reduce((n, id) => n + (myReserve.has(id) ? 1 : 0), 0),
             why: [],
             result,
           });

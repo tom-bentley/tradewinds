@@ -3,9 +3,24 @@
 // (playoff lineup). The verdict is a label over Edge% with ordered overrides on top.
 
 import { TRADEABLE } from "../config.js";
-import { activePlayers, playerOf, rosPoints, rosterById, slotEligibility } from "./context.js";
+import {
+  activePlayers,
+  irEligibleStatus,
+  playerOf,
+  rosPoints,
+  rosterById,
+  slotEligibility,
+  tradeablePlayers,
+} from "./context.js";
 import { marketValue, sideValue, surplus } from "./values.js";
-import { backfill, backfillPositions, freeAgentPoolByPos, isBye, seasonLineup } from "./lineup.js";
+import {
+  WEEK_ZERO_STATUSES,
+  backfill,
+  backfillPositions,
+  freeAgentPoolByPos,
+  isBye,
+  seasonLineup,
+} from "./lineup.js";
 import {
   explain,
   flagText,
@@ -218,8 +233,83 @@ export function cheapestDroppable(ctx, ids, protectedIds) {
   return best;
 }
 
+/** Statuses that keep a player out of a lineup right now — the ones an IR slot exists for. */
+const BENCHED_STATUSES = new Set(WEEK_ZERO_STATUSES);
+
+/**
+ * Where every player on one side of the trade ends up, and what it costs in roster spots and IR
+ * slots (§13.4 C2). Sleeper's rules, not ours:
+ *
+ * - a player sent FROM an IR slot frees an IR slot, not a roster spot;
+ * - a player sent from the taxi squad frees a taxi spot;
+ * - a player RECEIVED goes straight to the receiver's IR only when this league allows his status
+ *   (`reserve_allow_*`) AND a slot is still free; otherwise he takes a bench spot, which is what
+ *   makes a full roster "needs a drop".
+ *
+ * Receipts are placed in the order they were proposed, so two IR-eligible players and one free
+ * slot land deterministically (first one parks, second takes a spot).
+ * @param {object} ctx
+ * @param {number} rosterId
+ * @param {string[]} give ids this side sends
+ * @param {string[]} get ids this side receives
+ * @returns {{before:number, after:number, max:number, irBefore:number, irAfter:number, irMax:number,
+ *   beforeSpots:string[], beforeIr:string[], spots:string[], ir:string[], taxi:string[],
+ *   landing:Array<{id:string, ir:boolean, eligible:boolean, status:string|null}>,
+ *   gaveFromIr:string[], gaveFromTaxi:string[], freedSpots:number}}
+ */
+export function rosterLanding(ctx, rosterId, give, get) {
+  const roster = rosterById(ctx, rosterId);
+  const held = new Set(tradeablePlayers(roster));
+  const beforeSpots = activePlayers(roster);
+  const beforeIr = (((roster && roster.reserve) || [])).filter((id) => held.has(id));
+  const beforeTaxi = (((roster && roster.taxi) || [])).filter((id) => held.has(id));
+  const giveSet = new Set(give || []);
+  const irMax = Number(ctx.league.irSlots) || 0;
+
+  const keptSpots = beforeSpots.filter((id) => !giveSet.has(id));
+  const keptIr = beforeIr.filter((id) => !giveSet.has(id));
+  const keptTaxi = beforeTaxi.filter((id) => !giveSet.has(id));
+
+  let irUsed = keptIr.length;
+  const landing = [];
+  for (const id of get || []) {
+    const status = playerOf(ctx, id).inj || null;
+    const eligible = irEligibleStatus(ctx, status);
+    const ir = eligible && irUsed < irMax;
+    if (ir) irUsed += 1;
+    landing.push({ id, ir, eligible, status });
+  }
+  const toSpots = landing.filter((x) => !x.ir).map((x) => x.id);
+  const toIr = landing.filter((x) => x.ir).map((x) => x.id);
+  const after = keptSpots.length + toSpots.length;
+
+  return {
+    before: beforeSpots.length,
+    after,
+    max: ctx.league.maxRoster,
+    irBefore: beforeIr.length,
+    irAfter: keptIr.length + toIr.length,
+    irMax,
+    beforeSpots,
+    beforeIr,
+    spots: [...keptSpots, ...toSpots],
+    ir: [...keptIr, ...toIr],
+    taxi: keptTaxi,
+    landing,
+    gaveFromIr: beforeIr.filter((id) => giveSet.has(id)),
+    gaveFromTaxi: beforeTaxi.filter((id) => giveSet.has(id)),
+    freedSpots: beforeSpots.length - after,
+  };
+}
+
 /**
  * Evaluate one side of the trade from that side's own perspective.
+ *
+ * The lineup pool on BOTH sides is roster spots + IR, never the taxi squad: a stashed IR player
+ * is a real part of this team's season (that is the whole reason anyone buys one), so he has to
+ * count the same way whether he is arriving or leaving — crediting a received IR player while his
+ * old team loses nothing would invent points out of thin air. How much of his projection survives
+ * his injury is the lineup axis's job (`weekVector`), never a rule written here.
  * @param {object} ctx
  * @param {number} rosterId
  * @param {string[]} give ids this side sends
@@ -227,18 +317,20 @@ export function cheapestDroppable(ctx, ids, protectedIds) {
  * @param {Set<string>} involved every id in the trade (never available as a free agent)
  */
 function evaluateSide(ctx, rosterId, give, get, involved) {
-  const roster = rosterById(ctx, rosterId);
-  const before = activePlayers(roster);
-  const giveSet = new Set(give);
-  let afterIds = before.filter((id) => !giveSet.has(id)).concat(get);
-  const tradedCount = afterIds.length;
+  const counts = rosterLanding(ctx, rosterId, give, get);
+  const before = [...counts.beforeSpots, ...counts.beforeIr];
+  const irIds = counts.ir;
+  // Roster-spot occupants only: every count against maxRoster, every backfill and every drop
+  // suggestion is about spots, and an IR body occupies none of them.
+  let spotIds = counts.spots;
 
   const added = [];
-  if (afterIds.length < before.length) {
-    const filled = backfill(ctx, afterIds, before.length, involved);
-    afterIds = filled.ids;
+  if (counts.freedSpots > 0) {
+    const filled = backfill(ctx, spotIds, counts.beforeSpots.length, involved);
+    spotIds = filled.ids;
     added.push(...filled.added);
   }
+  let afterIds = [...spotIds, ...irIds];
 
   let afterLineup = cachedSeasonLineup(ctx, afterIds);
   // Repair a lineup that is short a slot. Sleeper forces this move anyway: a legal lineup is not
@@ -254,7 +346,7 @@ function evaluateSide(ctx, rosterId, give, get, involved) {
       }
     }
     const pool = freeAgentPoolByPos(ctx);
-    let working = afterIds;
+    let working = spotIds;
     for (const pos of positions) {
       const onRoster = new Set(working);
       const available = (pool[pos] || []).some((id) => !onRoster.has(id) && !involved.has(id));
@@ -270,8 +362,9 @@ function evaluateSide(ctx, rosterId, give, get, involved) {
       working = repaired.ids;
       added.push(...repaired.added);
     }
-    if (working !== afterIds) {
-      afterIds = working;
+    if (working !== spotIds) {
+      spotIds = working;
+      afterIds = [...spotIds, ...irIds];
       afterLineup = cachedSeasonLineup(ctx, afterIds);
     }
   }
@@ -283,9 +376,18 @@ function evaluateSide(ctx, rosterId, give, get, involved) {
     ? { week: afterLineup.shortWeeks[0].week, slot: afterLineup.shortWeeks[0].short[0] }
     : null;
 
-  const rosterCount = { before: before.length, after: tradedCount, max: ctx.league.maxRoster };
+  const rosterCount = {
+    before: counts.before,
+    after: counts.after,
+    max: counts.max,
+    irBefore: counts.irBefore,
+    irAfter: counts.irAfter,
+    irMax: counts.irMax,
+  };
+  // A drop has to free a ROSTER spot, so only spot occupants are candidates — cutting the IR
+  // stash you just traded for would not make the roster legal.
   const dropSuggestion =
-    tradedCount > ctx.league.maxRoster ? cheapestDroppable(ctx, afterIds, get) : forcedDrops[0] || null;
+    counts.after > counts.max ? cheapestDroppable(ctx, spotIds, get) : forcedDrops[0] || null;
 
   return {
     valueGive: { raw: valueGive.raw, surplus: valueGive.surplus, best: valueGive.best },
@@ -304,6 +406,10 @@ function evaluateSide(ctx, rosterId, give, get, involved) {
     dropSuggestion,
     shortDetail,
     afterIds,
+    spotIds,
+    irIds,
+    irLanding: counts.landing,
+    gaveFromIr: counts.gaveFromIr,
   };
 }
 
@@ -332,6 +438,36 @@ function buildFlags(ctx, me, them, give, get) {
         max: side.data.rosterCount.max,
         drop: side.data.dropSuggestion,
       });
+    }
+    // Where a received player actually lands. Info when an IR slot swallows him for free, warning
+    // when a body who cannot play this week has to sit on the bench instead (§13.4 C2).
+    for (const entry of side.data.irLanding || []) {
+      if (entry.ir) {
+        flags.push({
+          type: "ir_slot",
+          severity: "info",
+          side: side.key,
+          id: entry.id,
+          ir: true,
+          status: entry.status,
+          used: side.data.rosterCount.irAfter,
+          max: side.data.rosterCount.irMax,
+        });
+      } else if (entry.status && BENCHED_STATUSES.has(entry.status)) {
+        flags.push({
+          type: "ir_slot",
+          severity: "warn",
+          side: side.key,
+          id: entry.id,
+          ir: false,
+          status: entry.status,
+          // "full" = the league would allow it but every slot is taken; "status" = this league
+          // does not let that status onto a reserve slot at all
+          reason: entry.eligible ? "full" : "status",
+          used: side.data.rosterCount.irAfter,
+          max: side.data.rosterCount.irMax,
+        });
+      }
     }
     // sources publish the moving std-dev signed (B1 measured -17..19), so band it on |sd|
     let sd = 0;
@@ -384,16 +520,18 @@ export function evaluateTrade(ctx, proposal, opts = {}) {
   const problems = [];
   if (!mine || !theirs || myRosterId === theirRosterId) problems.push("Both sides must be different rosters in this league.");
   if (!give.length && !get.length) problems.push("Nothing is being traded.");
+  // Sleeper lets a manager trade anyone he HOLDS, IR and taxi included, so the only value-based
+  // rejection left is a player who is genuinely somewhere else (§13.4 C2).
   if (mine) {
-    const own = new Set(activePlayers(mine));
+    const own = new Set(tradeablePlayers(mine));
     for (const id of give) {
-      if (!own.has(id)) problems.push(`${playerOf(ctx, id).name} is not on ${v.aPossLower} active roster.`);
+      if (!own.has(id)) problems.push(`${playerOf(ctx, id).name} is not on ${v.aPossLower} roster.`);
     }
   }
   if (theirs) {
-    const own = new Set(activePlayers(theirs));
+    const own = new Set(tradeablePlayers(theirs));
     for (const id of get) {
-      if (!own.has(id)) problems.push(`${playerOf(ctx, id).name} is not on ${v.bPossLower} active roster.`);
+      if (!own.has(id)) problems.push(`${playerOf(ctx, id).name} is not on ${v.bPossLower} roster.`);
     }
   }
   for (const id of [...give, ...get]) {
@@ -516,12 +654,23 @@ function invalidResult(ctx, proposal, problems) {
     valueGet: { ...zero },
     edgePct: 0,
     lineup: { before: emptyLineup, after: emptyLineup, deltaPerWeek: 0, deltaPlayoffPerWeek: 0 },
-    rosterCount: { before: 0, after: 0, max: ctx.league.maxRoster },
+    rosterCount: {
+      before: 0,
+      after: 0,
+      max: ctx.league.maxRoster,
+      irBefore: 0,
+      irAfter: 0,
+      irMax: Number(ctx.league.irSlots) || 0,
+    },
     backfill: [],
     backfillDetail: [],
     dropSuggestion: null,
     shortDetail: null,
     afterIds: [],
+    spotIds: [],
+    irIds: [],
+    irLanding: [],
+    gaveFromIr: [],
   });
   const result = {
     give: proposal.give,
