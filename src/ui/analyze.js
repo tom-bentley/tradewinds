@@ -120,17 +120,41 @@ function matches(ctx, id, q) {
   return s.includes(q.toLowerCase());
 }
 
+/**
+ * IR and taxi players are on the roster; they just do not occupy a roster spot, and Sleeper
+ * lists them in `players` as well as in `reserve`/`taxi`. They get their own groups at the
+ * bottom of the column (design §13.2 A3) — a buy-low IR star is a real trade target, and a
+ * picker that hides him is lying about the roster.
+ *
+ * Until WS-C lands, the engine still answers "Invalid — not on … active roster" for these
+ * rows; that is the engine's semantics to fix, not the picker's.
+ */
+function parkedGroups(ctx, roster, q) {
+  const out = [];
+  for (const [slot, ids] of [["IR", roster.reserve], ["Taxi", roster.taxi]]) {
+    const list = (ids || []).filter((id) => matches(ctx, id, q));
+    if (list.length) out.push([slot, list]);
+  }
+  return out;
+}
+
 function columnList(ctx, roster, side, selected, q) {
-  const ids = roster.players.filter((id) => matches(ctx, id, q));
+  const parked = new Set([...(roster.reserve || []), ...(roster.taxi || [])]);
+  const ids = roster.players.filter((id) => !parked.has(id) && matches(ctx, id, q));
   const groups = positionGroups(ctx, ids);
-  if (!groups.length) return `<p class="col-empty">Nothing matches.</p>`;
-  return groups.map(([pos, list]) => {
+  const stashes = parkedGroups(ctx, roster, q);
+  if (!groups.length && !stashes.length) return `<p class="col-empty">Nothing matches.</p>`;
+  const group = (head, list, slot = "") => {
     const rows = list
       .map((id) => ({ id, mv: env.svc.marketValue(ctx, id) }))
       .sort((x, y) => (y.mv.m ?? -1) - (x.mv.m ?? -1));
-    return `<div class="pgroup"><h4 class="pgroup-h">${escapeHtml(pos)}<span class="pgroup-n">${rows.length}</span></h4>
-      ${rows.map((r) => playerRow(ctx, r.id, { side, selected: selected.includes(r.id), mv: r.mv, compact: true })).join("")}</div>`;
-  }).join("");
+    return `<div class="pgroup${slot ? " pgroup-park" : ""}"><h4 class="pgroup-h">${escapeHtml(head)}<span class="pgroup-n">${rows.length}</span></h4>
+      ${rows.map((r) => playerRow(ctx, r.id, { side, selected: selected.includes(r.id), mv: r.mv, compact: true, slot })).join("")}</div>`;
+  };
+  return [
+    ...groups.map(([pos, list]) => group(pos, list)),
+    ...stashes.map(([slot, list]) => group(slot, list, slot)),
+  ].join("");
 }
 
 function columns(ctx, a) {
