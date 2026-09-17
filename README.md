@@ -48,7 +48,7 @@ Full methodology, sources, and citations live in the research notes of the paren
 
 | Source | Used for | Terms |
 |---|---|---|
-| [Sleeper API](https://docs.sleeper.com/) | league, rosters, transactions, players, weekly projections, schedule | public read-only API |
+| [Sleeper API](https://docs.sleeper.com/) | league, rosters, transactions, players, weekly projections, season and weekly actuals (`data/history.json`), schedule | public read-only API |
 | [FantasyCalc](https://fantasycalc.com/) | redraft and dynasty trade values | public API |
 | [DynastyProcess](https://github.com/dynastyprocess/data) | dynasty values (`values-players.csv`) | GPL-3.0 |
 | [Boris Chen](https://www.borischen.co/) | weekly half-PPR tiers | public tier files |
@@ -65,7 +65,7 @@ iPhone (PWA on GitHub Pages) ──live──► api.sleeper.app · api.fantasyc
 
 - Static files only: `index.html`, `styles.css`, ES modules under `src/`, `sw.js`. No build step,
   no dependencies.
-- `pipeline/refresh.mjs` (Node ≥ 20, no dependencies) regenerates `data/*.json` every three hours
+- `pipeline/refresh.mjs` (Node ≥ 20, no dependencies) regenerates `data/*.json` (players, projections, values, schedule, meta, and `history.json` — last season's and this season's weekly actuals for the risk model) every three hours
   and the workflow in `.github/workflows/refresh-data.yml` commits the result when it changed.
 - `pipeline/alerts.mjs` is scheduled every 10 minutes: it reads live injury statuses for every
   rostered player (one current-week projections call — the rows carry Sleeper's `injury_*` fields
