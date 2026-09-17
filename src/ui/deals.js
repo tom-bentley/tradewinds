@@ -284,6 +284,17 @@ function whyLine(ctx, r, nm) {
   return r.why && r.why.length ? r.why[0] : "";
 }
 
+/**
+ * An IR stash is tradeable since §13.4 C3, so a deal can move a player who lands straight on
+ * the other side's IR. The counts come off the finder row; zero means "nothing to say".
+ */
+function irChips(r) {
+  const out = [];
+  if (Number(r.irOut) > 0) out.push(`<span class="tag tag-mute">${Number(r.irOut)} IR out</span>`);
+  if (Number(r.irIn) > 0) out.push(`<span class="tag tag-mute">${Number(r.irIn)} IR in</span>`);
+  return out.join("");
+}
+
 function card(r, i) {
   const ctx = store.ctx;
   const forId = r.forRosterId != null ? r.forRosterId : store.deals.forRosterId;
@@ -306,7 +317,7 @@ function card(r, i) {
       <span class="deal-body">
         ${tagged ? `<span class="deal-for">for ${escapeHtml(clip(forR?.displayName || "?", 16))}</span>` : ""}
         <span class="deal-h">${avatar(rival, 28)}<span class="deal-team">${escapeHtml(clip(rival?.displayName || "", 16))}</span>
-          <span class="deal-shape">${escapeHtml(r.shape.replace("-", " for "))}</span></span>
+          <span class="deal-shape">${escapeHtml(r.shape.replace("-", " for "))}</span>${irChips(r)}</span>
         <span class="swap">
           <span class="swap-row"><span class="swap-k swap-out">out</span><span class="swap-chips">${r.give.map((id) => playerChip(ctx, id, "theirs", env.svc.marketValue(ctx, id))).join("")}</span></span>
           <span class="swap-row"><span class="swap-k swap-in">in</span><span class="swap-chips">${r.get.map((id) => playerChip(ctx, id, "mine", env.svc.marketValue(ctx, id))).join("")}</span></span>

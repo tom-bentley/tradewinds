@@ -6,7 +6,9 @@
 // an idle callback after first paint — the skeleton is what the tab shows meanwhile.
 
 import { store, setIn } from "./store.js";
-import { playerThumb, skeleton, empty, signTone, injuryTag } from "./components.js";
+import {
+  playerThumb, skeleton, empty, signTone, injuryTag, bandChip, faComponents, isStreamable,
+} from "./components.js";
 import {
   escapeHtml, fmtValue, fmtNum, fmtPts, waiverChipText, clip,
 } from "./format.js";
@@ -136,8 +138,6 @@ function statusChip(row) {
   return `<span class="schip ${waivers ? "schip-wv" : "schip-free"}">${escapeHtml(waiverChipText(row))}</span>`;
 }
 
-// Wave 2 (design §13.8 step 2): the stat row gains the WS-D score components the engine will
-// put on each row (`insurancePerWeek`, `riskPenalty`, `consensusGap`) — they do not exist yet.
 function card(env, row, i) {
   const ctx = store.ctx;
   const p = ctx.players.get(row.add) || { name: row.add, pos: "", team: "" };
@@ -146,6 +146,9 @@ function card(env, row, i) {
   const drop = row.drop ? ctx.players.get(row.drop) : null;
   const why = Array.isArray(row.why) && row.why.length ? row.why[0] : "";
   const playoff = Number(row.playoffGainPerWeek);
+  // The score is a sum (§13.5 D3) — printing its terms is the only way a reader can tell a
+  // lineup upgrade from a piece of injury insurance the model liked.
+  const comp = faComponents(row);
   return `<li class="fa" data-status="${escapeHtml(row.status || "free")}">
     <button type="button" class="fa-hit" data-act="fa-open" data-id="${escapeHtml(row.add)}">
       <span class="fa-rank num">${i + 1}</span>
@@ -163,12 +166,14 @@ function card(env, row, i) {
           ${drop
             ? `<span class="schip schip-drop">drop ${escapeHtml(clip(drop.name, 16))}</span>`
             : `<span class="schip schip-open">open roster spot</span>`}
+          ${isStreamable(row) ? `<span class="schip schip-stream">streamable</span>` : ""}
+          ${row.risk ? bandChip(row.risk.band, "risk") : ""}
         </span>
         <span class="deal-stats">
           <span class="dstat"><b class="num" data-tone="${signTone(row.gainPerWeek)}">${fmtPts(row.gainPerWeek)}</b> pts/wk</span>
           ${Number.isFinite(playoff) ? `<span class="dstat"><b class="num" data-tone="${signTone(playoff)}">${fmtPts(playoff)}</b> playoffs</span>` : ""}
-          <span class="dstat"><b class="num" data-tone="${signTone(row.valueDelta, 50)}">${row.valueDelta > 0 ? "+" : ""}${fmtValue(row.valueDelta)}</b> value</span>
         </span>
+        ${comp.length ? `<span class="fa-comp">${comp.map((c) => escapeHtml(c)).join(" · ")}</span>` : ""}
         ${why ? `<span class="deal-why">${escapeHtml(why)}</span>` : ""}
       </span>
     </button>
