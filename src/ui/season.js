@@ -317,6 +317,7 @@ export async function loadSchedule(svc, ctx) {
   const from = Number(ctx.week) || 1;
   const to = Number(ctx.lastWeek) || 17;
   const byWeek = {};
+  const rawByWeek = {};
   if (typeof svc.getMatchups === "function" && leagueId) {
     const weeks = [];
     for (let w = from; w <= to; w += 1) weeks.push(w);
@@ -324,16 +325,33 @@ export async function loadSchedule(svc, ctx) {
       try { return [w, await svc.getMatchups(leagueId, w)]; } catch { return [w, null]; }
     }));
     for (const [w, rows] of answers) {
+      if (Array.isArray(rows) && rows.length) rawByWeek[w] = rows;
       const pairs = pairUp(rows);
       if (pairs) byWeek[w] = pairs;
     }
   }
   let bracket = null;
+  let rawBracket = null;
   if (typeof svc.getWinnersBracket === "function" && leagueId) {
     try {
       const rounds = await svc.getWinnersBracket(leagueId);
-      if (Array.isArray(rounds) && rounds.length) bracket = { provisional: true, asOfWeek: from, rounds };
+      if (Array.isArray(rounds) && rounds.length) {
+        rawBracket = rounds;
+        bracket = { provisional: true, asOfWeek: from, rounds };
+      }
     } catch { bracket = null; }
+  }
+  // Integration 2026-09-22: the engine's `buildSchedule` (design §3.5) is the canonical pairing AND
+  // the bracket shape `simulateSeason` reads (seeded rounds, completed-week results). Handing the
+  // simulation raw Sleeper bracket rows read as a 99 % first-round bye where the engine says 59 %.
+  // The local `pairUp` result below stays as the Phase-0 fallback when the engine is absent.
+  if (typeof svc.buildSchedule === "function" && Object.keys(rawByWeek).length) {
+    try {
+      const built = svc.buildSchedule(rawByWeek, rawBracket, ctx);
+      if (built && built.byWeek && Object.keys(built.byWeek).length) return built;
+    } catch (err) {
+      console.warn("[season] engine buildSchedule failed; using the local pairing", err);
+    }
   }
   return {
     byWeek,
