@@ -276,20 +276,35 @@ function usageSection(ctx, svc, id) {
   if (!u || !Array.isArray(u.weeks) || !u.weeks.length) return "";
   const snap = Array.isArray(u.snapShare) ? u.snapShare : [];
   const tgt = Array.isArray(u.targetShare) ? u.targetShare : [];
+  // Target share is rec_tgt over the TEAM'S TARGETS (R6 §Q6.3: pass attempts run 0–5 higher and are
+  // the wrong denominator), so the labels say "team targets", never "pass attempts".
   const spark = usageSparkline({
     weeks: u.weeks, values: snap.some((v) => v != null) ? snap : tgt,
     second: snap.some((v) => v != null) ? tgt : null,
-    kind: snap.some((v) => v != null) ? "snap share" : "target share of team pass attempts",
-    secondKind: "target share of team pass attempts",
+    kind: snap.some((v) => v != null) ? "snap share" : "share of team targets",
+    secondKind: "share of team targets",
     partialWeeks: u.partialWeeks, uid: `us-${id}`,
   });
   if (!spark) return "";
-  const last = (xs) => { for (let i = xs.length - 1; i >= 0; i -= 1) if (xs[i] != null) return xs[i]; return null; };
+  const lastAt = (xs) => { for (let i = xs.length - 1; i >= 0; i -= 1) if (xs[i] != null) return i; return -1; };
+  const weekOf = (i) => (i >= 0 && Array.isArray(u.weeks) && u.weeks[i] != null ? u.weeks[i] : null);
+  // The latest week alone can mislead (a back who left hurt reads "16 % of snaps"), so the line
+  // names the week and shows the previous played week beside it.
+  const share = (xs) => {
+    const i = lastAt(xs);
+    if (i < 0) return `<b class="num">—</b>`;
+    const wk = weekOf(i);
+    let prev = "";
+    for (let k = i - 1; k >= 0; k -= 1) {
+      if (xs[k] != null) { prev = ` <span class="dim">(wk ${escapeHtml(String(weekOf(k) ?? "?"))}: ${escapeHtml(pct01(xs[k]))})</span>`; break; }
+    }
+    return `<b class="num">${escapeHtml(pct01(xs[i]))}</b>${wk != null ? ` in wk ${escapeHtml(String(wk))}` : ""}${prev}`;
+  };
   const trend = (t) => (t && t.real ? ` <span class="dim">(${t.slope > 0 ? "rising" : "falling"} over ${t.weeks} weeks)</span>` : "");
   return `<h3 class="sub">Role</h3>
     ${spark}
-    <p class="mv-peak"><b class="num">${escapeHtml(pct01(last(snap)))}</b> of snaps${trend(u.trend && u.trend.snap)}
-      · <b class="num">${escapeHtml(pct01(last(tgt)))}</b> of team targets${trend(u.trend && u.trend.tgt)}</p>`;
+    <p class="mv-peak">${share(snap)} of snaps${trend(u.trend && u.trend.snap)}
+      · ${share(tgt)} of team targets${trend(u.trend && u.trend.tgt)}</p>`;
 }
 
 /**
