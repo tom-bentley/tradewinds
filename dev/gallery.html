@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tradewinds — micro-visual gallery (dev)</title>
+<!--
+  DEV ONLY. Not in `sw.js` PRECACHE, not linked from the app, not shipped to a user.
+
+  Every number below is SYNTHETIC and labelled as such: these are shapes for screenshots and for
+  eyeballing a token change, never a claim about a real player. Serve it from the repo root
+  (`python -m http.server 8788`) and open /dev/gallery.html — `file:` URLs cannot load ES modules.
+-->
+<link rel="stylesheet" href="../styles.css">
+<style>
+  html, body { height: auto; overflow: auto; }
+  body { padding: 16px 12px 64px; max-width: 560px; margin-inline: auto; }
+  h1 { font-size: 20px; letter-spacing: -.02em; margin-bottom: 4px; }
+  h2 { font-size: 17px; letter-spacing: -.02em; margin: 22px 0 2px; }
+  .lede, .cap { font-size: 14px; color: var(--ink-3); }
+  .cap { margin-bottom: 6px; }
+  .g-card { background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--r-card); padding: 12px; margin-top: 8px; }
+  .g-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+  .g-row .nm { flex: 1; min-width: 0; }
+  .g-bar { display: flex; gap: 8px; align-items: center; margin: 14px 0 0; }
+  .g-bar button { min-height: 36px; padding: 0 12px; border-radius: var(--r-pill); background: var(--surface2); border: 1px solid var(--line); color: var(--ink-2); }
+  .g-bar button[aria-pressed="true"] { border-color: var(--mine); color: var(--mine); }
+  .mv-twin-src[hidden] { display: none; }
+  .g-show .mv-twin-src[hidden] { display: block; }
+</style>
+</head>
+<body>
+<h1>Micro-visual gallery</h1>
+<p class="lede">Every primitive in <code>src/ui/sparkline.js</code>, drawn from synthetic sample
+data. Nothing here is a real player, a real projection or a real report.</p>
+
+<div class="g-bar">
+  <button type="button" id="g-theme" aria-pressed="false">Light mode</button>
+  <button type="button" id="g-twins" aria-pressed="false">Show table twins</button>
+</div>
+
+<div id="g"></div>
+
+<script type="module">
+import {
+  weekStrip, weekStripGroup, usageSparkline, matchupStrip, matchupNextChips,
+  availabilityBar, seasonMap, valueBullet, synergyBadges, dossierCard,
+} from "../src/ui/sparkline.js";
+import { seasonSection } from "../src/ui/season.js";
+
+/* ---------------------------------------------------------------- synthetic sample data */
+
+const WEEKS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+// A deterministic saw with one bye (wk 6), one did-not-play (wk 2) and one zero (wk 9).
+const ACTUAL = WEEKS.map((w) => (w === 6 || w === 2 ? null : w === 9 ? 0 : 6 + ((w * 7) % 19)));
+const PROJ = WEEKS.map((w) => 13 + ((w * 3) % 5));
+const PAST = WEEKS.filter((w) => w <= 10);
+
+const section = (title, cap, html) =>
+  `<h2>${title}</h2><p class="cap">${cap}</p><div class="g-card">${html}</div>`;
+
+const parts = [];
+
+/* P1 */
+parts.push(section("P1 · Week strip", "Synthetic: 10 played weeks, a bye in 6, a DNP in 2, a zero in 9.",
+  weekStrip({
+    weeks: PAST, actual: ACTUAL.slice(0, 10), projected: PROJ.slice(0, 10),
+    byeWeeks: [6], dnpWeeks: [2], currentWeek: 11, name: "Sample Player",
+    act: "twin", id: "p1", uid: "g1",
+    opponents: PAST.map((w) => ({ week: w, opp: w % 2 ? "@AAA" : "vs BBB" })),
+  })));
+
+parts.push(section("P1 · full season, nothing played yet",
+  "Synthetic: projections only — R12 §R4's fourth null state, the tick without a bar.",
+  weekStrip({ weeks: WEEKS, actual: WEEKS.map(() => null), projected: PROJ, currentWeek: 1, uid: "g1b" })));
+
+/* P1 small multiples */
+parts.push(section("P1 · small multiples", "Synthetic: four players, one shared scale stated once.",
+  weekStripGroup([
+    { name: "Sample A", weeks: PAST, actual: ACTUAL.slice(0, 10), projected: PROJ.slice(0, 10), byeWeeks: [6], uid: "m1" },
+    { name: "Sample B", weeks: PAST, actual: PAST.map((w) => 4 + w), projected: PROJ.slice(0, 10), uid: "m2" },
+    { name: "Sample C", weeks: PAST, actual: PAST.map((w) => 26 - w * 1.4), projected: PROJ.slice(0, 10), uid: "m3" },
+    { name: "Sample D", weeks: PAST, actual: PAST.map(() => 11), projected: PROJ.slice(0, 10), uid: "m4" },
+  ])));
+
+/* P2 */
+const SHARE = [0.41, 0.46, 0.52, 0.55, 0.6, 0.62, 0.66, 0.68];
+const TGT = [0.18, 0.2, 0.19, 0.24, 0.22, 0.26, 0.25, 0.28];
+parts.push(section("P2 · Usage sparkline",
+  "Synthetic: rising snap share with target share beside it. The row version is 56×18 and carries one series only.",
+  `${usageSparkline({ weeks: PAST.slice(0, 8), values: SHARE, second: TGT, kind: "snap share", secondKind: "target share of team pass attempts", partialWeeks: [8], uid: "g2" })}
+   <div class="g-row"><span class="nm">Sample Player <span class="dim">WR HOU</span></span>
+     ${usageSparkline({ weeks: PAST.slice(0, 8), values: SHARE, row: true, uid: "g2r" })}
+     <span class="num">4,120</span></div>
+   <div class="g-row"><span class="nm">Flat Sample <span class="dim">RB DET</span></span>
+     ${usageSparkline({ weeks: PAST.slice(0, 8), values: SHARE.map(() => 0.33), row: true, uid: "g2r2" })}
+     <span class="num">2,480</span></div>`));
+
+/* P3 */
+const GRADES = [5, 2, 4, 1, 3, 5, 4, null, 2, 3].map((bin) =>
+  (bin == null ? null : { bin, conf: "high", adjusted: true, opp: bin > 3 ? "@WEAK" : "vs TOUGH" }));
+parts.push(section("P3 · Matchup strip",
+  "Synthetic: taller is easier. Height carries the grade, three colour bins carry the bin — never a heat map.",
+  `${matchupNextChips([8, 9, 10], GRADES)}
+   ${matchupStrip({ weeks: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17], grades: GRADES, byeWeeks: [15], name: "Sample Player", act: "twin", id: "p3", uid: "g3" })}`));
+
+parts.push(section("P3 · a skill position, graded for display only",
+  "Synthetic: low confidence, unadjusted — R8 §5.4 says Sleeper already prices the defence in.",
+  matchupStrip({
+    weeks: [8, 9, 10, 11, 12], uid: "g3b",
+    grades: [4, 2, 3, 5, 1].map((bin) => ({ bin, conf: "low", adjusted: false, opp: "vs XXX" })),
+  })));
+
+/* P4 */
+parts.push(section("P4 · Availability bar",
+  "Synthetic: a knee that clears around week 11, with week 9 flagged as a decision.",
+  availabilityBar({
+    weeks: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+    pAvailable: [0.35, 0.62, 0.81, 0.95, 0.97, 0.97, 0.98, 0.98, 0.98, 0.98],
+    decisionWeeks: [9], expectedMissed: 1.8,
+  })));
+
+/* P5 + the whole season section */
+// pWin is derived from the two means through R9's own elasticity (1.37 pp per point of margin
+// around a 0.5 base), so the synthetic season behaves the way the real one will: a +18 point
+// edge is about 0.75, and everything inside +/-7.4 points is a coin flip.
+const strengthFor = (p) => (p >= 0.6 ? "strong" : p <= 0.4 ? "weak" : "even");
+const CARDS = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17].map((week, i) => {
+  const mine = 136 + ((i * 5) % 9);
+  const them = 118 + ((i * 11) % 30);
+  const pWin = Math.round(Math.min(0.9, Math.max(0.1, 0.5 + (mine - them) * 0.0137)) * 1000) / 1000;
+  return {
+    week,
+    isPlayoffWeek: week >= 15,
+    scheduleIsProvisional: week >= 15,
+    me: { mean: mine, sd: 28.6 },
+    opp: { rosterId: (i % 7) + 1, teamName: `Sample Team ${(i % 7) + 1}`, mean: them, sd: 28.1 },
+    margin: mine - them,
+    pWin,
+    strength: strengthFor(pWin),
+    holes: i === 5 ? [{ slot: "QB", cause: "injury", playerId: "111", weeks: [8, 9, 10] }] : [],
+    moves: i === 5 ? [
+      { kind: "season-add", addId: "444", pointsPerWeek: 1.2, weeksCovered: [8, 9, 10, 11, 12], winEquity: 0.031, cost: { faab: 24 } },
+      { kind: "stream", addId: "222", dropId: "333", pointsPerWeek: 4.5, weeksCovered: [8], winEquity: 0.012, cost: { faab: 2 } },
+    ] : [],
+  };
+});
+parts.push(section("P5 · Season map (the mark alone)",
+  "Synthetic: dumbbell of my mean against the opponent's, P(win) below the midline, playoff weeks banded.",
+  seasonMap({ cards: CARDS, currentWeek: 8, act: "twin", id: "p5", uid: "g5" })));
+
+parts.push(section("The League section it lives in",
+  "Synthetic SeasonMap, rendered by src/ui/season.js exactly as the League tab renders it.",
+  seasonSection({
+    weeks: CARDS,
+    summary: {
+      expectedWins: { regular: 6.74, total: 8.74, record: "8.7-5.3" },
+      playoffOdds: 0.96, firstRoundByeOdds: 0.41, topSeedOdds: 0.22, titleOdds: 0.19,
+      weakest: [{ week: 8, pWin: 0.453 }, { week: 9, pWin: 0.467 }],
+      strongest: [{ week: 12, pWin: 0.67 }, { week: 5, pWin: 0.75 }],
+      sigmaCalibration: { sigmaTeam: 29.0, ci95: [26.4, 31.9], n: 96, source: "history.json wk1..now", model: "positionCv" },
+      objectiveAdvice: "Your berth is 96% safe; play for the bye.",
+    },
+  }, { week: 8, objective: "bye", status: "ready", nameOf: (id) => `Sample ${id}` })));
+
+/* P6 */
+parts.push(section("P6 · Value-gap bullet",
+  "Synthetic: bar is the model, tick is the market. Third row shows the compact form the cards use.",
+  `${valueBullet({ market: 1240, model: 1510, label: "Model value" })}
+   ${valueBullet({ market: 3100, model: 2450, label: "Model value" })}
+   ${valueBullet({ market: 880, model: 890, compact: true })}`));
+
+parts.push(section("P6 · one shared scale",
+  "Synthetic: the same three players, all drawn 0–5,000 — the second stack-up view.",
+  [[1240, 1510], [3100, 2450], [880, 890]].map(([market, model], i) =>
+    `<div class="mv-panel"><p class="mv-panel-n">Sample ${"ABC"[i]}</p>${
+      valueBullet({ market, model, min: 0, max: 5000, compact: true })}</div>`).join("")));
+
+/* P7 */
+parts.push(section("P7 · Synergy badges",
+  "Synthetic: amber is reserved for the bye clash, which is genuine caution. No icons — the word is the signal.",
+  synergyBadges([
+    { kind: "handcuff", name: "Sample Starter", delta: 0.8, reason: "same team, one slot behind" },
+    { kind: "stack", name: "Sample QB", delta: 0.4 },
+    { kind: "bye_clash", week: 5, delta: -1.2 },
+    { kind: "complement", name: "Sample Incumbent", delta: 0.2 },
+    { kind: "scarcity", pos: "RB", delta: 0.5 },
+  ], { signed: true })));
+
+/* P8 */
+parts.push(section("P8 · Dossier card",
+  "Synthetic: no claim renders without a dated source row. Second card is the same report gone stale.",
+  `${dossierCard({ as_of: "2026-09-22T13:38:00Z", depth: "deep", conf: "med", n: 3 }, SAMPLE_DOSSIER(), { now: Date.parse("2026-09-22T15:00:00Z") })}
+   ${dossierCard({ as_of: "2026-09-22T13:38:00Z", depth: "deep", conf: "low", n: 1, flags: ["stale"] }, SAMPLE_DOSSIER(), { now: Date.parse("2026-09-27T15:00:00Z") })}
+   ${dossierCard(null, null)}`));
+
+function SAMPLE_DOSSIER() {
+  return {
+    as_of: "2026-09-22T13:38:00Z", depth: "deep", confidence: "med",
+    role: { notes: "18 of 23 routes from the slot last week", snap_share_trend: { src: 0 } },
+    matchup_notes: [{ text: "The next opponent is 27th in points allowed to the position", src: 0 }],
+    contradictions: [{ claim: "reported on injured reserve", against_src: 1, resolved: "no — day to day per the beat", severity: "high" }],
+    sources: [
+      { i: 0, url: "https://example.invalid/sample-a", outlet: "Sample Beat", published: "2026-09-22" },
+      { i: 1, url: "https://example.invalid/sample-b", outlet: "Sample Aggregator", published: "2026-09-21" },
+    ],
+    consensus: { n: 3 },
+  };
+}
+
+document.getElementById("g").innerHTML = parts.join("");
+
+/* ---------------------------------------------------------------- gallery controls */
+
+const themeBtn = document.getElementById("g-theme");
+themeBtn.addEventListener("click", () => {
+  const light = document.documentElement.dataset.theme !== "light";
+  document.documentElement.dataset.theme = light ? "light" : "dark";
+  themeBtn.setAttribute("aria-pressed", String(light));
+  themeBtn.textContent = light ? "Dark mode" : "Light mode";
+});
+
+const twinBtn = document.getElementById("g-twins");
+twinBtn.addEventListener("click", () => {
+  const on = !document.body.classList.contains("g-show");
+  document.body.classList.toggle("g-show", on);
+  for (const el of document.querySelectorAll(".mv-twin-src")) el.hidden = !on;
+  twinBtn.setAttribute("aria-pressed", String(on));
+});
+</script>
+</body>
+</html>

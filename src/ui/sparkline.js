@@ -653,7 +653,11 @@ export function seasonMap(o = {}) {
 
   const body = [
     bandRects,
-    rule(0, MID, W, "mv-mid"),
+    // The hairline sits at P = 0.5, not at the top of the band. That is what keeps colour from
+    // being the only channel for the sign (R12 §R3d): a bar that stops short of the rule is a
+    // week you are behind in, one that crosses it is a week you are ahead in, and the teal/rose
+    // fill only reinforces what the length against the reference already said.
+    rule(0, MID + (PBOT - MID) / 2, W, "mv-mid"),
     vpath(conn, "mv-conn", 1.5),
     dots(ring, "mv-ring", 5.5),
     dots(oppD, "mv-opp-dot", 3),
@@ -678,7 +682,7 @@ export function seasonMap(o = {}) {
     ${weekAxis(cards.map((c) => fin(c.week)), new Set(), o.axisEvery)}
     <figcaption class="mv-legend"><span class="mv-k mv-k-mine"></span>mine
       <span class="mv-k mv-k-opp"></span>opponent
-      <span class="dim">· bars below the line are P(win)</span></figcaption>
+      <span class="dim">· bars are P(win); the rule is a coin flip</span></figcaption>
   </figure>`;
 }
 

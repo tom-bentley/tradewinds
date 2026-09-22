@@ -1157,3 +1157,6 @@ html.kb-open #toasts { bottom: calc(var(--safe-b) + 12px); }
 .deal-bullet { display: block; margin-top: 4px; }
 .deal-bullet .mv-panel-n { display: block; font-size: 14px; color: var(--ink-3); font-weight: 500; }
 .fa-body .mv-bul-c, .deal-body .mv-bul-c { display: block; max-width: 100%; }
+
+/* The P(win) reference sits at 0.5 and has to be legible — it is the second channel. */
+.mv-mid { stroke: var(--ink-3); opacity: .55; }
