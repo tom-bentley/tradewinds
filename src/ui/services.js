@@ -182,21 +182,50 @@ async function loadLive() {
     // ---- 004 player intelligence (design §3) ----------------------------------------------
     // usage.js shares/trends, prognosis.js dossier-first absence, matchup.js K/DEF streaming +
     // grades, seasonmap.js week cards, hidden.js acquire/sell lists; sleeper.js gains the league
-    // schedule reads. `requestResearch` is wired at integration (push.js dispatch + queue contract).
+    // schedule reads.
     usageOf: (usage && usage.usageOf) || null,
+    usageTotals: (usage && usage.usageTotals) || null,
     dossierPrognosis: (prognosis && prognosis.dossierPrognosis) || null,
     prognose: (prognosis && prognosis.prognose) || null,
+    absenceNoteOf: (advisor && advisor.absenceNoteOf) || null,
     streamingFactor: (matchup && matchup.streamingFactor) || null,
     matchupGrade: (matchup && matchup.matchupGrade) || null,
+    matchupFlags: (matchup && matchup.matchupFlags) || null,
     oppFactor: (matchup && matchup.oppFactor) || null,
-    seasonMap: (seasonmap && seasonmap.seasonMap) || null,
+    // The season map takes the canonical per-week roster mean/sd from risk.js when it is there
+    // (WS-I/WS-K seam, design §3.5); without risk.js it falls back to its own positionCv estimate.
+    seasonMap:
+      seasonmap && seasonmap.seasonMap
+        ? (ctx, opts = {}) =>
+            seasonmap.seasonMap(ctx, { rosterWeekly: (risk && risk.rosterWeekly) || undefined, ...opts })
+        : null,
+    buildSchedule: (seasonmap && seasonmap.buildSchedule) || null,
+    simulateSeason: (seasonmap && seasonmap.simulateSeason) || null,
+    rosterWeekly: (risk && risk.rosterWeekly) || null,
     hiddenValue: (hidden && hidden.hiddenValue) || null,
     acquireList: (hidden && hidden.acquireList) || null,
     sellList: (hidden && hidden.sellList) || null,
+    hiddenLists: (hidden && hidden.hiddenLists) || null,
     synergyScore: (hidden && hidden.synergyScore) || null,
     getMatchups: (sleeper && sleeper.getMatchups) || null,
     getWinnersBracket: (sleeper && sleeper.getWinnersBracket) || null,
-    requestResearch: null,
+    // On-demand research (design §2.5, R11 §Q11.2): the same fine-grained PAT and dispatch path the
+    // alerts self-pairing uses, with `event_type: research`. The queue workflow appends the row; the
+    // phone only ever learns "GitHub accepted the request" (204) — never that a dossier will arrive.
+    requestResearch:
+      push && typeof push.dispatchToGithub === "function"
+        ? async (id, opts = {}) =>
+            push.dispatchToGithub({
+              event: "research",
+              payload: {
+                v: 1,
+                id: String(id),
+                depth: opts.depth || "deep",
+                sk: opts.sk ?? null,
+                at: new Date().toISOString(),
+              },
+            })
+        : null,
 
     // ---- src/engine/waiver.js (§11.2) -------------------------------------------------
     // waiver.js `freeAgentPool` is a FLAT id array; the stand-in finder wants them grouped, so
@@ -918,6 +947,13 @@ export function decorate(api) {
   if (!has("synergyScore")) api.synergyScore = () => null;
   if (!has("getMatchups")) api.getMatchups = async () => [];
   if (!has("getWinnersBracket")) api.getWinnersBracket = async () => [];
+  if (!has("usageTotals")) api.usageTotals = () => null;
+  if (!has("absenceNoteOf")) api.absenceNoteOf = () => "";
+  if (!has("matchupFlags")) api.matchupFlags = () => [];
+  if (!has("buildSchedule")) api.buildSchedule = () => null;
+  if (!has("simulateSeason")) api.simulateSeason = () => null;
+  if (!has("rosterWeekly")) api.rosterWeekly = () => [];
+  if (!has("hiddenLists")) api.hiddenLists = () => ({ acquire: [], sell: [] });
   if (!has("requestResearch")) {
     api.requestResearch = async () => ({ ok: false, reason: "Research requests are not available in this build." });
   }
