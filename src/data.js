@@ -92,6 +92,13 @@ export const PIPELINE_FILES = Object.freeze([
 export const ADVISOR_FILE = "advisor.json";
 
 /**
+ * The research desk's engine slice (004 design §2.4). Like `advisor.json` and unlike the §2.1–§2.3
+ * files, it is written by a job that is NOT the pipeline, so it carries no `meta.json` stamp and
+ * cannot ride along with the pipeline download — it gets its own loader below.
+ */
+export const DOSSIERS_FILE = "dossiers.json";
+
+/**
  * Pipeline files the app rides along with but never depends on (design §13.6 F3). They travel
  * with the heavy four — same meta-stamp check, same IndexedDB drawer — but absent, unreachable or
  * malformed is the ORDINARY case, not an error: the engine simply gets `null` and does without.
@@ -347,6 +354,8 @@ function isUsableOptionalFile(file, payload) {
   if (file === "stats.json") return payload.version === 1 && Array.isArray(payload.keys) && isPlainObject(payload.players);
   if (file === "games.json") return payload.version === 1 && Array.isArray(payload.games);
   if (file === "dvp.json") return payload.version === 1 && isPlainObject(payload.teams);
+  // Desk-written (§2.4): `v`, not `version`, because it is not a pipeline contract file.
+  if (file === DOSSIERS_FILE) return payload.v === 1 && isPlainObject(payload.players);
   return true;
 }
 
@@ -588,6 +597,31 @@ export async function loadAdvisorFeed({ fetchImpl = globalThis.fetch, idb = defa
 }
 
 /**
+ * The research desk's engine slice (004 design §2.4). Exactly the `loadAdvisorFeed` contract one
+ * file over: network-first, an IndexedDB drawer behind it, and `null` for every failure mode —
+ * a repo whose desk has never run has no `data/dossiers.json` at all, so "absent" is the ordinary
+ * case. A GitHub Pages 404 is served as an HTML page, so the shape gate matters: without it that
+ * page would be cached over a good copy and handed to `buildContext` (R13 §Q13.5 gotcha).
+ *
+ * `buildDossiers` in the engine applies the same `v === 1` check, and `prognosis.js` decides
+ * per row whether the rubric is known and the dossier still fresh — nothing here judges content.
+ * @param {{fetchImpl?: Function, idb?: object}} [deps]
+ * @returns {Promise<object|null>} the parsed slice file, or null when there is none
+ */
+export async function loadDossiers({ fetchImpl = globalThis.fetch, idb = defaultIdb } = {}) {
+  const key = `pipeline:${DOSSIERS_FILE}`;
+  try {
+    const payload = await fetchDataFile(DOSSIERS_FILE, fetchImpl);
+    if (!isUsableOptionalFile(DOSSIERS_FILE, payload)) return null;
+    await idb.set(key, payload);
+    return payload;
+  } catch {
+    const cached = await idb.get(key);
+    return isUsableOptionalFile(DOSSIERS_FILE, cached?.payload) ? cached.payload : null;
+  }
+}
+
+/**
  * @typedef {object} LoadDeps
  * @property {typeof fetch} [fetchImpl] Fetch used for both data files and APIs.
  * @property {{get: Function, set: Function, del: Function, keys: Function}} [idb] Cache backend.
@@ -666,6 +700,8 @@ export async function loadAll(options = {}) {
   // The advisor feed rides along with the live layer rather than adding a round trip of its own;
   // it is awaited at step 4 and resolves null when the job has never written one.
   const advisorJob = loadAdvisorFeed({ fetchImpl, idb });
+  // 004 design §2.4: same ride-along treatment, started here so it overlaps the pipeline download.
+  const dossiersJob = loadDossiers({ fetchImpl, idb });
 
   // ── 2. Live Sleeper layer ───────────────────────────────────────────────────────────────────
   progress("league", "Fetching live league state", 1);
@@ -811,12 +847,13 @@ export async function loadAll(options = {}) {
       history: isPlainObject(files["history.json"]) ? files["history.json"] : null,
       // 004 design §2.1–§2.4: usage lines, game context, defense-vs-position and desk dossiers.
       // Optional in every direction, exactly like history.json; `buildContext` collapses each to an
-      // empty Map. `dossiers` is filled by the dedicated loader once it ships (design §2.4) — until
-      // then it is null here on purpose.
+      // empty Map. The first three are meta-stamped pipeline files and ride with the download;
+      // `dossiers` is desk-written, so it comes from its own loader and is null whenever the desk
+      // has not published one.
       stats: isPlainObject(files["stats.json"]) ? files["stats.json"] : null,
       games: isPlainObject(files["games.json"]) ? files["games.json"] : null,
       dvp: isPlainObject(files["dvp.json"]) ? files["dvp.json"] : null,
-      dossiers: null,
+      dossiers: await dossiersJob,
       // Design §11.2: the engine never calls Date.now(), so the clock is an input. Both keys are
       // optional on the engine side — nothing breaks if buildContext ignores them.
       trending,

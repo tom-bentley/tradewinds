@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  ADVISOR_FILE,
+  DOSSIERS_FILE,
   FC_FLOORS,
   OPTIONAL_PIPELINE_FILES,
   PIPELINE_FILES,
@@ -27,10 +29,12 @@ const boom = () => {
 
 /**
  * How many of the five COMMITTED pipeline files a load downloaded. `data/advisor.json` (design
- * §12.4) and the OPTIONAL files of §13.6 F3 ride along on every load and say nothing about
- * whether the 250 KB pipeline payload was re-fetched, so they are counted out here.
+ * §12.4), `data/dossiers.json` (004 design §2.4) and the OPTIONAL files of §13.6 F3 ride along on
+ * every load and say nothing about whether the 250 KB pipeline payload was re-fetched, so they
+ * are counted out here. Both desk/job-written files have their own loaders and their own IDB
+ * drawers, so they are fetched on EVERY load, fast path included.
  */
-const rideAlongs = ["advisor.json", ...OPTIONAL_PIPELINE_FILES];
+const rideAlongs = [ADVISOR_FILE, DOSSIERS_FILE, ...OPTIONAL_PIPELINE_FILES];
 const pipelineUrls = (fetchImpl) =>
   fetchImpl.urls("data/").filter((url) => !rideAlongs.some((file) => url.includes(file)));
 const pipelineHits = (fetchImpl) => pipelineUrls(fetchImpl).length;
