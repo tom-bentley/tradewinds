@@ -34,12 +34,22 @@ export const CANDIDATES_PER_POS = 8;
 export const MAX_FA_CANDIDATES = 40;
 /** The top of a roster by surplus is never a drop candidate, whatever the wire offers. */
 export const PROTECTED_BY_SURPLUS = 6;
-/** Bid model (design.md §11.2, ported from R4 §4). */
+/** Bid model (design.md §11.2, ported from R4 §4; re-derived in 004 per R9 §Q9.4 R-8). */
 export const MAX_BID_SHARE = 0.35;
 export const BID_GAIN_SCALE = 10;
 export const BID_PHASE_FLOOR = 0.35;
 export const BID_AGGRESSIVE_MULT = 1.6;
 export const SEASON_WEEKS = 17;
+/**
+ * Total points — Δ per week × the weeks the add will actually start — that prices a bid at the
+ * whole `MAX_BID_SHARE` before scarcity and phase.
+ *
+ * Calibrated to R5 §2.3's published tiers via R9 §Q9.4's worked example: an 8-point weekly upgrade
+ * started for 12 weeks is 96 points and reads 28 % of budget (R5's "league-winner 30–40 %" band,
+ * and the 0.35 cap once scarcity multiplies it); a 3 pts/wk rest-of-season add at week 1 is 51
+ * points and reads 15 %, the middle of the "weekly starter 10–20 %" tier. ENGINE-CHOSEN.
+ */
+export const BID_TOTAL_SCALE = 340;
 /** Another free agent within this many points per week is "the same add, still available". */
 export const ALT_BAND_PER_WEEK = 2;
 /** Lineup gains inside this margin are a tie, settled on market value instead. */
@@ -285,16 +295,44 @@ export function alternativesAt(ctx, addId) {
 }
 
 /**
+ * How much of the budget a dollar is still worth, as a function of how much season is left.
+ *
+ * R9 §Q9.4 R-8 caught this curve running BACKWARDS: `0.35 + 0.65·(1 − weeksLeft/17)` rose from
+ * 0.35 in week 1 to 0.96 in week 17, so the same player was bid $10 in week 1 and $27 in week 17 —
+ * the opposite of every sourced FAAB heuristic ("FAAB is like a new car; it depreciates", R5 §2.3
+ * [34][35]; "$1 in Week 2 buys 15 weeks of a player, $1 in Week 12 buys 5", 4for4 [R11]). The fix
+ * is the same expression with the inversion removed: MONOTONE NON-INCREASING across weeks 1–17,
+ * floored at `BID_PHASE_FLOOR` so a late add is never free.
+ * @param {number} weeksLeft how many scoring weeks remain, this week included
+ * @param {number} [seasonWeeks]
+ * @returns {number} 1.0 with a full season left, `BID_PHASE_FLOOR` with none
+ */
+export function faabPhase(weeksLeft, seasonWeeks = SEASON_WEEKS) {
+  const n = Number(weeksLeft);
+  const span = Number(seasonWeeks) > 0 ? Number(seasonWeeks) : SEASON_WEEKS;
+  const left = Number.isFinite(n) ? Math.min(1, Math.max(0, n / span)) : 0;
+  return BID_PHASE_FLOOR + (1 - BID_PHASE_FLOOR) * left;
+}
+
+/**
  * What to bid, in FAAB units — only ever a number when the player is actually ON waivers in a
  * FAAB league. Outside the window he is free, and a bid is not a thing that exists.
+ *
+ * Priced as **Δ points per week × the weeks the add will actually start** (R9 §Q9.4 R-8/R-5, R5
+ * §2.3): a rest-of-season add in week 2 buys fifteen weeks of the upgrade and a week-15 add buys
+ * three, so the same weekly gain is worth a fifth as much [R11][R12]. The phase term on top is the
+ * depreciation of the budget itself and now falls with the calendar instead of rising against it.
  * @param {object} ctx
  * @param {number} rosterId
  * @param {string} addId
- * @param {number} gainPerWeek
+ * @param {number} gainPerWeek Δ points per week the add is expected to start
  * @param {string} status
- * @returns {{value:number, aggressive:number, remaining:number}|null}
+ * @param {number} [weeksCovered] how many weeks this add actually covers — a 1-week streamer, a
+ *   4-week bridge, or (the default) every remaining week, capped at the season's horizon
+ * @returns {{value:number, aggressive:number, remaining:number, weeksCovered:number,
+ *   totalPoints:number}|null}
  */
-export function suggestedBid(ctx, rosterId, addId, gainPerWeek, status) {
+export function suggestedBid(ctx, rosterId, addId, gainPerWeek, status, weeksCovered) {
   if (status !== "waivers") return null;
   if (Number(ctx.league && ctx.league.waiverType) !== FAAB_WAIVER_TYPE) return null;
   const roster = rosterById(ctx, rosterId);
@@ -303,12 +341,18 @@ export function suggestedBid(ctx, rosterId, addId, gainPerWeek, status) {
   const remaining = Math.max(0, (Number.isFinite(budget) ? budget : 0) - (Number(roster.waiverBudgetUsed) || 0));
   if (remaining <= 0) return null;
 
+  const weeksLeft = (ctx.weeksLeft || []).length;
+  const horizon = Math.max(1, Math.min(weeksLeft || SEASON_WEEKS, SEASON_WEEKS));
+  const asked = Number(weeksCovered);
+  const covered = Number.isFinite(asked) ? Math.max(0, Math.min(asked, horizon)) : horizon;
+  const totalPoints = Math.max(0, Number(gainPerWeek) || 0) * covered;
+
   const scarcity = 1 + 0.5 * (1 - Math.min(alternativesAt(ctx, addId), 6) / 6);
-  const phase = BID_PHASE_FLOOR + 0.65 * (1 - Math.min(1, (ctx.weeksLeft || []).length / SEASON_WEEKS));
-  const share = Math.min(MAX_BID_SHARE, Math.max(0, gainPerWeek) / BID_GAIN_SCALE) * scarcity * phase;
+  const phase = faabPhase(weeksLeft);
+  const share = Math.min(MAX_BID_SHARE, totalPoints / BID_TOTAL_SCALE) * scarcity * phase;
   const value = Math.max(1, Math.min(remaining, Math.round(remaining * share)));
   const aggressive = Math.min(remaining, Math.max(value, Math.round(value * BID_AGGRESSIVE_MULT)));
-  return { value, aggressive, remaining };
+  return { value, aggressive, remaining, weeksCovered: covered, totalPoints };
 }
 
 /** "6 h", "45 min", "3 d" — how long ago, in the coarsest unit that still says something. */
