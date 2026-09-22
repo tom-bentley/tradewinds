@@ -101,7 +101,7 @@ const GRADES = [5, 2, 4, 1, 3, 5, 4, null, 2, 3].map((bin) =>
   (bin == null ? null : { bin, conf: "high", adjusted: true, opp: bin > 3 ? "@WEAK" : "vs TOUGH" }));
 parts.push(section("P3 · Matchup strip",
   "Synthetic: taller is easier. Height carries the grade, three colour bins carry the bin — never a heat map.",
-  `${matchupNextChips([8, 9, 10], GRADES)}
+  `${matchupNextChips([8, 9, 10], GRADES, { byeWeeks: [15] })}
    ${matchupStrip({ weeks: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17], grades: GRADES, byeWeeks: [15], name: "Sample Player", act: "twin", id: "p3", uid: "g3" })}`));
 
 parts.push(section("P3 · a skill position, graded for display only",

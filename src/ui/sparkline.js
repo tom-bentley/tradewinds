@@ -438,6 +438,7 @@ export function matchupStrip(o = {}) {
   if (!weeks.length || !grades.some((g) => g && fin(g.bin) != null)) return "";
 
   const id = uid("mvm", o.uid);
+  const oppLookup = typeof o.oppOf === "function" ? (w) => o.oppOf(w) || null : () => null;
   const W = weeks.length * PITCH;
   const H = o.compact ? 22 : 32;
   const TOP = 3;
@@ -456,8 +457,9 @@ export function matchupStrip(o = {}) {
     tracks.push([cx, TOP, FLOOR]);
     if (byes.has(w)) { byeDots.push([cx, TOP + (FLOOR - TOP) * 0.4]); rows.push([`wk ${w}`, "bye", null, null]); return; }
     const g = grades[i];
+    const opp = (g && g.opp) || oppLookup(w);
     const bin = g ? fin(g.bin) : null;
-    if (bin == null) { rows.push([`wk ${w}`, (g && g.opp) || null, DASH, null]); return; }
+    if (bin == null) { rows.push([`wk ${w}`, opp, DASH, null]); return; }
     const b = Math.min(5, Math.max(1, bin));
     if (g.adjusted) adjusted = true;
     if (g.conf === "low") anyLowConf = true;
@@ -467,7 +469,7 @@ export function matchupStrip(o = {}) {
     bins[slot].push([cx, TOP, TOP + h]);
     if (easiest == null || b > easiest.b) easiest = { b, w };
     if (hardest == null || b < hardest.b) hardest = { b, w };
-    rows.push([`wk ${w}`, (g && g.opp) || null, `${b} of 5`, g.conf === "low" ? "low" : "high"]);
+    rows.push([`wk ${w}`, opp, `${b} of 5`, g.conf === "low" ? "low" : "high"]);
   });
 
   const body = [
@@ -507,14 +509,31 @@ export function matchupStrip(o = {}) {
   </figure>`;
 }
 
-/** The `.fchip` row R12 P3 asks for above the strip: the next three weeks, named. */
-export function matchupNextChips(weeks, grades, n = 3) {
+/**
+ * The `.fchip` row R12 P3 asks for above the strip: the next three weeks, named.
+ *
+ * "BYE" is printed ONLY for a week in `byeWeeks`. The engine's `matchupGrade` returns
+ * `{bin, conf, adjusted, why}` and no opponent, so an unknown opponent is an unknown opponent —
+ * printing "BYE" for it (which an `opp || "BYE"` fallback would do on every single chip) would
+ * be the app inventing a bye week out of a missing field.
+ *
+ * @param {number[]} weeks
+ * @param {Array<{opp?:string}|null>} grades
+ * @param {{n?:number, byeWeeks?:number[], oppOf?:(week:number)=>string|null}} [opts]
+ */
+export function matchupNextChips(weeks, grades, opts = {}) {
+  const o = typeof opts === "number" ? { n: opts } : (opts || {});
+  const n = fin(o.n, 3);
+  const byes = weekSet(o.byeWeeks);
+  const oppOf = typeof o.oppOf === "function" ? o.oppOf : () => null;
   const out = [];
   const ws = arr(weeks);
   for (let i = 0; i < ws.length && out.length < n; i += 1) {
+    const w = fin(ws[i]);
+    if (w == null) continue;
     const g = arr(grades)[i];
-    const opp = g && g.opp ? String(g.opp) : null;
-    out.push(`<span class="fchip mv-chip">WK ${escapeHtml(String(ws[i]))} ${escapeHtml(opp || "BYE")}</span>`);
+    const opp = byes.has(w) ? "BYE" : ((g && g.opp) || oppOf(w) || null);
+    out.push(`<span class="fchip mv-chip">WK ${escapeHtml(String(w))}${opp ? ` ${escapeHtml(String(opp))}` : ""}</span>`);
   }
   return out.length ? `<div class="mv-chips">${out.join("")}</div>` : "";
 }

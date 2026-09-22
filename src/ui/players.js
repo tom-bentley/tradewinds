@@ -167,6 +167,20 @@ function byeWeeksOf(ctx, p) {
   return Number.isFinite(b) ? [b] : [];
 }
 
+/**
+ * "@DET" / "vs CHI" for one team-week, from `ctx.gameOf` + `ctx.games` (004 design §3.1). The
+ * engine's `matchupGrade` returns `{bin, conf, adjusted, why}` and deliberately no opponent, so
+ * the opponent is looked up here or it is simply not printed — it is never guessed, and a missing
+ * game is never rendered as a bye.
+ */
+function oppLabel(ctx, team, week) {
+  if (!team || !ctx.gameOf || !ctx.games || typeof ctx.gameOf.get !== "function") return null;
+  const gid = ctx.gameOf.get(`${team}|${week}`);
+  const g = gid == null ? null : ctx.games.get(gid);
+  if (!g || !g.home || !g.away) return null;
+  return g.home === team ? `vs ${g.away}` : `@ ${g.home}`;
+}
+
 /** Weeks from now to the end of the scoring season — the horizon P3 and P4 both draw. */
 function aheadWeeks(ctx) {
   const from = Number(ctx.week) || 1;
@@ -245,10 +259,12 @@ function matchupSection(ctx, svc, id, p) {
     return `<h3 class="sub">The schedule ahead</h3>
       <p class="note">The remaining schedule is not graded yet.</p>`;
   }
+  const byes = byeWeeksOf(ctx, p);
+  const oppOf = (w) => oppLabel(ctx, p.team, w);
   return `<h3 class="sub">The schedule ahead</h3>
-    ${matchupNextChips(weeks, grades)}
+    ${matchupNextChips(weeks, grades, { byeWeeks: byes, oppOf })}
     ${matchupStrip({
-      weeks, grades, byeWeeks: byeWeeksOf(ctx, p), currentWeek: Number(ctx.week) || undefined,
+      weeks, grades, byeWeeks: byes, currentWeek: Number(ctx.week) || undefined, oppOf,
       name: p.name, act: "mv-twin", id: `mg-${id}`, uid: `mg-${id}`,
     })}`;
 }

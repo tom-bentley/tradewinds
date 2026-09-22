@@ -257,10 +257,25 @@ test("matchup and week strips share a pitch so their cells line up", () => {
 });
 
 test("the next-three chips name the opponent above the strip", () => {
-  const chips = matchupNextChips([8, 9, 10, 11], [{ opp: "@DET" }, { opp: "vs CHI" }, null, { opp: "@GB" }]);
+  const grades = [{ opp: "@DET" }, { opp: "vs CHI" }, null, { opp: "@GB" }];
+  const chips = matchupNextChips([8, 9, 10, 11], grades, { byeWeeks: [10] });
   assert.match(chips, /WK 8 @DET/);
   assert.match(chips, /WK 10 BYE/);
   assert.doesNotMatch(chips, /WK 11/, "three chips, not four");
+});
+
+test("an unknown opponent is blank, never BYE — the engine supplies no opp field", () => {
+  // `matchupGrade` returns {bin, conf, adjusted, why}. An `opp || \"BYE\"` fallback would print
+  // BYE on every chip of every player, inventing a bye week out of a missing field.
+  const chips = matchupNextChips([8, 9, 10], [{ bin: 4 }, { bin: 2 }, { bin: 5 }]);
+  assert.doesNotMatch(chips, /BYE/);
+  assert.match(chips, /WK 8<\/span>/);
+  // A caller that CAN resolve the opponent passes a lookup instead.
+  const named = matchupNextChips([8, 9], [{ bin: 4 }, { bin: 2 }], { oppOf: (w) => `@T${w}` });
+  assert.match(named, /WK 8 @T8/);
+  // and the strip's table twin uses the same lookup
+  const strip = matchupStrip({ weeks: [8, 9], grades: [{ bin: 4, conf: "high" }, { bin: 2, conf: "high" }], oppOf: (w) => `@T${w}`, uid: "op" });
+  assert.match(strip, /@T8/);
 });
 
 /* ---------------------------------------------------------------- P4 availability */
