@@ -370,3 +370,27 @@ test("D2: the streaming budget is what the roster could actually sign", () => {
   const off = buildContext(INPUT, { streaming: { enabled: false } });
   assert.equal(streamBudget(off, MINE), 0);
 });
+
+// ---------------------------------------------------------------------------------------------
+// 004 §3.4 — the K/DEF streaming-model hook (src/engine/matchup.js), exercised through the full
+// bestLineup pipeline, not just weekVector in isolation. A LOCAL ctx built with games.json input,
+// never the shared module-level `ctx` above (which stays games-less so every number above holds).
+// ---------------------------------------------------------------------------------------------
+
+test("004 §3.4: bestLineup's DEF slot value moves with the streaming model once ctx.games carries odds", () => {
+  const gamesInput = JSON.parse(readFileSync(new URL("./fixtures/games_sample.json", import.meta.url), "utf8"));
+  const withGames = buildContext({ ...INPUT, games: gamesInput }, {});
+  const plain = buildContext(INPUT, {});
+
+  assert.equal(weekPoints(plain, "HOU", 1), weekPoints(ctx, "HOU", 1), "sanity: plain matches the shared ctx");
+  assert.notEqual(weekPoints(withGames, "HOU", 1), weekPoints(plain, "HOU", 1), "the odds actually move the number");
+
+  const rosterWithHou = MINE; // roster 3 already carries HOU at DEF
+  const defSlotPts = (context) => bestLineup(context, rosterWithHou, 1).slots.find((s) => s.slot === "DEF").pts;
+  assert.equal(defSlotPts(withGames), weekPoints(withGames, "HOU", 1), "the lineup reads the adjusted value");
+  assert.notEqual(defSlotPts(withGames), defSlotPts(plain), "the whole pipeline carries the adjustment through");
+
+  // skill positions in the same lineup are untouched end-to-end
+  const qbSlotPts = (context) => bestLineup(context, rosterWithHou, 1).slots.find((s) => s.slot === "QB").pts;
+  assert.equal(qbSlotPts(withGames), qbSlotPts(plain), "R8 §5.4: no skill-position adjustment, ever");
+});

@@ -184,6 +184,43 @@ export const DEFAULTS = Object.freeze({
     bands: Object.freeze({ low: 25, moderate: 50, high: 75 }),
     worst: 5, // how many players rosterFragility names
   }),
+
+  // --- K/DEF streaming model (004 design §3.4, src/engine/matchup.js) ------------------------
+  // R8 §5.4: never apply an opponent-defence term to a Sleeper SKILL-position projection — it is
+  // already in there (±6-8%, R8 §2.3). K and DEF are the exception: K is projected matchup-blind
+  // (R8 §2.5) and DEF's matchup signal is real but ~10x under-weighted by Rotowire (R8 §2.7), so a
+  // Vegas-only rule corrects rather than double-counts. `enabled: true` ships on (SC-105).
+  streamingModel: Object.freeze({
+    enabled: true,
+    meanImplied: 22, // z-score center for implied team totals (R8 §5.2)
+    zUnit: 4, // pts per z (R8 §5.2)
+    // DST: f = 1 + clip(wImp · z_impOpp, ±cap), z_impOpp from the OPPONENT's implied total.
+    // wImp = -0.30 ≈ (-0.472 pts/pt measured, R8 §4.1) shrunk onto the 4-pt z unit; cap = 0.40 is
+    // the observed bucket spread as a fraction of the mean (R8 §5.3 note 2).
+    dst: Object.freeze({ wImp: -0.3, cap: 0.4 }),
+    // K: f = 1 + clip(wImp · z_impK + wWind · windTerm, ±cap), z_impK from the OWN implied total,
+    // CAPPED at impliedPeak (kicker points peak 21-24, then fall as FGA converts to TDs, R8 §4.2).
+    // wImp = +0.06 (measured +0.149 pts/pt shrunk ~30% for one-season noise, R8 §5.3 note 1).
+    // wWind = +0.20 (wind term is already negative-going, R8 §4.2 -0.156 pts/mph). cap = 0.15.
+    // indoorPts = +0.5 ADDITIVE bonus applied after f scales the points (low end of a disputed
+    // +0.4..+1.35 range across 3 sources, R8 §5.3 note 1 — ship the low end).
+    k: Object.freeze({ wImp: 0.06, wWind: 0.2, cap: 0.15, indoorPts: 0.5, impliedPeak: 24 }),
+    windFlagMph: 15, // R8 §5.5: wind ≥ this outdoors downgrades K and flags WR
+  }),
+
+  // --- Cross-position calibration multipliers (004 design §3.4, R8 §2.9/§5.3) -----------------
+  // A measured 2025 bias between Sleeper's `pts_half_ppr` projection field and points recomputed
+  // from the same row's stat line the way Tradewinds scores (Tradewinds is already immune to the
+  // QB inflation bug because it always recomputes — this is a SEPARATE, smaller, real bias on top
+  // of that). Matters only for cross-position comparisons (FLEX); never for same-position ordering,
+  // so it ships OFF by default — one season of evidence, re-measure before enabling (R8 §8.16).
+  calibration: Object.freeze({
+    enabled: false,
+    QB: 0.956,
+    RB: 0.969,
+    WR: 0.918,
+    TE: 0.992,
+  }),
 });
 
 export const SLEEPER = Object.freeze({

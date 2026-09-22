@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "generated_at": "2026-09-22T12:00:00Z",
+  "season": "2026",
+  "_provenance": "WS-H eng-matchup, 004 Player Intelligence, 2026-09-22 — synthetic test fixture in the design.md §2.2 games.json shape. Home/away pairs deliberately MATCH test/fixtures/schedule.json's real week-1 matchups (so merging games.json rows onto the schedule-threaded ctx.games entries in buildGames never orphans a team-week index) — only spread/total/roof/wind are invented, to cover every position on rosters.json roster 3 plus a spread of conditions (dome, closed w/ explicit indoor, closed w/ derived indoor, known wind, missing wind, calm, windy >=15mph, negative/positive home spread). Not real 2026 odds.",
+  "games": [
+    { "id": "s1_HOU_BUF", "week": 1, "home": "HOU", "away": "BUF", "spread": -9.0, "total": 38.0, "roof": "closed", "indoor": true, "kick": "2026-09-13T17:00:00Z" },
+    { "id": "s1_IND_BAL", "week": 1, "home": "IND", "away": "BAL", "spread": -3.0, "total": 45.0, "roof": "closed", "kick": "2026-09-13T17:00:00Z" },
+    { "id": "s1_MIN_GB", "week": 1, "home": "MIN", "away": "GB", "spread": -2.0, "total": 44.0, "roof": "outdoors", "windMph": 9, "kick": "2026-09-13T17:00:00Z" },
+    { "id": "s1_CIN_TB", "week": 1, "home": "CIN", "away": "TB", "spread": -1.5, "total": 46.0, "roof": "outdoors", "windMph": 16, "kick": "2026-09-13T13:00:00Z" },
+    { "id": "s1_DET_NO", "week": 1, "home": "DET", "away": "NO", "spread": -3.5, "total": 44.5, "roof": "outdoors", "kick": "2026-09-13T13:00:00Z" },
+    { "id": "s1_NYG_DAL", "week": 1, "home": "NYG", "away": "DAL", "spread": -2.5, "total": 47.0, "roof": "outdoors", "windMph": 5, "kick": "2026-09-13T17:00:00Z" },
+    { "id": "s1_LAR_SF", "week": 1, "home": "LAR", "away": "SF", "spread": -4.0, "total": 45.5, "roof": "dome", "kick": "2026-09-10T20:00:00Z" },
+    { "id": "s1_PHI_WAS", "week": 1, "home": "PHI", "away": "WAS", "spread": -3.0, "total": 43.0, "roof": "outdoors", "windMph": 7, "kick": "2026-09-13T13:00:00Z" },
+    { "id": "s1_LV_MIA", "week": 1, "home": "LV", "away": "MIA", "spread": -6.0, "total": 46.5, "roof": "dome", "kick": "2026-09-13T20:05:00Z" },
+    { "id": "s1_PIT_ATL", "week": 1, "home": "PIT", "away": "ATL", "spread": 1.5, "total": 41.0, "roof": "outdoors", "windMph": 20, "kick": "2026-09-13T13:00:00Z" }
+  ]
+}
