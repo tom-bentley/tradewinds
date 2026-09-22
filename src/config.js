@@ -184,6 +184,31 @@ export const DEFAULTS = Object.freeze({
     bands: Object.freeze({ low: 25, moderate: 50, high: 75 }),
     worst: 5, // how many players rosterFragility names
   }),
+
+  // --- Season map (004 design §3.5, calibrated by R9) ------------------------------------------
+  // The map answers one question per week — "do I win this one, and what is the cheapest thing
+  // that changes the answer" — and one question per season: bye or trophy.
+  seasonMap: Object.freeze({
+    // R-16: ω = 2.0 is calibrated for SEEDING. A TITLE objective in a 6-of-8 league wants 8-10,
+    // because a point in weeks 15-17 buys 8-11× the title equity of a point in weeks 3-14
+    // (R9 §4.7: 0.289 vs 0.028 pp of title per point-week). This is a labelled CHOICE, not a
+    // hidden default — and it never touches `playoffWeight`, which the lineup axis still owns.
+    objective: "bye",
+    omega: Object.freeze({ bye: 2.0, title: 8.0 }),
+    // R9 §Q9.5: derived from the measured σ_margin 29.0 and the 1.37 pp/pt elasticity, not from
+    // round numbers. 0.60/0.40 are ±7.4 points — ±0.26 σ_margin. Inside that band the projection
+    // genuinely cannot tell two teams apart, and the UI owes the reader that disclosure.
+    strong: 0.6,
+    weak: 0.4,
+    // A pure engine may not roll dice it cannot reproduce: the season simulator is seeded, so two
+    // runs of the same ctx return the same odds (R9 §Q9.5 "non-negotiable").
+    sims: 20000,
+    seed: 20260922,
+    // Correlation between the two teams' weekly totals. Both lineups sample the same NFL Sunday,
+    // but that shifts both scores together and leaves the MARGIN alone (R9 §Q9.3 caveat 2), so 0
+    // is the honest default. Exposed because same-game stacks are a real, unmeasured dial.
+    corr: 0,
+  }),
 });
 
 export const SLEEPER = Object.freeze({
