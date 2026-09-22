@@ -328,6 +328,18 @@ test("matchupGrade: neutral bin 3 / conf low / adjusted false when K or DEF has 
   assert.equal(g.adjusted, false);
 });
 
+test("matchupGrade: adjusted stays false for K/DEF when streamingModel.enabled is off, even with odds present", () => {
+  const ctx = miniCtx({
+    pos: "DEF",
+    team: "AAA",
+    game: G({ total: 44, spread: 2 * 10 - 44 }), // a real, clean bucket-5 matchup if it were on
+    settings: { streamingModel: { enabled: false } },
+  });
+  const g = matchupGrade(ctx, "P1", 3);
+  assert.equal(g.bin, 3, "no false precision once the model is off");
+  assert.equal(g.adjusted, false, "nothing is actually being adjusted");
+});
+
 test("matchupGrade skill positions: conf low, adjusted false always, and carries the exact priced-in copy", () => {
   const proj = [20, 10, 10, 10, 10, 10, 10, 10];
   const ctx = miniCtx({ pos: "WR", week: 1, lastWeek: 8, proj });

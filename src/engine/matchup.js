@@ -373,8 +373,12 @@ export function matchupGrade(ctx, id, week) {
   if (pos === "K" || pos === "DEF") {
     const team = teamOf(ctx, id);
     const imp = team ? impliedTotals(ctx, team, week) : null;
-    if (!imp) {
-      return { bin: 3, conf: "low", adjusted: false, why: ["No game odds for this week — matchup unknown."] };
+    const enabled = cfgBlock(ctx, "streamingModel").enabled !== false;
+    if (!imp || !enabled) {
+      const why = enabled
+        ? ["No game odds for this week — matchup unknown."]
+        : ["The streaming model is turned off — no adjustment is being applied."];
+      return { bin: 3, conf: "low", adjusted: false, why };
     }
     const flags = matchupFlags(ctx, id, week);
     if (pos === "DEF") {
