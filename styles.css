@@ -1007,3 +1007,156 @@ html.kb-open #toasts { bottom: calc(var(--safe-b) + 12px); }
 .dg-row .tag { flex: none; margin-left: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .diagnose .steps { margin-bottom: 2px; }
 .diagnose .codeblock { font-size: 12px; }
+
+/* ------------------------------------------------------------------ micro-visuals (004 §4)
+
+   Every data mark in the app lives under the `mv-` prefix and is drawn by src/ui/sparkline.js.
+   Three rules hold the whole block together (R12 §Q12.3):
+     · tokens only, never a hex — so light mode needs no second stylesheet;
+     · furniture is a hairline that does NOT scale with the strip (`vector-effect` on the path);
+     · `--mine` and `--ok` never meet in one graphic, and amber means counterparty or caution,
+       never "medium" — which is why matchup difficulty is a height, not a colour ramp. */
+
+.mv { width: 100%; height: auto; display: block; overflow: visible; }
+.mv-fig { margin: 8px 0 12px; }
+.mv-track { stroke: var(--surface2); }
+.mv-base, .mv-mid { stroke: var(--line); }
+.mv-over { stroke: var(--mine); }
+.mv-under { stroke: var(--loss); }
+.mv-tick { stroke: var(--ink-2); }
+.mv-null { stroke: var(--ink-3); }
+
+/* P2 — the only mark allowed in a list row. One hue: one series needs no legend. */
+.mv-usage { stroke: none; }
+.mv-line { stroke: var(--mine); }
+.mv-line2 { stroke: var(--mine-dim); }
+.mv-mean { stroke: var(--line); }
+.mv-dot { stroke: var(--mine); }
+.mv-dot-partial { stroke: var(--ink-3); }
+.mv-usage-row { width: 56px; height: 18px; flex: none; }
+
+/* P3 — three legible bins is all a dark surface carries (R12 §R3a); height does the rest. */
+.mv-bin1 { stroke: var(--mine); opacity: .58; }
+.mv-bin2 { stroke: var(--mine); opacity: .75; }
+.mv-bin3 { stroke: var(--mine); }
+
+/* P5 — dumbbell above the midline, P(win) below it. */
+.mv-conn { stroke: var(--line); }
+.mv-mine-dot { stroke: var(--mine); }
+.mv-opp-dot { stroke: var(--ink-3); }
+.mv-ring { stroke: var(--surface); }
+.mv-band { fill: var(--raised); }
+.mv-legend { font-size: 14px; color: var(--ink-3); margin-top: 4px; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.mv-k { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.mv-k-mine { background: var(--mine); }
+.mv-k-opp { background: var(--ink-3); }
+
+/* The axis is HTML, not SVG <text>: it keeps the strip inside its node budget, inherits the
+   app's type scale, and can print a literal "B" under a bye (R12 §R4). */
+.mv-axis { display: flex; font-size: 12px; color: var(--ink-3); line-height: 1.2; margin-top: 2px; }
+.mv-ax { flex: 1 1 0; text-align: center; font-variant-numeric: tabular-nums; min-width: 0; }
+.mv-peak { font-size: 14px; color: var(--ink-3); margin-top: 4px; }
+.mv-peak b { color: var(--ink-2); }
+.mv-note { font-size: 14px; color: var(--ink-3); margin-top: 4px; }
+.mv-chips { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 6px; }
+.mv-chip { font-variant-numeric: tabular-nums; }
+
+/* One tap target per strip: 17 cells cannot each hold 44 px, so the strip opens the table
+   instead and no cell carries a listener of its own (R12 §R10). */
+.mv-hit {
+  display: block; width: 100%; min-height: 44px; padding: 2px 0; margin: 0;
+  background: none; border: 0; border-radius: var(--r-row); text-align: left; cursor: pointer;
+}
+.mv-twin { margin-top: 4px; }
+.mv-twin th[scope="col"] { text-align: left; }
+.mv-twin th.mv-r { text-align: right; }
+.mv-multi { margin: 8px 0 4px; }
+.mv-scale { font-size: 14px; color: var(--ink-3); margin-bottom: 6px; }
+.mv-panel + .mv-panel { margin-top: 10px; border-top: 1px solid var(--line-soft); padding-top: 8px; }
+.mv-panel-n { font-size: 14px; color: var(--ink-2); font-weight: 600; }
+
+/* P4 — 17 cells in the shipped bar track. Opacity carries P(play) with a 0.35 floor so a bad
+   week is still visible; amber marks a week that is a decision, which is caution (R3c). */
+.mv-avail { margin: 8px 0 4px; }
+.mv-av-track { height: 16px; display: grid; grid-template-columns: repeat(var(--mv-n, 17), 1fr); gap: 1px; padding: 1px; }
+.mv-av-c { display: block; height: 100%; background: var(--mine); border-radius: 1px; }
+.mv-av-c:first-child { border-radius: 3px 1px 1px 3px; }
+.mv-av-c:last-child { border-radius: 1px 3px 3px 1px; }
+.mv-av-dec { background: var(--theirs); }
+.mv-av-na { background: transparent; }
+.mv-av-key { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 14px; color: var(--ink-3); margin-top: 4px; }
+.mv-av-x { color: var(--ink-2); }
+.mv-av-x b { color: var(--ink); }
+
+/* P6 — Few's bullet on the shipped .bar-track. Spans only: the Deals and FA cards are one
+   <button> each, and a <div> inside a button is invalid HTML. */
+.mv-bul { display: block; margin: 6px 0 10px; }
+.mv-bul .bar-line { display: flex; }
+.mv-bul .bar-track { display: block; }
+.mv-bul .bar-raw { display: block; }
+.mv-bul-fill { display: block; }
+.mv-bul-c { margin: 4px 0 2px; }
+.mv-bul-c .bar-track { height: 6px; margin: 2px 0 3px; }
+.mv-bul-raw { display: block; font-size: 14px; color: var(--ink-3); }
+.mv-bul-raw b { color: var(--ink-2); }
+
+/* P7 — vocabulary only; `flagChips` already shipped the chip. */
+.mv-syn { margin: 6px 0 10px; }
+
+/* P8 — no claim renders without a dated source row. */
+.mv-dossier { margin: 8px 0 12px; }
+.mv-dos-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.mv-dos-m { font-size: 14px; color: var(--ink-3); }
+.mv-dos-claims { margin: 8px 0 6px; }
+.mv-dos-claims li { color: var(--ink-2); }
+.mv-dos-warn::before { background: var(--theirs); }
+.mv-dos-src { display: block; font-size: 14px; color: var(--ink-3); }
+.mv-dos-drop { font-size: 14px; margin-bottom: 6px; }
+.mv-dos-srcs { margin-top: 6px; }
+.mv-dossier-empty { padding: 14px 0; }
+
+/* Research desk — an optimistic chip that says "asked", never "delivered" (R11 §Q11.2 step 4). */
+.mv-research { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
+.mv-research .btn { flex: none; min-height: 44px; }
+.mv-rchip { font-size: 14px; color: var(--ink-2); }
+.mv-rchip[data-tone="loss"] { color: var(--loss); }
+
+/* Live per-week detail, fetched when the sheet opens. Never blocks the sheet, and says so when
+   it cannot reach Sleeper. */
+.mv-live { margin: 8px 0 12px; }
+.mv-live > summary { cursor: pointer; font-size: 14px; color: var(--ink-2); min-height: 44px; display: flex; align-items: center; }
+.mv-live[open] > summary { color: var(--ink); }
+
+/* Season map section (src/ui/season.js) — a League section, not a tab. */
+.season { margin-bottom: 18px; }
+.season-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.season-obj { display: flex; gap: 6px; }
+.season-obj .btn { min-height: 36px; padding: 0 12px; font-size: 14px; }
+.season-obj .btn[aria-pressed="true"] { border-color: var(--mine); color: var(--mine); }
+.season-sum { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0 6px; }
+.season-note { font-size: 14px; color: var(--ink-3); margin: 6px 0 10px; }
+.wcards { display: grid; gap: 10px; margin-top: 10px; }
+.wcard { background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--r-card); padding: 10px 12px; }
+.wcard-is-now { border-color: var(--mine); }
+.wcard-h { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.wcard-w { font-weight: 700; font-variant-numeric: tabular-nums; }
+.wcard-opp { color: var(--ink-2); font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wcard-mu { font-size: 14px; color: var(--ink-3); margin-top: 2px; }
+.wcard-mu b { color: var(--ink-2); }
+.wcard-holes { font-size: 14px; color: var(--ink-2); margin-top: 6px; }
+.wcard-moves { display: grid; gap: 6px; margin-top: 6px; font-size: 14px; color: var(--ink-2); }
+.wcard-moves li { padding-left: 14px; position: relative; }
+.wcard-moves li::before { content: ""; position: absolute; left: 2px; top: 8px; width: 5px; height: 5px; border-radius: 50%; background: var(--ink-3); }
+.wcard-eq { color: var(--ink-3); }
+
+/* The list-row sparkline sits between the meta line and the value, and gives ground first. */
+.prow-spark { flex: none; margin: 0 8px; opacity: .9; }
+@media (max-width: 340px) { .prow-spark { display: none; } }
+
+/* A compact bullet inside a Deals or FA card, which is one <button> from edge to edge. */
+.deal-bullet { display: block; margin-top: 4px; }
+.deal-bullet .mv-panel-n { display: block; font-size: 14px; color: var(--ink-3); font-weight: 500; }
+.fa-body .mv-bul-c, .deal-body .mv-bul-c { display: block; max-width: 100%; }
+
+/* The P(win) reference sits at 0.5 and has to be legible — it is the second channel. */
+.mv-mid { stroke: var(--ink-3); opacity: .55; }

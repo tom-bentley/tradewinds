@@ -7,6 +7,7 @@ import {
 } from "./components.js";
 import { escapeHtml, fmtValue, fmtFull, fmtNum, fmtPct, fmtPts, relTime, clip } from "./format.js";
 import { prefill } from "./analyze.js";
+import { mountSeason, seasonClick } from "./season.js";
 
 export const title = "League";
 
@@ -14,13 +15,18 @@ let env = null;
 
 export function mount(el, e) {
   env = e;
+  // The season map sits above the standings on my own team's block — a SECTION, not a tab
+  // (R12 Surprise 1: six tabs already leave 65 px each at 390 px). It paints its own loading
+  // state and fetches the league schedule once per session, so the standings never wait on it.
   el.innerHTML = `<div class="league">
+    <div id="lg-season"></div>
     ${standings()}
     <section class="sec"><div class="sec-head"><h2>Completed trades</h2></div><div id="lg-trades">${skeleton(2, "sk-row")}</div></section>
     <section class="sec"><div class="sec-head"><h2>Recent moves</h2></div><div id="lg-moves">${skeleton(3, "sk-row")}</div></section>
     ${trending()}
   </div>`;
   el.addEventListener("click", onClick);
+  mountSeason(document.getElementById("lg-season"), env);
   loadTxns();
   fillRiskStrips();
   return { destroy() { riskGen += 1; } };
@@ -302,6 +308,7 @@ function trending() {
 /* ---------------------------------------------------------------- events */
 
 function onClick(e) {
+  if (seasonClick(e, env)) return;
   const t = e.target.closest("[data-act]");
   if (!t) return;
   if (t.dataset.act === "roster") { rosterSheet(Number(t.dataset.id)); return; }

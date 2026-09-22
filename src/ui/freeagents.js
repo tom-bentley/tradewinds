@@ -12,6 +12,7 @@ import {
 import {
   escapeHtml, fmtValue, fmtNum, fmtPts, waiverChipText, clip,
 } from "./format.js";
+import { valueBullet } from "./sparkline.js";
 import { openPlayerSheet } from "./players.js";
 
 const POSITIONS = ["QB", "RB", "WR", "TE", "K", "DEF"];
@@ -173,11 +174,29 @@ function card(env, row, i) {
           <span class="dstat"><b class="num" data-tone="${signTone(row.gainPerWeek)}">${fmtPts(row.gainPerWeek)}</b> pts/wk</span>
           ${Number.isFinite(playoff) ? `<span class="dstat"><b class="num" data-tone="${signTone(playoff)}">${fmtPts(playoff)}</b> playoffs</span>` : ""}
         </span>
+        ${faBullet(env, ctx, row.add, mv)}
         ${comp.length ? `<span class="fa-comp">${comp.map((c) => escapeHtml(c)).join(" · ")}</span>` : ""}
         ${why ? `<span class="deal-why">${escapeHtml(why)}</span>` : ""}
       </span>
     </button>
   </li>`;
+}
+
+/**
+ * P6 compact on a free-agent card. The wire is exactly where a market-against-model gap is worth
+ * knowing — a player the market has not priced is the one the waiver claim is for — so the bullet
+ * rides on the card rather than waiting for the sheet. Span-only markup: the card is a `<button>`.
+ */
+function faBullet(env, ctx, id, mv) {
+  const svc = env && env.svc;
+  if (!svc || typeof svc.hiddenValue !== "function") return "";
+  const market = mv && (mv.mAdj != null ? mv.mAdj : mv.m);
+  if (market == null) return "";
+  let hv = null;
+  try { hv = svc.hiddenValue(ctx, id); } catch (err) { console.warn("[fa] hiddenValue", err); return ""; }
+  const model = hv && Number.isFinite(Number(hv.modelValue)) ? Number(hv.modelValue) : null;
+  if (model == null) return "";
+  return valueBullet({ market, model, compact: true });
 }
 
 /* ---------------------------------------------------------------- events */
