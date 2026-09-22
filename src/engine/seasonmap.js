@@ -1231,12 +1231,25 @@ function calibration(ctx, schedule, weeks, rosterId, cells) {
   const sigmaTeam = sds.length ? sds.reduce((a, b) => a + b, 0) / sds.length : 0;
   const results = (schedule && schedule.results) || {};
   const residuals = [];
+  // Completed weeks lie BEFORE the map's window, so they are not in the grid — their projected
+  // totals are built here, on demand. Two honest caveats, both inherited from R9's own mae_check:
+  // the roster today is not the roster that played week 1, and `weekVector` applies today's injury
+  // statuses to a past week. The residual is therefore an estimate of σ, not a measurement of it.
   for (const [week, byRoster] of Object.entries(results)) {
     const w = Number(week);
+    if (!(w >= 1)) continue;
     for (const [rid, actual] of Object.entries(byRoster)) {
+      const roster = rosterById(ctx, Number(rid));
+      if (!roster) continue;
       const cell = cells.get(Number(rid));
-      const projected = cell && cell.get(w) ? cell.get(w).mean : null;
-      if (projected == null || !(projected > 0)) continue;
+      const cached = cell && cell.get(w);
+      let projected;
+      if (cached) projected = cached.mean;
+      else {
+        const rosterIds = activePlayers(roster);
+        projected = meanSdAt(ctx, rosterIds, w, idsKey(rosterIds)).mean;
+      }
+      if (!(projected > 0)) continue;
       residuals.push(Number(actual) - projected);
     }
   }
@@ -1268,7 +1281,9 @@ function calibration(ctx, schedule, weeks, rosterId, cells) {
       "σ here is the positionCv PRIOR under independence, not a fit. R9 §Q9.3 measured " +
       "σ_margin at 29-32 from 16 team-weeks of residuals, 95% CI [21.4, 44.9], and found the " +
       "priors running ~40% hot on a sampled roster-week — so this P(win) is if anything " +
-      "conservative. Re-fit from real team scores once ~6 weeks are in (engine change E6).",
+      "conservative. Any residual reported here reprojects a past week with TODAY's roster and " +
+      "today's injury statuses, so treat it as an estimate. Re-fit from real team scores once " +
+      "~6 weeks are in (engine change E6).",
   };
 }
 
