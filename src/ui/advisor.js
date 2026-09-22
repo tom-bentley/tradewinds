@@ -22,6 +22,7 @@ import {
 } from "./format.js";
 import { openPlayerSheet } from "./players.js";
 import { prefill } from "./analyze.js";
+import { valueBullet, synergyBadges, matchupStrip } from "./sparkline.js";
 
 export const title = "Advisor";
 
@@ -347,10 +348,56 @@ function cardBody(item, i, opts = {}) {
     </div>
     ${absence ? `<p class="adv-abs">${escapeHtml(absence)}</p>` : ""}
     ${week ? `<p class="adv-week">${escapeHtml(week)}</p>` : ""}
+    ${marks(ctx, item)}
     ${irLine(item)}
     ${moves(item, i, source)}
     ${alternatives(item)}`;
 }
+
+/**
+ * The three summary marks an Advisor card gets (R12 §Q12.4 tab map): the value bullet compact,
+ * the synergy badges, and the matchup strip compact. Advisor is the default route (`app.js:18`),
+ * so it gets the SUMMARY marks and never the full strips — a card is a prompt to look, not the
+ * place to read a season off. The week strip and the usage sparkline stay in the player sheet,
+ * which is one tap away through the card's own thumbnail.
+ *
+ * Every one of these is null in a build without the 004 engine modules, and a null answer means
+ * the mark is simply absent — there is no placeholder and no zero.
+ */
+function marks(ctx, item) {
+  const svc = env && env.svc;
+  const id = item && item.id;
+  if (!svc || !id || !ctx.players.has(id)) return "";
+  const out = [];
+
+  const hv = typeof svc.hiddenValue === "function" ? safeMark(() => svc.hiddenValue(ctx, id)) : null;
+  const mv = typeof svc.marketValue === "function" ? safeMark(() => svc.marketValue(ctx, id)) : null;
+  const market = mv && (mv.mAdj != null ? mv.mAdj : mv.m);
+  const model = hv && Number.isFinite(Number(hv.modelValue)) ? Number(hv.modelValue) : null;
+  if (market != null && model != null) out.push(valueBullet({ market, model, compact: true }));
+
+  const parts = hv && hv.synergy && Array.isArray(hv.synergy.parts) ? hv.synergy.parts : null;
+  if (parts && parts.length) {
+    out.push(synergyBadges(parts.map((x) => ({
+      ...x,
+      name: x.name || (x.withId && ctx.players.get(x.withId) ? ctx.players.get(x.withId).name : null),
+    })), { max: 3 }));
+  }
+
+  if (typeof svc.matchupGrade === "function") {
+    const from = Number(ctx.week) || 1;
+    const to = Math.min(Number(ctx.lastWeek) || 17, from + 5);
+    const weeks = [];
+    for (let w = from; w <= to; w += 1) weeks.push(w);
+    const grades = weeks.map((w) => safeMark(() => svc.matchupGrade(ctx, id, w)));
+    if (grades.some((g) => g && Number.isFinite(Number(g.bin)))) {
+      out.push(matchupStrip({ weeks, grades, compact: true, uid: `adv-${id}` }));
+    }
+  }
+  return out.filter(Boolean).join("");
+}
+
+function safeMark(fn) { try { return fn(); } catch (err) { console.warn("[advisor] mark", err); return null; } }
 
 /**
  * The IR window, but only when the moves do not already say it. The engine writes an "ir" move

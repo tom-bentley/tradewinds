@@ -18,6 +18,8 @@ import {
   bandChip, pct01, irLedger, signTone,
 } from "./components.js";
 import { escapeHtml, fmtPct, fmtPts, fmtNum, fmtValue, fmtFull, clip, acceptPhrase } from "./format.js";
+import { weekStripGroup, valueBullet } from "./sparkline.js";
+import { weekPanel } from "./players.js";
 
 export const title = "Analyze";
 
@@ -238,6 +240,7 @@ function sheetBody(ctx, r, nm) {
     ${dead ? "" : valueBars(r.me, nm)}
     ${dead ? "" : bestBadge(ctx, r.best, mvBest, nm)}
     ${flagChips(r.flags)}
+    ${dead ? "" : stackUp(ctx)}
     <p class="vp-head">${escapeHtml(headline)}</p>
     ${dead ? `<ul class="reasons">${(r.reasons || []).map((x) => `<li>${escapeHtml(x.text)}</li>`).join("")}</ul>` : details(ctx, r, nm, headline)}
     ${dead ? "" : riskSection(ctx, r, nm)}
@@ -247,6 +250,50 @@ function sheetBody(ctx, r, nm) {
     </div>
   </div>`;
 }
+
+/**
+ * "How do these players stack up, week by week?" — R12 §Q12.4's small-multiples variant of P1,
+ * and the literal question this section exists to answer.
+ *
+ * One panel per player in the deal, capped at four (`DV/choosing-a-form.md:66`), all on ONE
+ * y-scale computed across every panel and stated once above the group. `weekStripGroup` owns
+ * both the cap and the scale, so there is no second implementation to drift: the same function
+ * draws one strip on a player card and four here. A player's teal week stays teal in both,
+ * because the fill is a function of actual − projected and never of rank or row position.
+ *
+ * Below the strips, one P6 bullet per player on a shared value scale — the second "stack up"
+ * view, and the one that says whether the market agrees with the model about each side.
+ */
+function stackUp(ctx) {
+  const a = store.analyze;
+  const ids = [...(a.give || []), ...(a.get || [])].slice(0, 4);
+  if (ids.length < 2) return "";
+  const panels = ids.map((id) => weekPanel(ctx, id)).filter(Boolean);
+  const bullets = ids.map((id) => {
+    const p = ctx.players.get(id);
+    const mv = env.svc.marketValue(ctx, id);
+    const hv = typeof env.svc.hiddenValue === "function" ? safeCall(() => env.svc.hiddenValue(ctx, id)) : null;
+    const market = mv && (mv.mAdj != null ? mv.mAdj : mv.m);
+    const model = hv && Number.isFinite(Number(hv.modelValue)) ? Number(hv.modelValue) : null;
+    if (!p || market == null || model == null) return null;
+    return { name: p.name, market, model };
+  }).filter(Boolean);
+
+  if (!panels.length && !bullets.length) return "";
+  // One scale across every bullet, for the same reason the strips share one: two bars drawn to
+  // their own maxima are not a comparison, they are two pictures of 100 %.
+  const top = bullets.reduce((m, b) => Math.max(m, b.market, b.model), 0) * 1.1;
+
+  return `<h3 class="sub">Week by week</h3>
+    ${panels.length ? weekStripGroup(panels) : `<p class="note">No weekly scores yet for these players.</p>`}
+    ${bullets.length ? `<h3 class="sub">Market against model</h3>
+      <p class="mv-scale">All bars on one scale, 0–${escapeHtml(fmtValue(top))}.</p>
+      ${bullets.map((b) => `<div class="mv-panel"><p class="mv-panel-n">${escapeHtml(b.name)}</p>
+        ${valueBullet({ market: b.market, model: b.model, min: 0, max: top, compact: true })}</div>`).join("")}` : ""}`;
+}
+
+/** The 004 services are optional; a stand-in that throws must not take the sheet down with it. */
+function safeCall(fn) { try { return fn(); } catch (err) { console.warn("[analyze]", err); return null; } }
 
 /**
  * The risk axis on a graded trade (design §13.5 / §13.8 step 2). `result.risk` is null for an

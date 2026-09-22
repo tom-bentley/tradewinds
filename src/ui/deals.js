@@ -10,6 +10,7 @@
 import { store, setIn } from "./store.js";
 import { avatar, playerChip, icon, skeleton, empty, signTone, openTeamSheet, teamChip } from "./components.js";
 import { escapeHtml, fmtPct, fmtPts, clip, acceptPhrase } from "./format.js";
+import { valueBullet } from "./sparkline.js";
 import { prefill } from "./analyze.js";
 import { faStart, faPaint, faFilters, faClick, faChange, faAbort } from "./freeagents.js";
 
@@ -327,11 +328,39 @@ function card(r, i) {
           <span class="dstat"><b class="num" data-tone="${signTone(r.myEdgePct, 0.5)}">${fmtPct(r.myEdgePct)}</b> edge</span>
           <span class="dstat dstat-read ${acc.cls}">${escapeHtml(read)}</span>
         </span>
+        ${headlineBullet(ctx, r)}
         ${whyLine(ctx, r, nm) ? `<span class="deal-why">${escapeHtml(whyLine(ctx, r, nm))}</span>` : ""}
       </span>
       <span class="deal-go">${icon("chevron")}</span>
     </button>
   </li>`;
+}
+
+/**
+ * P6 compact, for the ONE player the offer is built around: the most valuable piece coming in.
+ * A deal card cannot carry four bullets at 340 px, and averaging the sides into a single bar
+ * would be a number nobody computed — so this names the player it is about and stands down
+ * entirely when the model has nothing to say about him.
+ *
+ * `valueBullet` renders span-only, which matters here: the whole card body is one `<button>`.
+ */
+function headlineBullet(ctx, r) {
+  const svc = env && env.svc;
+  if (!svc || typeof svc.hiddenValue !== "function") return "";
+  let best = null;
+  for (const id of r.get || []) {
+    const mv = svc.marketValue(ctx, id);
+    const m = mv && (mv.mAdj != null ? mv.mAdj : mv.m);
+    if (m != null && (!best || m > best.m)) best = { id, m };
+  }
+  if (!best) return "";
+  let hv = null;
+  try { hv = svc.hiddenValue(ctx, best.id); } catch (err) { console.warn("[deals] hiddenValue", err); }
+  const model = hv && Number.isFinite(Number(hv.modelValue)) ? Number(hv.modelValue) : null;
+  if (model == null) return "";
+  const p = ctx.players.get(best.id);
+  return `<span class="deal-bullet"><span class="mv-panel-n">${escapeHtml(clip(p ? p.name : best.id, 20))}</span>
+    ${valueBullet({ market: best.m, model, compact: true })}</span>`;
 }
 
 /* ---------------------------------------------------------------- events */

@@ -197,6 +197,29 @@ function valueSection(ctx, svc, id, mv) {
   };
 }
 
+/**
+ * One P1 panel's worth of data for a player. Exported because the Analyze Details sheet draws
+ * the same strip for 2–4 players at once, and two implementations of "what did he score each
+ * week" would drift the moment one of them learned about byes.
+ * @returns {{name:string, weeks:number[], actual:(number|null)[], projected:(number|null)[],
+ *            byeWeeks:number[], dnpWeeks:number[], uid:string}|null}
+ */
+export function weekPanel(ctx, id) {
+  const p = ctx.players && typeof ctx.players.get === "function" ? ctx.players.get(id) : null;
+  const sw = seasonWeekly(ctx, id);
+  if (!p || !sw) return null;
+  return {
+    name: p.name,
+    weeks: sw.weeks,
+    actual: sw.actual,
+    projected: projFor(ctx, id, sw.weeks),
+    byeWeeks: byeWeeksOf(ctx, p),
+    dnpWeeks: sw.dnp,
+    currentWeek: Number(ctx.week) || undefined,
+    uid: `panel-${id}`,
+  };
+}
+
 /** P1 — the headline mark: what happened each week against what was expected. */
 function weekSection(ctx, id, p) {
   const sw = seasonWeekly(ctx, id);

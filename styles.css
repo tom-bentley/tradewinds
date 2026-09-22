@@ -1152,3 +1152,8 @@ html.kb-open #toasts { bottom: calc(var(--safe-b) + 12px); }
 /* The list-row sparkline sits between the meta line and the value, and gives ground first. */
 .prow-spark { flex: none; margin: 0 8px; opacity: .9; }
 @media (max-width: 340px) { .prow-spark { display: none; } }
+
+/* A compact bullet inside a Deals or FA card, which is one <button> from edge to edge. */
+.deal-bullet { display: block; margin-top: 4px; }
+.deal-bullet .mv-panel-n { display: block; font-size: 14px; color: var(--ink-3); font-weight: 500; }
+.fa-body .mv-bul-c, .deal-body .mv-bul-c { display: block; max-width: 100%; }
