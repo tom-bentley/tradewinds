@@ -458,9 +458,9 @@ export function hiddenValue(ctx, id, opts = {}) {
     );
   } else if (totals && totals.gap != null) {
     why.push(
-      `His usage is worth about ${fmt1(totals.xfp)} points over ${playedWeeks} played week${playedWeeks === 1 ? "" : "s"} ` +
-        `and he scored ${fmt1(totals.actual)} — a gap of ${totals.gap >= 0 ? "+" : ""}${fmt1(totals.gap)} ` +
-        `(${fmt1(perWeek)}/wk) on ${opportunities} opportunities.`
+      `His usage is worth about ${fmt1(totals.xfpMatched)} points over ${totals.gapWeeks} scored ` +
+        `week${totals.gapWeeks === 1 ? "" : "s"} and he scored ${fmt1(totals.actual)} — a gap of ` +
+        `${totals.gap >= 0 ? "+" : ""}${fmt1(totals.gap)} (${fmt1(perWeek)}/wk) on ${opportunities} opportunities.`
     );
     if (direction === "positive") {
       why.push(`He scored under his opportunity, which is the buy side of the regression flag.`);
@@ -506,7 +506,8 @@ export function hiddenValue(ctx, id, opts = {}) {
     modelValue,
     marketGap,
     usage: {
-      xfp: totals ? totals.xfp : null,
+      // the MATCHED window, so `xfp − actual === gap` holds on the row the UI renders
+      xfp: totals ? totals.xfpMatched : null,
       actual: totals ? totals.actual : null,
       gap: totals ? totals.gap : null,
       perWeek,

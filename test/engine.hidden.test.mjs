@@ -460,7 +460,9 @@ test("the usage row on the hidden value is the usage module's own answer", () =>
   for (const id of [DEEBO, HIGGINS, BARKLEY]) {
     const h = hiddenValue(ctx, id, { rosterId: MINE });
     const t = usageTotals(ctx, id);
-    assert.equal(h.usage.xfp, t.xfp);
+    // the MATCHED window, so `xfp − actual === gap` holds on the row the UI renders
+    assert.equal(h.usage.xfp, t.xfpMatched);
+    assert.ok(Math.abs(h.usage.xfp - h.usage.actual - h.usage.gap) < 1e-12);
     assert.equal(h.usage.actual, t.actual);
     assert.equal(h.usage.gap, t.gap);
     assert.equal(h.usage.perWeek, t.perWeek);

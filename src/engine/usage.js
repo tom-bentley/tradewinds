@@ -322,15 +322,24 @@ export function usageOf(ctx, id) {
  * Season-to-date totals over the played weeks: the numbers a sentence quotes ("18 targets and 4
  * red-zone looks in two weeks"). Shares are opportunity-weighted, not the mean of weekly shares,
  * so one snap in a blowout cannot swing the line.
+ *
+ * The gap is computed on the MATCHED window only. `stats.json` ships a trailing window of completed
+ * weeks and `history.json` is regenerated on its own cadence, so the two can disagree by a week —
+ * and an xFP summed over two weeks against points summed over one is not a regression signal, it is
+ * a lag artefact that would read as a huge buy on everybody at once. `xfp` is therefore the whole
+ * played window (what his usage was worth) and `xfpMatched` is the part that has an actual beside
+ * it; only the second one is ever differenced.
  * @param {object} ctx
  * @param {string} id
- * @returns {{playedWeeks:number, opportunities:number, xfp:number, actual:number|null,
- *   gap:number|null, perWeek:number|null, snapShare:number|null, targetShare:number|null}|null}
+ * @returns {{playedWeeks:number, opportunities:number, xfp:number, xfpMatched:number,
+ *   actual:number|null, gap:number|null, gapWeeks:number, perWeek:number|null,
+ *   snapShare:number|null, targetShare:number|null}|null}
  */
 export function usageTotals(ctx, id) {
   const u = usageOf(ctx, id);
   if (!u) return null;
   let xfpSum = 0;
+  let xfpMatched = 0;
   let actSum = 0;
   let actWeeks = 0;
   let snapNum = 0;
@@ -344,6 +353,7 @@ export function usageTotals(ctx, id) {
     if (!u.played[i]) continue;
     xfpSum += u.xfp[i] || 0;
     if (u.actual[i] != null) {
+      xfpMatched += u.xfp[i] || 0;
       actSum += u.actual[i];
       actWeeks += 1;
     }
@@ -359,14 +369,16 @@ export function usageTotals(ctx, id) {
       tgtDen += tm.tgt;
     }
   }
-  const gap = actWeeks > 0 ? xfpSum - actSum : null;
+  const gap = actWeeks > 0 ? xfpMatched - actSum : null;
   return {
     playedWeeks: u.playedWeeks,
     opportunities: u.opportunities,
     xfp: xfpSum,
+    xfpMatched,
     actual: actWeeks > 0 ? actSum : null,
     gap,
-    perWeek: gap != null && u.playedWeeks > 0 ? gap / u.playedWeeks : null,
+    gapWeeks: actWeeks,
+    perWeek: gap != null && actWeeks > 0 ? gap / actWeeks : null,
     snapShare: share(snapNum, snapDen),
     targetShare: share(tgtNum, tgtDen),
   };

@@ -272,8 +272,10 @@ test("gap is xFP − this season's actual points, in the league's own scoring ba
 
   const totals = usageTotals(withHistory, DOWNS);
   assert.equal(totals.playedWeeks, 4);
+  assert.equal(totals.gapWeeks, 4);
   assert.equal(totals.opportunities, 3 + 7 + 9 + 12); // targets + carries
-  assert.ok(Math.abs(totals.gap - (totals.xfp - totals.actual)) < 1e-12);
+  assert.ok(Math.abs(totals.xfpMatched - totals.xfp) < 1e-12, "every played week has an actual here");
+  assert.ok(Math.abs(totals.gap - (totals.xfpMatched - totals.actual)) < 1e-12);
   assert.ok(Math.abs(totals.perWeek - totals.gap / 4) < 1e-12);
   // opportunity-weighted, not the mean of weekly shares
   assert.ok(Math.abs(totals.targetShare - 30 / 120) < 1e-12);
@@ -282,6 +284,25 @@ test("gap is xFP − this season's actual points, in the league's own scoring ba
   const u2 = usageOf(ctx, DOWNS);
   assert.deepEqual(u2.actual.slice(1), [null, null, null]);
   assert.deepEqual(u2.gap.slice(1), [null, null, null]);
+});
+
+test("the gap is differenced on the MATCHED window only, never across a history lag", () => {
+  // stats.json ships a trailing window of completed weeks; history.json is regenerated on its own
+  // cadence. When history is a week behind, an xFP summed over 4 weeks against points summed over 2
+  // is not a regression signal — it is a lag artefact that reads as a huge buy on everybody at once.
+  const lagged = build({
+    stats: statsFile(USAGE_SPEC),
+    history: historyFile({ [DOWNS]: { gp: 2, ga: 2, w: [[4, 2], [6, 4]] } }, 2),
+  });
+  const t = usageTotals(lagged, DOWNS);
+  assert.equal(t.playedWeeks, 4, "he played all four weeks of the stats window");
+  assert.equal(t.gapWeeks, 2, "but only two of them have points on file");
+  assert.ok(t.xfpMatched < t.xfp, "the matched xFP is the shorter window");
+  assert.ok(Math.abs(t.gap - (t.xfpMatched - t.actual)) < 1e-12);
+  assert.ok(Math.abs(t.perWeek - t.gap / 2) < 1e-12, "per-week divides by the weeks it actually compared");
+
+  // and the unmatched window would have produced a materially different, wrong answer
+  assert.ok(Math.abs(t.xfp - t.actual - t.gap) > 1e-6);
 });
 
 // ---------------------------------------------------------------------------------------------
