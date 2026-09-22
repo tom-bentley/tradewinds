@@ -2,6 +2,10 @@
 // Every validator returns an array of human-readable problems; empty means valid.
 // refresh.mjs warns on problems; the tests assert on them.
 
+// Integration 2026-09-22: the dossier validator takes its enum inventories from the engine rubric
+// (single source of truth for codes → numbers), so the pipeline can never drift from it.
+import { ENUMS as ENGINE_ENUMS } from "../src/engine/prognosis.js";
+
 /** Weeks in a projections array. */
 export const EXPECTED_WEEKS = 18;
 
@@ -728,32 +732,35 @@ export const DOSSIER_TTL_MS = Object.freeze({
  * any SUBSET of the R7 fields and rejects anything outside the inventory, so a desk that ships
  * fewer codes is fine and one that invents a field is not.
  */
-export const DOSSIER_SLICE_ROW_BYTES = 512;
+/**
+ * Integration 2026-09-22 (design §2.4 amendment): 512 B is the TARGET a desk aims for; a real
+ * 7-branch distribution measured 593 B after shedding every sheddable code (WS-M), so the hard cap
+ * is 640 B. Rows above the target are flagged `slice-wide` by the desk, not rejected here; the
+ * 64 KB file cap below remains the binding bound on the phone's cold start.
+ */
+export const DOSSIER_SLICE_ROW_TARGET = 512;
+export const DOSSIER_SLICE_ROW_BYTES = 640;
 export const DOSSIERS_FILE_BYTES = 64 * 1024;
 
-/** R7 §6.3 enum inventories, UPPER_SNAKE (004 design §2.4 supersedes R11's lowercase examples). */
+/**
+ * R7 §6.3 enum inventories, UPPER_SNAKE (004 design §2.4 supersedes R11's lowercase examples).
+ *
+ * Integration 2026-09-22: taken FROM THE ENGINE (`src/engine/prognosis.js` `ENUMS`) rather than
+ * copied, so the validator can never drift from the rubric that maps codes to numbers — the first
+ * hand-copied version listed ramp classes (FAST/SLOW) the engine does not define and would have
+ * rejected every real dossier's `RAMP_SURGICAL`. `UNKNOWN` is always accepted for `ramp`; `trend`
+ * is a slice-only field with no engine counterpart.
+ */
 export const R7_ENUMS = Object.freeze({
-  injury_type: new Set([
-    "HAMSTRING", "GROIN_ADDUCTOR", "CALF", "QUAD", "HIP_FLEXOR", "OBLIQUE", "CORE_MUSCLE",
-    "ANKLE_LOW", "ANKLE_HIGH", "TURF_TOE", "LISFRANC", "JONES_5MT", "FOOT_OTHER", "PLANTAR_FASCIA",
-    "ACL", "PCL", "MCL", "LCL", "MENISCUS", "BONE_BRUISE", "PATELLAR_TENDON", "KNEE_UNSPEC",
-    "ACHILLES",
-    "SHOULDER_AC", "SHOULDER_INSTABILITY", "SHOULDER_LABRUM", "PEC", "CLAVICLE", "ELBOW",
-    "HAND_FINGER", "THUMB", "WRIST", "FOREARM",
-    "RIB", "BACK_STRAIN", "BACK_DISC", "NECK", "CONCUSSION",
-    "ILLNESS", "PERSONAL", "REST", "NON_INJURY", "NONE", "UNKNOWN",
-  ]),
-  side: new Set(["LEFT", "RIGHT", "BILATERAL", "NA", "UNKNOWN"]),
-  severity: new Set(["GRADE_1", "GRADE_2", "GRADE_3", "HIGH_GRADE", "LOW_GRADE", "UNKNOWN"]),
-  surgery: new Set(["NONE", "SCHEDULED", "ARTHROSCOPIC", "RECONSTRUCTION", "ORIF", "UNKNOWN"]),
-  recurrence: new Set(["FIRST", "RE_AGGRAVATION", "CHRONIC", "UNKNOWN"]),
-  team_timeline: new Set(["DAY_TO_DAY", "WEEK_TO_WEEK", "MULTI_WEEK", "IR", "SEASON", "UNKNOWN"]),
-  practice_pattern: new Set([
-    "FP_FP_FP", "LP_FP_FP", "LP_LP_FP", "LP_LP_LP", "DNP_LP_LP", "DNP_DNP_LP", "DNP_DNP_DNP",
-    "SHORT_WEEK_ONE_REPORT", "NO_PRACTICE_YET", "UNKNOWN",
-  ]),
-  designation: new Set(["NONE", "Q", "D", "O", "IR", "IR_R", "PUP", "NFI", "SUS", "EXEMPT"]),
-  ramp: new Set(["RAMP_FAST", "RAMP_MODERATE", "RAMP_SLOW", "RAMP_NONE", "UNKNOWN"]),
+  injury_type: new Set(ENGINE_ENUMS.injury_type),
+  side: new Set(ENGINE_ENUMS.side),
+  severity: new Set(ENGINE_ENUMS.severity),
+  surgery: new Set(ENGINE_ENUMS.surgery),
+  recurrence: new Set(ENGINE_ENUMS.recurrence),
+  team_timeline: new Set(ENGINE_ENUMS.team_timeline),
+  practice_pattern: new Set(ENGINE_ENUMS.practice_pattern),
+  designation: new Set(ENGINE_ENUMS.designation),
+  ramp: new Set([...ENGINE_ENUMS.ramp_class, "UNKNOWN"]),
   trend: new Set(["up", "flat", "down", "unknown"]),
 });
 
