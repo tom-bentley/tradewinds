@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "generated_at": "2026-09-22T12:00:00Z",
+  "season": "2026",
+  "_provenance": "WS-H eng-matchup, 004 Player Intelligence, 2026-09-22 — synthetic test fixture in the design.md §2.2 games.json shape, covering every position on test/fixtures/rosters.json roster 3 plus a spread of roof/wind conditions (dome, closed w/ explicit indoor, outdoors w/ known wind, outdoors w/ missing wind, calm, windy). Not real 2026 odds.",
+  "games": [
+    { "id": "s1_HOU_LAR", "week": 1, "home": "HOU", "away": "LAR", "spread": -9.0, "total": 38.0, "roof": "closed", "indoor": true, "kick": "2026-09-13T17:00:00Z" },
+    { "id": "s1_BAL_CIN", "week": 1, "home": "BAL", "away": "CIN", "spread": -3.0, "total": 45.0, "roof": "outdoors", "windMph": 6, "kick": "2026-09-13T13:00:00Z" },
+    { "id": "s1_CAR_CHI", "week": 1, "home": "CAR", "away": "CHI", "spread": 1.5, "total": 41.5, "roof": "outdoors", "windMph": 18, "kick": "2026-09-13T13:00:00Z" },
+    { "id": "s1_GB_DET", "week": 1, "home": "GB", "away": "DET", "spread": -2.5, "total": 44.0, "roof": "outdoors", "kick": "2026-09-13T17:25:00Z" },
+    { "id": "s1_TB_PHI", "week": 1, "home": "TB", "away": "PHI", "spread": -4.0, "total": 48.5, "roof": "outdoors", "windMph": 3, "kick": "2026-09-13T17:00:00Z" },
+    { "id": "s1_NO_SF", "week": 1, "home": "NO", "away": "SF", "spread": -6.5, "total": 45.0, "roof": "dome", "kick": "2026-09-13T13:00:00Z" },
+    { "id": "s1_NYG_LV", "week": 1, "home": "NYG", "away": "LV", "spread": -1.0, "total": 39.5, "roof": "outdoors", "windMph": 11, "kick": "2026-09-13T13:00:00Z" },
+    { "id": "s1_IND_SEA", "week": 1, "home": "IND", "away": "SEA", "spread": -5.5, "total": 43.0, "roof": "closed", "kick": "2026-09-13T13:00:00Z" }
+  ]
+}

@@ -9,6 +9,9 @@ import { marketValue, rosBaselines } from "./values.js";
 // other's bindings while the modules are evaluating — both sides are hoisted function
 // declarations, called only after both modules are live.
 import { absenceOf, availability } from "./injuries.js";
+// One-directional: matchup.js reads ctx.proj/ctx.games directly and never imports lineup.js, so
+// this import cannot cycle (004 design §3.4).
+import { streamingFactor } from "./matchup.js";
 
 /** Statuses that zero a player's projection for the CURRENT week only — the floor under the
  *  availability scaling below, kept explicit so a hand-edited injury table cannot start a
@@ -83,6 +86,13 @@ function absenceApplied(ctx, id) {
  * news. Week `ctx.week` is still forced to 0 for WEEK_ZERO_STATUSES whatever the table says, and
  * a scenario ctx built by `withAbsence` is skipped (its projections already carry the discount).
  * `DEFAULTS.availability.scaleFutureWeeks = false` restores the old current-week-only rule.
+ *
+ * 004 §3.4 (R8 §5.4): after the availability scale, K/DEF weeks are further multiplied by the
+ * streaming model's factor and get its additive indoor bonus — the ONLY positions where a matchup
+ * term is applied, because that is the only place the research found it pays without double-
+ * counting Rotowire's own embedded opponent adjustment. `streamingFactor` itself is a no-op
+ * (`f: 1`, `indoorPts: 0`) when `DEFAULTS.streamingModel.enabled` is off, so this line is always
+ * safe to run.
  * @param {object} ctx
  * @param {string} id
  * @returns {Float64Array} length lastWeek+1
@@ -97,11 +107,16 @@ export function weekVector(ctx, id) {
   const zeroNow = inj != null && ZERO_SET.has(inj);
   const scaleOn = settingsBlock(ctx, "availability").scaleFutureWeeks !== false;
   const absence = inj != null && scaleOn && !absenceApplied(ctx, id) ? absenceOf(ctx, row) : null;
+  const streamPos = row.pos === "K" || row.pos === "DEF";
   const vec = new Float64Array(ctx.lastWeek + 1);
   for (let w = 1; w <= ctx.lastWeek; w += 1) {
     let pts = src ? Number(src[w - 1]) || 0 : 0;
     if (pts && isBye(ctx, id, w)) pts = 0;
     if (pts && absence && w >= ctx.week) pts *= availability(ctx, id, w, absence);
+    if (pts && streamPos) {
+      const sf = streamingFactor(ctx, id, w);
+      pts = pts * sf.f + sf.indoorPts;
+    }
     if (pts && zeroNow && w === ctx.week) pts = 0;
     vec[w] = pts;
   }
