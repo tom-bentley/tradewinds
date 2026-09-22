@@ -45,6 +45,7 @@ import {
   writeJsonFile,
 } from "./util.mjs";
 import { ADVISOR_ITEM_LIMIT, ADVISOR_VERSION, validateAdvisor, validateAlertsState } from "./contract.mjs";
+import { enqueueAll } from "./queue.mjs";
 import { PROJECTION_POSITION_QUERY, textOrNull, weeklyPoints } from "./sources/sleeper.mjs";
 import {
   adviseAll,
@@ -1215,6 +1216,48 @@ function emptySeen() {
 }
 
 /**
+ * Turn this run's status transitions into research-queue requests (004 design §2.5, trigger ii).
+ * Pure: the queue write itself happens once per run in `main`.
+ *
+ * Depth and priority follow the ladder in §2.5. A transition on MY roster is the one that changes
+ * a start/sit or an IR decision, so it earns a `deep` fill at priority 2; a rival's is trade and
+ * waiver intelligence, so it is `standard` at priority 5 and only when the device asked for rival
+ * news at all. Free agents are skipped here on purpose — the desk's own trending sweep covers the
+ * unrostered market, and enqueuing every unowned Questionable player would swamp the queue.
+ *
+ * `sk` is the post-transition `statusKey`, which is exactly the freshness oracle a dossier is
+ * stamped with (R11 §Q11.3): a dossier written for this key stays valid until the status moves.
+ * @param {object} ctx engine context (only `rosterOf` is read)
+ * @param {object[]} events `diffStatuses` output
+ * @param {{ rosterId: number|string|null, includeRivals?: boolean }} options
+ * @returns {object[]} `queue.appendRow` requests, at most one per player
+ */
+export function researchRequests(ctx, events, options) {
+  const { rosterId, includeRivals = false } = options || {};
+  /** @type {Map<string, object>} */
+  const out = new Map();
+  for (const event of events || []) {
+    if (!event || event.id == null) continue;
+    const id = String(event.id);
+    const owner = ctx?.rosterOf?.has?.(id) ? ctx.rosterOf.get(id) : null;
+    if (owner == null) continue;
+    const mine = rosterId != null && String(owner) === String(rosterId);
+    if (!mine && !includeRivals) continue;
+    // A player who is both mine and (impossibly) a rival's keeps the deeper request.
+    if (out.has(id) && out.get(id).depth === "deep") continue;
+    out.set(id, {
+      player_id: id,
+      depth: mine ? "deep" : "standard",
+      reason: "news",
+      sk: statusKey(event.after),
+      requested_by: "alerts",
+      priority: mine ? 2 : 5,
+    });
+  }
+  return [...out.values()];
+}
+
+/**
  * Decide what one device should hear about this run. Pure — no fetch, no clock, no sending.
  *
  * Advice comes first: a lineup hole expires at kickoff, a trade idea does not (§12.1). The run cap
@@ -1232,9 +1275,10 @@ function emptySeen() {
  * @param {object} state the run's pre-run alerts state (never mutated)
  * @param {{ status?: Record<string, string>, seeding?: boolean, now?: number }} [options]
  *   `now` drives the per-kind cooldowns (§13.3 B3); the engine still never reads a clock itself.
- * @returns {{ notifications: object[], advisories: object[], baseline: string[],
- *   seen: { trades: string[], deals: string[], fa: string[], advice: string[] },
+ * @returns {{ notifications: object[], advisories: object[], research: object[],
+ *   baseline: string[], seen: { trades: string[], deals: string[], fa: string[], advice: string[] },
  *   seeding: boolean, deferred: number, cooled: Record<string, number>, problems: string[] }}
+ *   `research` is the queue.mjs request list for data/research-queue.json (004 design §2.5).
  */
 export function composeAlerts(ctx, device, state, options = {}) {
   /** @type {string[]} */
@@ -1261,13 +1305,23 @@ export function composeAlerts(ctx, device, state, options = {}) {
   // regardless of prefs.advice; only the notification group below is gated.
   /** @type {object[]} */
   let advisories = [];
+  /** @type {object[]} */
+  let research = [];
   if (rosterId != null) {
     try {
       const events = diffStatuses(previousStatus, nextStatus);
       advisories = adviseAll(ctx, { rosterId, events, includeRivals: prefs.rivalNews }) || [];
+      // 004 design §2.5 trigger (ii): the same diff that produces an advisory also asks the
+      // research desk for a dossier. Zero extra HTTP requests — the status rows are already here.
+      // A seeding run is excluded: the first sight of a league is not a transition, and enqueuing
+      // every Questionable player on day one would drown the desk.
+      if (!seeding) {
+        research = researchRequests(ctx, events, { rosterId, includeRivals: prefs.rivalNews });
+      }
     } catch (error) {
       problems.push(`adviseAll failed: ${error.message}`);
       advisories = [];
+      research = [];
     }
   }
 
@@ -1330,7 +1384,7 @@ export function composeAlerts(ctx, device, state, options = {}) {
   // news: remember them so the next run only speaks up about what actually changed.
   const baseline = seeding ? advisories.map((advisory) => advisory.key).filter(Boolean) : [];
 
-  return { notifications, advisories, baseline, seen, seeding, deferred, cooled, problems };
+  return { notifications, advisories, research, baseline, seen, seeding, deferred, cooled, problems };
 }
 
 /**
@@ -2001,6 +2055,9 @@ export async function main(options = {}) {
   const feedUpdates = {};
   /** @type {Map<string, Set<string>>} */
   const feedKeys = new Map();
+  /** 004 design §2.5: one research request per player across every device and league this run. */
+  /** @type {Map<string, object>} */
+  const researchWanted = new Map();
   let leaguesOk = 0;
   let notified = 0;
 
@@ -2100,6 +2157,11 @@ export async function main(options = {}) {
         feedKeys.set(leagueId, new Set());
         feedUpdates[leagueId] = { week, items: [] };
       }
+      for (const request of composed.research || []) {
+        const existing = researchWanted.get(request.player_id);
+        if (!existing || existing.priority > request.priority) researchWanted.set(request.player_id, request);
+      }
+
       const seenKeys = feedKeys.get(leagueId);
       for (const advisory of composed.advisories) {
         if (!advisory || typeof advisory.key !== "string" || seenKeys.has(advisory.key)) continue;
@@ -2232,6 +2294,27 @@ export async function main(options = {}) {
     const size = writeJsonFile(advisorFile, feed);
     const count = Object.values(feed.leagues).reduce((total, entry) => total + entry.items.length, 0);
     status("ok", "advisor", `data/advisor.json written (${count} advisory(ies), ${size.bytes} B)`);
+  }
+
+  // --- data/research-queue.json: what the research desk should look at next (§2.5) --------------
+  // Append-only and idempotent: `appendRow` refuses a duplicate of a live (player_id, depth, sk)
+  // row and debounces the same status key inside one UTC day, so the ten-minute cadence adds a
+  // row on the transition and nothing at all on the ninety runs that follow it.
+  if (researchWanted.size > 0) {
+    const queueFile = join(root, "data", "research-queue.json");
+    const requests = [...researchWanted.values()].sort((a, b) => a.priority - b.priority);
+    const result = enqueueAll(queueFile, requests, { now });
+    if (!result.written) {
+      status("warn", "research", `queue rejected (${result.problems[0]}) — data/research-queue.json left alone`);
+    } else if (result.added === 0) {
+      status("ok", "research", `${result.skipped} transition(s) already queued — nothing added`);
+    } else {
+      status(
+        "ok",
+        "research",
+        `data/research-queue.json +${result.added} row(s), ${result.skipped} deduped (${result.bytes} B)`,
+      );
+    }
   }
 
   status("ok", "done", `${notified} notification(s) across ${leaguesOk}/${leagueIds.length} league(s)`);

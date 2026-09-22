@@ -1,0 +1,67 @@
+name: Research queue
+
+# Files one research request from the phone onto data/research-queue.json (004 design §2.5, §5).
+#
+# The phone has no server, so "ask the desk to research this player" is a `repository_dispatch`
+# with the same fine-grained PAT the alerts re-pairing path already uses (src/ui/push.js) —
+# Contents: read and write, this repository only. This job does not research anything: it appends
+# a queued row and commits it. Whichever research desk is awake (the PC one, or the opt-in Actions
+# fallback) claims the row and does the work.
+#
+# Payload: `client_payload` = { v: 1, id: "<sleeper player_id>", depth: "deep"|"standard"|"quick",
+# sk: "<statusKey at tap time, optional>", at: "<ISO, optional>" }. Anything else is ignored and
+# the job exits 0 — a malformed dispatch must not leave a red run in the history.
+#
+#   curl -X POST -H "Accept: application/vnd.github+json" \
+#        -H "Authorization: Bearer <PAT>" \
+#        https://api.github.com/repos/tom-bentley/tradewinds/dispatches \
+#        -d '{"event_type":"research","client_payload":{"v":1,"id":"11604","depth":"deep"}}'
+#
+# Notes:
+# - `concurrency: alerts` on purpose: alerts.yml writes the same file, and two jobs committing to
+#   main in the same second is the one failure `git pull --rebase` cannot always fix. Sharing the
+#   group serialises them.
+# - queue.mjs dedupes `(player_id, depth, sk)` over live rows and debounces the same status key
+#   inside a UTC day, so a double-tap on a flaky connection costs nothing.
+
+on:
+  repository_dispatch:
+    types: [research]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alerts
+  cancel-in-progress: false
+
+jobs:
+  enqueue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Append the request
+        run: node scripts/enqueue-research.mjs
+        env:
+          RESEARCH_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+
+      - name: Commit the queue if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          for file in data/research-queue.json; do
+            if [ -f "$file" ]; then git add "$file"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "Nothing queued."
+          else
+            git commit -m "chore(research): queue $(date -u +'%Y-%m-%d %H:%MZ')"
+            git pull --rebase origin main
+            git push
+          fi

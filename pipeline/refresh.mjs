@@ -17,13 +17,17 @@ import { dirname, join } from "node:path";
 
 import {
   PIPELINE_VERSION,
+  compareIds,
   POLITE_DELAY_MS,
   formatSize,
   isoTimestamp,
   orderedByKey,
   readJsonIfExists,
+  readTextIfExists,
+  round,
   sleep,
   writeJsonFile,
+  writeTextFile,
 } from "./util.mjs";
 import { validateAll } from "./contract.mjs";
 import {
@@ -32,8 +36,11 @@ import {
   applyLastGood,
   historyPlayerCount,
   loadPreviousHistory,
+  loadPreviousOptional,
   loadPreviousValueSources,
+  optionalRowCount,
   resolveHistory,
+  resolveOptional,
 } from "./lastgood.mjs";
 import {
   buildNameIndex,
@@ -42,15 +49,34 @@ import {
   fetchState,
   rosterPlayerIds,
 } from "./sources/sleeper.mjs";
+import {
+  DVP_VERSION,
+  STATS_VERSION,
+  collectStats,
+} from "./sources/sleeper-stats.mjs";
+import { GAMES_VERSION, collectGames } from "./sources/games.mjs";
 import { FC_NUM_TEAMS, FC_PPR, FC_TABLES, fetchFantasyCalcTable } from "./sources/fantasycalc.mjs";
 import { DP_TABLES, fetchDynastyProcessTables } from "./sources/dynastyprocess.mjs";
 import { BC_FORMATS, fetchBorisChenTables } from "./sources/borischen.mjs";
 
 /**
  * Total data/ budget; the run warns (does not fail) above it. Stat lines dominate it; raised from
- * 1.6 MB when data/history.json (design §13.6) joined the set.
+ * 1.6 MB when data/history.json (design §13.6) joined the set, and from 1 800 000 to 2 500 000 for
+ * 004 §2 (stats.json + dvp.json + games.json). Measured at the raise: the committed set was
+ * 1 649 858 B, the three new files add 106 418 B and the job-written advisor/alerts/queue files
+ * 76 043 B, for 1 832 319 B against the new budget. `test/pipeline.budget.test.mjs` sums every
+ * committed data/** file, job-written ones included, and fails above this number.
  */
-const SIZE_BUDGET_BYTES = 1_800_000;
+export const SIZE_BUDGET_BYTES = 2_500_000;
+
+/**
+ * data/values-history.csv alone (design §2.6). Warn only in 0.5.0: the monthly gzip roll-off is
+ * deferred, so exceeding this is a prompt to implement it, not a failure.
+ */
+export const VALUES_HISTORY_SIZE_BUDGET_BYTES = 600_000;
+
+/** The value table data/values-history.csv snapshots, one row per player per UTC day (§2.6). */
+export const VALUES_HISTORY_TABLE = "fc_redraft";
 
 /** Per-file budget for data/history.json alone (design §13.6 F1: "≤ 220 KB raw"). Warns only. */
 const HISTORY_SIZE_BUDGET_BYTES = 220_000;
@@ -128,6 +154,46 @@ async function attemptGroup(id, ids, run) {
   return Object.fromEntries(
     ids.map((tableId) => [tableId, { table: tables?.[tableId] ?? null, error }]),
   );
+}
+
+/**
+ * Append one UTC-day snapshot of the FantasyCalc redraft table to data/values-history.csv
+ * (design §2.6). Header `date,id,v,t`: `v` is the market value, `t` FantasyCalc's own 30-day
+ * trend, both verbatim off the table this run published. Idempotent within a day — a second run
+ * on the same date finds the date already present and writes nothing, so the 3-hourly cron adds
+ * one snapshot a day and the file is a clean append in every diff.
+ *
+ * Six weeks of this is what R10 §1.5 needs; nothing reads it yet, and the phone never loads it.
+ * @param {string|null} previousText current file contents, or null
+ * @param {{ values?: Record<string, {v?: number, t?: number}> }|null|undefined} table
+ * @param {string} date `YYYY-MM-DD` (UTC)
+ * @returns {{ text: string, rows: number, appended: boolean }}
+ */
+export function appendValuesHistory(previousText, table, date) {
+  const NL = "\n";
+  const header = "date,id,v,t";
+  const existing =
+    typeof previousText === "string" && previousText.trim() !== ""
+      ? previousText.trimEnd().split(NL)
+      : [];
+  const body = existing.length > 0 && existing[0].startsWith("date,") ? existing.slice(1) : existing;
+  if (body.some((line) => line.startsWith(`${date},`))) {
+    return { text: `${[header, ...body].join(NL)}${NL}`, rows: 0, appended: false };
+  }
+  /** @type {string[]} */
+  const rows = [];
+  for (const id of Object.keys(table?.values ?? {}).sort(compareIds)) {
+    const row = table.values[id];
+    const value = typeof row?.v === "number" && Number.isFinite(row.v) ? round(row.v, 2) : null;
+    if (value === null) continue;
+    const trend = typeof row?.t === "number" && Number.isFinite(row.t) ? round(row.t, 2) : "";
+    rows.push(`${date},${id},${value},${trend}`);
+  }
+  return {
+    text: `${[header, ...body, ...rows].join(NL)}${NL}`,
+    rows: rows.length,
+    appended: rows.length > 0,
+  };
 }
 
 /**
@@ -279,6 +345,86 @@ export async function main() {
     }
   }
 
+  // --- 004 player intelligence: stats, dvp, games (design §2.1–§2.3) --------
+  // All three are OPTIONAL in every direction: a failure here keeps the committed copy and never
+  // fails the run, exactly like history.json and the value tables. The player set is lean — the
+  // ids data/projections.json already carries this season (design §2.1) — so the file stays a
+  // league-agnostic usage table rather than a second copy of the player dump.
+  const projectionIds = new Set(Object.keys(core.projections.players));
+  let statsRun = { stats: null, dvp: null, weeks: [], gameIds: new Map(), errors: { stats: "not attempted" } };
+  try {
+    statsRun = await collectStats({
+      season,
+      stateWeek: week,
+      allowedIds: projectionIds,
+      generatedAt,
+      schedule: core.schedule,
+      log: (message) => status("ok", "sleeper_stats", message),
+    });
+  } catch (error) {
+    status("warn", "sleeper_stats", error.message);
+    statsRun = { stats: null, dvp: null, weeks: [], gameIds: new Map(), errors: { stats: error.message } };
+  }
+  await sleep(POLITE_DELAY_MS);
+
+  let gamesRun = { games: null, errors: { games: "not attempted" }, weatherCalls: 0 };
+  try {
+    gamesRun = await collectGames({
+      season,
+      week,
+      generatedAt,
+      log: (message) => status("ok", "games", message),
+    });
+  } catch (error) {
+    status("warn", "games", error.message);
+    gamesRun = { games: null, errors: { games: error.message }, weatherCalls: 0 };
+  }
+
+  const statsErrors = Object.values(statsRun.errors ?? {});
+  const gamesErrors = Object.values(gamesRun.errors ?? {});
+  const guardedStats = resolveOptional({
+    name: "stats",
+    next: statsRun.stats,
+    previous: loadPreviousOptional(join(DATA_DIR, "stats.json"), STATS_VERSION),
+    error: statsErrors[0] ?? null,
+  });
+  const guardedDvp = resolveOptional({
+    name: "dvp",
+    next: statsRun.dvp,
+    previous: loadPreviousOptional(join(DATA_DIR, "dvp.json"), DVP_VERSION),
+    error: statsErrors[0] ?? null,
+  });
+  const guardedGames = resolveOptional({
+    name: "games",
+    next: gamesRun.games,
+    previous: loadPreviousOptional(join(DATA_DIR, "games.json"), GAMES_VERSION),
+    error: gamesErrors[0] ?? null,
+  });
+  for (const guard of [guardedStats, guardedDvp, guardedGames]) {
+    if (guard.note) status("warn", "lastgood", guard.note);
+  }
+  status(
+    guardedStats.file ? "ok" : "warn",
+    "stats",
+    guardedStats.file
+      ? `${guardedStats.count} players over week(s) ${JSON.stringify(guardedStats.file.weeks)}` +
+        `${guardedStats.file.partial.length ? ` · partial ${JSON.stringify(guardedStats.file.partial)}` : ""}`
+      : `no stats file (${statsErrors[0] ?? "no completed week"})`,
+  );
+  status(
+    guardedDvp.file ? "ok" : "warn",
+    "dvp",
+    guardedDvp.file ? `${guardedDvp.count} teams, half-PPR, ppr_ref kept for provenance` : "no dvp file",
+  );
+  status(
+    guardedGames.file ? "ok" : "warn",
+    "games",
+    guardedGames.file
+      ? `${guardedGames.count} games · ${gamesRun.weatherCalls} weather call(s)` +
+        `${gamesErrors.length ? ` · ${gamesErrors.length} source problem(s)` : ""}`
+      : `no games file (${gamesErrors[0] ?? "unknown"})`,
+  );
+
   // --- assemble + write -----------------------------------------------------
   const values = { generated_at: generatedAt, sources: orderedByKey(guarded.sources) };
 
@@ -308,6 +454,38 @@ export async function main() {
         guardedHistory.notes.join("; ") || `season(s) ${guardedHistory.failed.join(", ")} failed`;
     }
   }
+  // 004 design §2.6: one UTC-day snapshot of the FantasyCalc redraft table, append-only. Built
+  // here (not written yet) so meta.json can describe it and the size guard can count it.
+  const valuesHistoryFile = join(DATA_DIR, "values-history.csv");
+  const valuesHistory = appendValuesHistory(
+    readTextIfExists(valuesHistoryFile),
+    guarded.sources[VALUES_HISTORY_TABLE],
+    generatedAt.slice(0, 10),
+  );
+
+  for (const [name, guard] of [
+    ["stats", guardedStats],
+    ["games", guardedGames],
+    ["dvp", guardedDvp],
+  ]) {
+    if (!guard.file) continue;
+    const problem = name === "stats" ? statsErrors[0] : name === "dvp" ? statsErrors[0] : gamesErrors[0];
+    metaSources[name] = {
+      // `ok: false` when the file on disk is a carried-forward copy or a source complained — the
+      // file itself has nowhere to record its own staleness (same argument as history.json).
+      ok: !guard.kept && !problem,
+      fetched_at: guard.file.generated_at ?? generatedAt,
+      count: guard.count,
+      ...(guard.kept ? { error: guard.note ?? "kept last good" } : problem ? { error: problem } : {}),
+    };
+  }
+  metaSources.values_history = {
+    ok: true,
+    fetched_at: generatedAt,
+    count: valuesHistory.rows,
+    ...(valuesHistory.appended ? {} : { error: `no snapshot added for ${generatedAt.slice(0, 10)}` }),
+  };
+
   const meta = {
     generated_at: generatedAt,
     season,
@@ -326,6 +504,10 @@ export async function main() {
     values,
     schedule: core.schedule,
     ...(history ? { history } : {}),
+    // Same "absent is ordinary" rule as history.json (004 design §2, FR-103).
+    ...(guardedStats.file ? { stats: guardedStats.file } : {}),
+    ...(guardedGames.file ? { games: guardedGames.file } : {}),
+    ...(guardedDvp.file ? { dvp: guardedDvp.file } : {}),
     meta,
   };
 
@@ -359,6 +541,18 @@ export async function main() {
       );
     }
   }
+  // data/values-history.csv is not a contract file and the phone never loads it, but it IS
+  // committed, so it is written with the rest and counted against the same budget (§2.6).
+  const historySize = writeTextFile(valuesHistoryFile, valuesHistory.text);
+  totalBytes += historySize.bytes;
+  totalGzip += historySize.gzip;
+  status(
+    historySize.bytes > VALUES_HISTORY_SIZE_BUDGET_BYTES ? "warn" : "ok",
+    "values-history",
+    `${valuesHistory.appended ? `+${valuesHistory.rows} row(s)` : "no new snapshot today"} — ` +
+      `${formatSize(historySize)} of a ${VALUES_HISTORY_SIZE_BUDGET_BYTES.toLocaleString("en-US")} byte budget`,
+  );
+
   status(
     totalBytes > SIZE_BUDGET_BYTES ? "warn" : "ok",
     "data size",

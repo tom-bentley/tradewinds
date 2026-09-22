@@ -108,7 +108,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           # data/advisor.json only appears once a run has advice to publish, and `git add` on a
           # path that does not exist yet fails the step — so add whichever of the two is there.
-          for file in data/alerts-state.json data/advisor.json; do
+          for file in data/alerts-state.json data/advisor.json data/research-queue.json; do
             if [ -f "$file" ]; then git add "$file"; fi
           done
           if git diff --cached --quiet; then
