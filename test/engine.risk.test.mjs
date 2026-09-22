@@ -14,14 +14,17 @@ import { evaluateTrade } from "../src/engine/trade.js";
 import { seasonLineup } from "../src/engine/lineup.js";
 import { marketValue } from "../src/engine/values.js";
 import {
+  LAMBDA_MARGIN_SCALE,
   consensusGaps,
   durabilityOf,
+  lambdaEffective,
   historyOf,
   historyWeekly,
   lineupConcentration,
   playerRisk,
   rosterFragility,
   rosterRisk,
+  rosterWeekly,
   tradeRisk,
 } from "../src/engine/risk.js";
 
@@ -338,4 +341,78 @@ test("tradeRisk grades both sides of a real trade result and signs the deltas fr
   // a 2-for-1 concentrates value into fewer bodies: the starter share can only go up or stay put
   assert.ok(risk.deltaStarterShare >= -1e-9, `starter share moved ${risk.deltaStarterShare}`);
   assert.equal(tradeRisk(ctx, null), null, "an ungraded proposal is answered, not thrown at");
+});
+
+// ---------------------------------------------------------------------------------------------
+// per-week export + the underdog flip (004, R9 §Q9.5 E2 / E9, R5 §5.6)
+// ---------------------------------------------------------------------------------------------
+
+test("R9 E2: rosterWeekly is the grid rosterRisk already averaged, now exported", () => {
+  const grid = rosterWeekly(ctx, mine);
+  assert.equal(grid.length, ctx.weeksLeft.length);
+  assert.deepEqual(grid.map((r) => r.week), ctx.weeksLeft);
+  for (const row of grid) {
+    assert.ok(Number.isFinite(row.mean) && row.mean >= 0);
+    assert.ok(Number.isFinite(row.sd) && row.sd >= 0);
+  }
+  assert.ok(grid.some((r) => r.mean > 0 && r.sd > 0), "a real roster scores and swings");
+
+  // the σ rosterRisk reports IS the mean of this column — the loop was factored out, not rewritten
+  const risk = rosterRisk(ctx, mine);
+  const meanSd = grid.reduce((a, r) => a + r.sd, 0) / grid.length;
+  assert.ok(Math.abs(risk.weekly.sd - meanSd) < 1e-12, `${risk.weekly.sd} vs ${meanSd}`);
+  // and it is reachable by roster id as well as by the id list
+  assert.deepEqual(rosterWeekly(ctx, MINE), grid);
+  assert.equal(rosterWeekly(ctx, mine), grid, "memoized per roster");
+  // a roster that does not exist is answered, not thrown at: an empty lineup scores nothing
+  const nobody = rosterWeekly(ctx, 99);
+  assert.equal(nobody.length, ctx.weeksLeft.length);
+  assert.ok(nobody.every((r) => r.mean === 0 && r.sd === 0));
+});
+
+test("R9 E9 / R5 §5.6: lambdaEffective flips the risk price with the projected margin", () => {
+  const lambda = DEFAULTS.risk.lambda;
+  assert.equal(lambdaEffective(lambda, 0), 0, "a pick'em prices variance at nothing");
+  // favourite ⇒ variance is a cost (a boom/bust lineup costs a 5-point favourite −5.50 pp, [R1])
+  assert.ok(lambdaEffective(lambda, 5) > 0);
+  // underdog ⇒ variance is an asset, and the flip is exactly symmetric
+  assert.ok(lambdaEffective(lambda, -5) < 0);
+  assert.ok(Math.abs(lambdaEffective(lambda, -5) + lambdaEffective(lambda, 5)) < 1e-12);
+  // |λ_eff| ≤ |λ| everywhere, and it saturates rather than running away
+  for (const margin of [-200, -28, -7, -1, 0, 1, 7, 28, 200]) {
+    const eff = lambdaEffective(lambda, margin);
+    assert.ok(Math.abs(eff) <= lambda + 1e-12, `${margin} → ${eff}`);
+  }
+  assert.ok(lambdaEffective(lambda, 200) < lambda, "tanh never reaches λ");
+  // monotone in the margin
+  let prev = -Infinity;
+  for (let m = -40; m <= 40; m += 4) {
+    const eff = lambdaEffective(lambda, m);
+    assert.ok(eff > prev, `not monotone at ${m}`);
+    prev = eff;
+  }
+  // the scale is the margin SD and is overridable; junk inputs fall back to the constant λ
+  assert.ok(Math.abs(lambdaEffective(lambda, LAMBDA_MARGIN_SCALE) - lambda * Math.tanh(1)) < 1e-12);
+  assert.ok(lambdaEffective(lambda, 7, 7) > lambdaEffective(lambda, 7, 28), "a tighter scale flips harder");
+  assert.equal(lambdaEffective(lambda, NaN), lambda);
+  assert.equal(lambdaEffective(lambda, 5, 0), lambda);
+  assert.equal(lambdaEffective(NaN, 5), 0);
+
+  // it is NOT wired into rosterRisk: the free-agent path still has no opponent to read
+  assert.ok(
+    Math.abs(rosterRisk(ctx, mine).certaintyEquivalent - (rosterRisk(ctx, mine).weekly.mean - lambda * rosterRisk(ctx, mine).weekly.sd)) < 1e-9
+  );
+});
+
+test("DEFAULTS.risk.positionCv is the single JS source for weekly volatility", () => {
+  // R9 §Q9.4 E6 asks for the JS table and the Python prototype's to be reconciled. That is a
+  // pipeline job; these numbers are the ones every shipped risk band was calibrated against and
+  // they do not move here.
+  assert.deepEqual(Object.keys(DEFAULTS.risk.positionCv).sort(), ["DEF", "K", "QB", "RB", "TE", "WR"]);
+  assert.equal(DEFAULTS.risk.positionCv.QB, 0.38);
+  assert.equal(DEFAULTS.risk.positionCv.RB, 0.58);
+  assert.equal(DEFAULTS.risk.positionCv.WR, 0.62);
+  assert.equal(DEFAULTS.risk.positionCv.TE, 0.66);
+  assert.equal(DEFAULTS.risk.positionCv.K, 0.5);
+  assert.equal(DEFAULTS.risk.positionCv.DEF, 0.85);
 });

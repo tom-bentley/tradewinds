@@ -57,15 +57,25 @@
 // buckets λ = 1.75/7 = 0.25. The 7-point SD gap is the uncertain input — it is an assumption, not
 // a measurement, and it is the first number to revisit if the risk axis reads too hot or too cold.
 //
-// NOT modelled on purpose: `lambdaUnderdogFlip` (R5 §5.6). The right behaviour is λ_eff =
-// λ·tanh(projectedMargin/28) — chase ceiling when projected to lose, floor when projected to win —
-// but the free-agent path has no opponent projection to read, so v1 ships the constant.
+// `lambdaUnderdogFlip` (R5 §5.6) now EXISTS as `lambdaEffective(lambda, margin, scale)` — λ_eff =
+// λ·tanh(projectedMargin/28), chase ceiling when projected to lose and floor when projected to win.
+// It is a pure helper, not yet wired into `certaintyEquivalent`: the free-agent path still has no
+// opponent projection to read, so `rosterRisk` keeps the constant λ and the season map (WS-I), which
+// does know the opponent, applies the flip itself per week off `rosterWeekly`.
+//
+// `DEFAULTS.risk.positionCv` is the SINGLE JS source for per-position weekly CV. The Python
+// prototype (`lineup_optimizer.py:108`) carries a different table and R9 §Q9.4 E6 asks for the two
+// to be reconciled — that reconciliation belongs to the pipeline, not here. Until it happens the JS
+// numbers do not move: they are the ones every shipped risk band was calibrated against.
 
 import { POSITIONS, DEFAULTS } from "../config.js";
 import { playerOf, rosterById, activePlayers, slotEligibility } from "./context.js";
 import { bestLineup, seasonLineup, settingsBlock, streamerFor, weekPoints, weekVector } from "./lineup.js";
 import { absenceOf, availability } from "./injuries.js";
 import { marketValue } from "./values.js";
+
+/** Margin SD used by `lambdaEffective` — a ±28-point weekly margin spread (R5 §5.6). */
+export const LAMBDA_MARGIN_SCALE = 28;
 
 /** A cache key for one roster: order must not matter, identity must. */
 function rosterKey(ids) {
@@ -545,6 +555,67 @@ export function rosterFragility(ctx, ids) {
 }
 
 /**
+ * One roster's projected weekly total, week by week, with the spread around it (R9 §Q9.5 E2).
+ *
+ * `rosterRisk` has always computed this grid and then thrown away everything but the mean of the
+ * σ column; the season map needs the whole thing, because P(win) in week w is Φ of the standardized
+ * margin in week w and a roster on bye is not the same roster it was a week earlier.
+ *
+ * σ is taken under INDEPENDENCE: √Σ (cv_i · pts_i)² over the week's starters. Starters correlate a
+ * little (same game script, a stacked QB/WR) — R10 §2.1 supplies exactly one calibrated cell
+ * (QB–WR +0.31) and nothing for the rest, so the honest model is still independence, said out loud,
+ * rather than a correlation matrix nobody can fill in.
+ *
+ * @param {object} ctx
+ * @param {number|string|string[]} roster a roster id, or the player ids directly
+ * @returns {Array<{week:number, mean:number, sd:number}>} one row per `ctx.weeksLeft`
+ */
+export function rosterWeekly(ctx, roster) {
+  const ids = Array.isArray(roster) ? roster : activePlayers(rosterById(ctx, roster));
+  return memoized(ctx, "rosterWeekly", rosterKey(ids), () => {
+    const { weeks, lineups } = startShare(ctx, ids);
+    return weeks.map((week, i) => {
+      let mean = 0;
+      let variance = 0;
+      for (const slot of lineups[i].slots) {
+        if (!slot.id) continue;
+        const pts = weekPoints(ctx, slot.id, week);
+        if (pts <= 0) continue;
+        mean += pts;
+        const cv = playerRisk(ctx, slot.id).volatility;
+        variance += (cv * pts) * (cv * pts);
+      }
+      return { week, mean, sd: Math.sqrt(variance) };
+    });
+  });
+}
+
+/**
+ * λ_eff = λ · tanh(margin / scale) — the underdog flip R5 §5.6 specified and v1 deferred because
+ * the free-agent path had no opponent to read. With a projected margin in hand it is one line:
+ * price variance as a cost when you are projected to WIN (margin > 0 ⇒ λ_eff > 0, the certainty
+ * equivalent docks σ) and as an asset when you are projected to LOSE (margin < 0 ⇒ λ_eff < 0, σ is
+ * paid for). Reedy's simulations are the evidence for the shape: a boom/bust lineup costs a
+ * 5-point favourite −5.50 pp of win probability and an even team −2.78 pp, while a 5-point underdog
+ * gains from volatility (R9 §Q9.4 [R1], R5 §3.4 [28]).
+ *
+ * tanh keeps |λ_eff| ≤ |λ| at every margin and is zero at a pick'em, so nothing here can make the
+ * risk axis louder than λ already allowed.
+ * @param {number} lambda the constant λ (`DEFAULTS.risk.lambda`)
+ * @param {number} margin projected points for − projected points against, this week
+ * @param {number} [scale] margin SD; 28 is the measured NFL-fantasy margin spread (R5 §5.6)
+ * @returns {number}
+ */
+export function lambdaEffective(lambda, margin, scale = LAMBDA_MARGIN_SCALE) {
+  const l = Number(lambda);
+  if (!Number.isFinite(l)) return 0;
+  const m = Number(margin);
+  const s = Number(scale);
+  if (!Number.isFinite(m) || !Number.isFinite(s) || s <= 0) return l;
+  return l * Math.tanh(m / s);
+}
+
+/**
  * The whole roster on one risk row: how concentrated it is, how fragile it is, how much its
  * weekly total swings, and what it is worth to a manager who would rather not lose (§13.5 D4).
  *
@@ -561,25 +632,13 @@ export function rosterRisk(ctx, ids) {
     const c = cfg(ctx);
     const concentration = lineupConcentration(ctx, ids);
     const fragility = rosterFragility(ctx, ids);
-    const { weeks, lineups } = startShare(ctx, ids);
     const season = seasonLineup(ctx, ids);
 
-    // weekly sd under independence: √Σ (cv_i · pts_i)² over the starters, averaged over weeks.
-    // Starters correlate a little (same game script, stacked QB/WR) — assume independence and say
-    // so, rather than invent a correlation matrix nobody can calibrate.
+    // the per-week grid, factored out so the season map can read it too (R9 §Q9.5 E2)
+    const perWeek = rosterWeekly(ctx, ids);
     let sdSum = 0;
-    for (let i = 0; i < weeks.length; i += 1) {
-      let variance = 0;
-      for (const slot of lineups[i].slots) {
-        if (!slot.id) continue;
-        const pts = weekPoints(ctx, slot.id, weeks[i]);
-        if (pts <= 0) continue;
-        const cv = playerRisk(ctx, slot.id).volatility;
-        variance += (cv * pts) * (cv * pts);
-      }
-      sdSum += Math.sqrt(variance);
-    }
-    const sd = weeks.length ? sdSum / weeks.length : 0;
+    for (const row of perWeek) sdSum += row.sd;
+    const sd = perWeek.length ? sdSum / perWeek.length : 0;
     const mean = season.avgPerWeek;
     const cv = mean > 0 ? sd / mean : 0;
     const lambda = finite(c.lambda, 0.25);
