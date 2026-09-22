@@ -7,7 +7,7 @@
 // model, extended one level up: the INPUTS to the table become enums too, so the desk's output
 // space is finite, diff-able, and a rubric bump invalidates every old dossier deterministically.
 //
-// Purity, like the rest of the engine: no fetch, no `Date.now()`, no randomness. The clock arrives
+// Purity, like the rest of the engine: no network, no wall clock, no randomness. The clock arrives
 // as `ctx.now` and nowhere else, so a dossier + a data snapshot + `ctx.now` replay to the identical
 // answer (FR-109, SC-103).
 //
