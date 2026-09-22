@@ -8,14 +8,17 @@ import { seasonLineup, weekPoints } from "../src/engine/lineup.js";
 import { evaluateTrade } from "../src/engine/trade.js";
 import { sideNames } from "../src/engine/explain.js";
 import {
+  BID_PHASE_FLOOR,
   DAY_MS,
   PROTECTED_BY_SURPLUS,
+  SEASON_WEEKS,
   currentStarters,
   dropCandidates,
   findFreeAgents,
   freeAgentPool,
   gradeTransaction,
   protectedBySurplus,
+  faabPhase,
   suggestedBid,
   trendCount,
   waiverStatus,
@@ -670,4 +673,83 @@ test("D3: the drop is chosen on gain AND insurance, never gain alone", () => {
     );
     assert.ok(Number.isFinite(row.insurancePerWeek));
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// FAAB: Δ × weeks-covered pricing (004, R9 §Q9.4 R-8 / E7)
+// ---------------------------------------------------------------------------------------------
+
+/** A completed drop, so the player sits on waivers for the clear window and carries a bid. */
+const droppedAt = (id, at, roster = 1) =>
+  normalize({
+    transaction_id: `d-${id}`,
+    type: "waiver",
+    status: "complete",
+    created: at - 6 * 3600000,
+    drops: { [id]: roster },
+    roster_ids: [roster],
+  });
+
+test("R9 R-8: the FAAB phase factor is monotone NON-INCREASING across weeks 1–17", () => {
+  // The shipped v1 curve ran backwards — `0.35 + 0.65·(1 − weeksLeft/17)` rose from 0.35 in week 1
+  // to 0.96 in week 17, bidding the same player $10 early and $27 late. Every sourced heuristic
+  // says the opposite ("FAAB is like a new car; it depreciates", R5 §2.3 [34][35]; "$1 in Week 2
+  // buys 15 weeks of a player, $1 in Week 12 buys 5", 4for4 [R11]).
+  const curve = [];
+  for (let week = 1; week <= 17; week += 1) curve.push(faabPhase(17 - week + 1));
+  for (let i = 1; i < curve.length; i += 1) {
+    assert.ok(curve[i] <= curve[i - 1] + 1e-12, `week ${i + 1} (${curve[i]}) rose above week ${i} (${curve[i - 1]})`);
+    assert.ok(curve[i] < curve[i - 1], `week ${i + 1} must be strictly cheaper than week ${i}`);
+  }
+  assert.ok(Math.abs(curve[0] - 1) < 1e-12, "a full season left is a full-price dollar");
+  assert.ok(Math.abs(curve[16] - (BID_PHASE_FLOOR + (1 - BID_PHASE_FLOOR) / SEASON_WEEKS)) < 1e-12);
+  assert.ok(curve[16] >= BID_PHASE_FLOOR, "a late add is never free");
+  // out-of-range inputs clamp instead of exploding
+  assert.equal(faabPhase(99), 1);
+  assert.equal(faabPhase(0), BID_PHASE_FLOOR);
+  assert.equal(faabPhase(NaN), BID_PHASE_FLOOR);
+});
+
+test("R9 R-8: the same weekly gain gets cheaper as the season runs out", () => {
+  const atWeek = (week) => {
+    const state = { ...fixture("state.json"), week, display_week: week };
+    const shifted = build({ state, transactions: [droppedAt(MAHOMES, NOW)] });
+    return { bid: suggestedBid(shifted, MINE, MAHOMES, 3, "waivers"), weeksLeft: shifted.weeksLeft.length };
+  };
+  const rows = [];
+  for (let week = 1; week <= 17; week += 1) rows.push(atWeek(week));
+
+  for (const { bid } of rows) assert.ok(bid && bid.value >= 1 && bid.value <= bid.remaining);
+  for (let i = 1; i < rows.length; i += 1) {
+    // The two WEEK-dependent terms — how many weeks the add covers, and what a dollar is still
+    // worth — both fall, every week, for the same Δ. (The third term, scarcity, is a property of
+    // the wire and legitimately jumps around: on this fixture Mahomes has 8 comparable QBs behind
+    // him until KC's week-5 bye clears the band, which is a real scarcity signal, not a phase one.)
+    assert.ok(rows[i].bid.weeksCovered < rows[i - 1].bid.weeksCovered, `weeks covered at ${i + 1}`);
+    assert.ok(rows[i].bid.totalPoints < rows[i - 1].bid.totalPoints, `Δ × weeks at ${i + 1}`);
+    assert.ok(faabPhase(rows[i].weeksLeft) < faabPhase(rows[i - 1].weeksLeft), `phase at ${i + 1}`);
+  }
+  // end to end: the v1 curve bid this player $10 in week 1 and $27 in week 17. It now front-loads.
+  assert.ok(rows[0].bid.value > rows[16].bid.value, `${rows[0].bid.value} vs ${rows[16].bid.value}`);
+  assert.equal(rows[0].bid.weeksCovered, 17);
+  assert.ok(Math.abs(rows[0].bid.totalPoints - 3 * 17) < 1e-9);
+  assert.equal(rows[16].bid.weeksCovered, 1);
+  assert.ok(Math.abs(rows[16].bid.totalPoints - 3) < 1e-9);
+});
+
+test("R9 R-5: a short horizon is priced as a short horizon, whatever week it is", () => {
+  const ctx2 = build({ transactions: [droppedAt(MAHOMES, NOW)] });
+  const season = suggestedBid(ctx2, MINE, MAHOMES, 4, "waivers");
+  const bridge = suggestedBid(ctx2, MINE, MAHOMES, 4, "waivers", 4);
+  const streamer = suggestedBid(ctx2, MINE, MAHOMES, 4, "waivers", 1);
+  assert.equal(season.weeksCovered, 17);
+  assert.equal(bridge.weeksCovered, 4);
+  assert.equal(streamer.weeksCovered, 1);
+  assert.ok(season.value > bridge.value, `${season.value} vs ${bridge.value}`);
+  assert.ok(bridge.value > streamer.value, `${bridge.value} vs ${streamer.value}`);
+  assert.equal(streamer.value, 1, "a one-week stream is $1–2 (R5 §2.3, [R11], [R12])");
+  // a horizon longer than the season cannot be bought
+  assert.equal(suggestedBid(ctx2, MINE, MAHOMES, 4, "waivers", 99).weeksCovered, 17);
+  // and no gain is no bid beyond the $1 floor a claim always costs
+  assert.equal(suggestedBid(ctx2, MINE, MAHOMES, 0, "waivers").value, 1);
 });
