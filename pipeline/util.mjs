@@ -311,6 +311,32 @@ export function readJsonIfExists(file) {
 }
 
 /**
+ * @param {string} file
+ * @returns {string|null} the file's text, or null when absent/unreadable
+ */
+export function readTextIfExists(file) {
+  if (!existsSync(file)) return null;
+  try {
+    return readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write a text file (data/values-history.csv, design §2.6) and measure it the same way
+ * `writeJsonFile` measures JSON, so the size guard can count every committed byte.
+ * @param {string} file
+ * @param {string} text
+ * @returns {{ bytes: number, gzip: number }}
+ */
+export function writeTextFile(file, text) {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, text, "utf8");
+  return { bytes: Buffer.byteLength(text, "utf8"), gzip: gzipBytes(text) };
+}
+
+/**
  * Write compact JSON plus a trailing newline (git-friendly).
  * @param {string} file
  * @param {unknown} value

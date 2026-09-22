@@ -253,3 +253,79 @@ export function resolveHistory(input) {
   if (!envelope) return { history: null, kept, failed, notes };
   return { history: { ...envelope, seasons }, kept, failed, notes };
 }
+
+// ── 004 player intelligence (design §2.1–§2.3) ─────────────────────────────────────────────────
+//
+// Third level of the same rule. data/stats.json, data/games.json and data/dvp.json are each built
+// from a fan-out of per-week calls, so a half-successful run produces a file that is *valid* and
+// *much smaller* than the one it would replace — the failure mode the value tables' row floors
+// exist for, one step further out. Two guards, both from design §2.1:
+//   * never overwrite a good file with an empty one, and
+//   * keep the previous file when the new one loses more than 20 % of its rows.
+// A file that has no previous copy is always published: the first run has to start somewhere.
+
+/** Share of rows a rebuild may lose before the previous file is kept instead (design §2.1). */
+export const LOSS_RATIO = 0.2;
+
+/**
+ * Rows a 004 file carries, by file name. Kept in one place so the guard, the log line and
+ * meta.json all count the same thing.
+ * @param {string} name "stats" | "games" | "dvp"
+ * @param {any} file
+ * @returns {number}
+ */
+export function optionalRowCount(name, file) {
+  if (!file || typeof file !== "object") return 0;
+  if (name === "games") return Array.isArray(file.games) ? file.games.length : 0;
+  if (name === "dvp") return file.teams && typeof file.teams === "object" ? Object.keys(file.teams).length : 0;
+  return file.players && typeof file.players === "object" ? Object.keys(file.players).length : 0;
+}
+
+/**
+ * Apply the guard to one optional 004 file.
+ * @param {{ name: string, next?: object|null, previous?: object|null, error?: string|null,
+ *   lossRatio?: number }} input
+ * @returns {{ file: object|null, kept: boolean, count: number, note: string|null }}
+ *   `kept` means the previous file was published instead of the new one.
+ */
+export function resolveOptional(input) {
+  const { name, next = null, previous = null, error = null } = input;
+  const lossRatio = Number.isFinite(input.lossRatio) ? Number(input.lossRatio) : LOSS_RATIO;
+  const nextCount = optionalRowCount(name, next);
+  const previousCount = optionalRowCount(name, previous);
+
+  if (nextCount === 0) {
+    if (previousCount === 0) {
+      return { file: null, kept: false, count: 0, note: error ? `${name}: ${error}` : null };
+    }
+    return {
+      file: previous,
+      kept: true,
+      count: previousCount,
+      note: `${name}: rebuilt empty${error ? ` (${error})` : ""} — kept the committed ${previousCount} row(s)`,
+    };
+  }
+  if (previousCount > 0 && nextCount < previousCount * (1 - lossRatio)) {
+    return {
+      file: previous,
+      kept: true,
+      count: previousCount,
+      note:
+        `${name}: rebuilt with ${nextCount} row(s), down from ${previousCount} ` +
+        `(> ${Math.round(lossRatio * 100)} % lost) — kept the committed file`,
+    };
+  }
+  return { file: next, kept: false, count: nextCount, note: null };
+}
+
+/**
+ * The previous copy of an optional 004 file, or null.
+ * @param {string} file
+ * @param {number} version the `version` the file must declare
+ * @returns {object|null}
+ */
+export function loadPreviousOptional(file, version) {
+  const previous = readJsonIfExists(file);
+  if (!previous || typeof previous !== "object" || Array.isArray(previous)) return null;
+  return Number(/** @type {any} */ (previous).version) === version ? previous : null;
+}
