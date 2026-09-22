@@ -52,6 +52,10 @@ Full methodology, sources, and citations live in the research notes of the paren
 | [FantasyCalc](https://fantasycalc.com/) | redraft and dynasty trade values | public API |
 | [DynastyProcess](https://github.com/dynastyprocess/data) | dynasty values (`values-players.csv`) | GPL-3.0 |
 | [Boris Chen](https://www.borischen.co/) | weekly half-PPR tiers | public tier files |
+| Sleeper per-player stats (`/stats/nfl/player/{id}`, `/stats/nfl/{season}/{week}`) | usage lines (`data/stats.json`), defence-vs-position (`data/dvp.json`, half-PPR recomputed) | public read-only API |
+| [nflverse `nfldata`](https://github.com/nflverse/nfldata) `games.csv` | betting lines, roof, surface, rest days (`data/games.json`) | public data, CC-BY-4.0 upstream |
+| ESPN scoreboard API | kickoff time, venue, weather block | public site API |
+| [Open-Meteo](https://open-meteo.com/) | wind at outdoor venues inside 7 days (airport coordinates, 8–60 km off) | free, no key |
 
 KeepTradeCut is deliberately **not** used: its terms of service prohibit scraping and
 derivative works.
@@ -231,6 +235,69 @@ node scripts/alerts-doctor.mjs              # is the sender healthy, and who doe
 `POST https://api.github.com/repos/<you>/tradewinds/dispatches` and body
 `{"event_type":"alerts"}` using a fine-grained token (Contents: read, Actions: write). The job is
 state-diffed, so extra runs never double-notify.
+
+## Player intelligence (0.5.0)
+
+Version 0.5.0 adds a deterministic intelligence layer on top of the trade engine. Everything below is
+reproducible from committed data, every number traces to a cited source or a versioned table, and the
+app still costs nothing to run. Design and research: `specs/004-player-intelligence/` in the parent
+project (research R6–R13, `design.md`, `spec.md`).
+
+- **Dossiers.** A research desk (Claude Code, headless, on a schedule and on demand) researches one
+  player at a time into *codes with evidence* — injury type, severity, surgery, team and reporter
+  timelines, practice pattern, designation — each backed by a 2026-dated source quote. The engine
+  maps codes to numbers through a versioned rubric (`src/engine/prognosis.js`, rubric `r7-v1`), so the
+  same evidence always yields the same games-missed distribution. A dossier is stale the moment
+  Sleeper's status key changes, whatever the clock says; the app then says so and falls back to the
+  injury table. **Research this player** on any player card queues a dossier through the same GitHub
+  dispatch the alerts use; the chip only ever says "queued".
+- **Prognosis.** The injury table itself was re-derived from the sports-medicine literature: Doubtful
+  players play 6 % of the time (not 30 %), meniscus trims and repairs are different injuries, the
+  suspension prior clusters at 4–6 games, and the IR floor runs down as games are served.
+- **Statistics.** `data/stats.json` carries usage lines (snaps, targets, red-zone looks, carries) for
+  every projected player over a trailing window; target share divides by the team's targets, never by
+  pass attempts. Opening a player fetches his full 50-field weekly rows live from Sleeper.
+- **Matchups, honestly.** Sleeper's Rotowire projections already embed the opponent (90 % of
+  home-and-away rematch pairs are byte-identical), and a walk-forward 2025 backtest of a defence-vs-
+  position layer for skill positions was net zero — so the app does **not** adjust QB/RB/WR/TE points
+  for matchup; it shows the matchup as a grade with a confidence note instead. It *does* apply a
+  measured streaming model to K and DEF from the implied team total, wind and roof, the one place the
+  signal beat the incumbent projection.
+- **Season map.** League → my team shows every remaining week: opponent, projected points both sides,
+  win probability, the holes and their cause (bye, injury, suspension), and the moves that fill each
+  hole ranked by win equity (or title equity), never by points. Playoff, first-round-bye, top-seed and
+  title odds come from a seeded 20 000-season simulation of the real bracket. The honest disclosure is
+  built in: nothing moves a single week by more than about ten percentage points.
+- **Hidden value.** Acquire and sell lists built from usage-expected points versus actual scoring
+  (opportunity persists, efficiency regresses), market over-reaction, and fit with your roster
+  (handcuff, stack, bye clash, schedule, live positional scarcity). The market's 30-day trend was
+  measured to carry no usage information once realised points are controlled for — that gap is the
+  product.
+- **Visuals.** Eight small inline-SVG primitives (week strip, usage sparkline, matchup strip,
+  availability bar, season map, value bullet, synergy badges, dossier card), each with a spoken
+  `aria-label` and a table twin, no dependencies.
+
+### The research desk
+
+```
+phone "Research this player" → repository_dispatch: research → research-queue.yml → data/research-queue.json
+alerts job status transition ──────────────────────────────────────────────────┘
+desk (PC, every 10 min while awake) claims rows → N structured fills → consensus → prognose() → validator
+     → data/dossiers/{id}.json + data/dossiers.json → commit → push → the app sees it on its next data check
+```
+
+The desk is the `ff-dossier` skill in the parent project (`.claude/skills/ff-dossier/`), driven by
+`tools/dossier_desk.py` on a Task Scheduler task. It never invents a number: a fill returns enum codes and
+source quotes under a JSON Schema, three independent fills are reconciled by majority and median, a
+three-gate guard rejects 2025 articles (a 2026 token in the URL or dateline, no bare "Week N", the
+opponent cross-checked against Sleeper's own row), and the engine's rubric turns codes into the
+distribution. Queue rows are committed, so a desk that was asleep is a visible, recoverable state —
+rows stuck at three attempts stay in the file and show in Diagnose.
+
+`.github/workflows/research-desk.yml` is an **opt-in** fallback that drains rows older than twenty
+minutes with `anthropics/claude-code-action`; it does nothing unless the repository secret
+`CLAUDE_CODE_OAUTH_TOKEN` exists (a long-lived subscription credential on a public repository — a
+deliberate trade-off, off by default).
 
 ## Use it for your own league
 
