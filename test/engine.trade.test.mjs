@@ -651,11 +651,14 @@ test("IR: the injury flag says how long he is out (§13.4 C4)", () => {
   const r = evaluateTrade(c, { myRosterId: 3, theirRosterId: 4, give: [REED], get: [WORTHY] });
   const inj = r.flags.find((f) => f.type === "injury" && f.id === REED);
   assert.ok(inj);
-  // Hand-checked: IR with no body part is the irMin4 row {4:.4, 6:.3, 8:.2, season:.1}, whose
-  // MEDIAN is 6 games. The fixture sits in week 1 and his bye is week 11, so weeks 1-6 are six
-  // real games missed and week 7 is the first he plays. (The MEAN of that row is 14.9 games —
-  // the 10 % season-ending tail alone — which is why the median is the statistic used.)
-  assert.equal(inj.text, "Jayden Reed is IR — expected back ~week 7.");
+  // Hand-checked, R7 §3.2 [32]: IR with no body part is now the `ir` row
+  // {4:.25, 6:.22, 8:.18, 10:.10, season:.25}, whose MEDIAN is 8 games — heavier than the old
+  // {4:.4, 6:.3, 8:.2, season:.1} because only EIGHT return designations exist per regular season
+  // (two per player, 21-day window), so most in-season IR placements never get one. The fixture
+  // sits in week 1 and his bye is week 11, so weeks 1-8 are eight real games missed and week 9 is
+  // the first he plays. (The MEAN of that row is 29.5 games — the 25 % season tail alone — which
+  // is why the median is the statistic used.)
+  assert.equal(inj.text, "Jayden Reed is IR — expected back ~week 9.");
 
   // a season-ending body part says so instead of naming a week
   const torn = make(
