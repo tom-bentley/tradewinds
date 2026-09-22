@@ -89,6 +89,10 @@ export {
   rosterRisk,
   tradeRisk,
   consensusGaps,
+  // 004 (design §3.5/§3.6): per-week roster mean/sd for the season map, underdog lambda helper
+  rosterWeekly,
+  lambdaEffective,
+  LAMBDA_MARGIN_SCALE,
 } from "./risk.js";
 
 export {
@@ -150,6 +154,12 @@ export {
   IR_STATUSES,
   QUESTIONABLE_SHIFT,
   SEASON_GAMES,
+  // 004 (design §2.4/§3.3): dossier gate — rubric id, statusKey formula, slice shape, lookup
+  IR_RETURN_BRANCHES,
+  DOSSIER_RUBRIC,
+  statusKeyOf,
+  sliceIsValid,
+  dossierLookup,
 } from "./injuries.js";
 
 export {
@@ -175,6 +185,8 @@ export {
   IR_ALWAYS,
   STATUS_CHAIN,
   SEVERITY_ORDER,
+  // 004: the one-line provenance note for a dossier-driven absence ("per dossier (as of …)")
+  absenceNoteOf,
 } from "./advisor.js";
 
 export {
@@ -193,3 +205,68 @@ export {
   acceptancePhrase,
   MAX_MEANINGFUL_TIER,
 } from "./explain.js";
+
+// 004 Player Intelligence (design §3). Each module is pure and optional-input tolerant: with no
+// stats/games/dvp/dossiers in ctx every function degrades to null/neutral rather than throwing.
+
+// §3.3 — the R7 prognosis rubric (codes in, numbers out) and the dossier-first absence path
+export {
+  RUBRIC_ID,
+  ENUMS,
+  SEVERITY_ORDER as PROGNOSIS_SEVERITY_ORDER, // advisor.js owns the bare name
+  RAMP_POSITION_TILT,
+  PROGNOSIS_TABLES,
+  rampClassOf,
+  rampFor,
+  prognose,
+  dossierPrognosis,
+} from "./prognosis.js";
+
+// §3.4 — K/DEF streaming model, Rotowire's embedded opponent factor (display only), grades, flags
+export {
+  teamImplied,
+  oppImplied,
+  oppFactor,
+  streamingFactor,
+  calibrationFactor,
+  matchupFlags,
+  matchupGrade,
+} from "./matchup.js";
+
+// §3.5 — season map: schedule, win probability, seeded simulation, holes and horizon-matched moves
+export {
+  seasonMapSettings,
+  erf,
+  normalCdf,
+  pWin,
+  weekStrength,
+  mulberry32,
+  buildSchedule,
+  seedOrder,
+  bracketShape,
+  kindForHorizon,
+  horizonBid,
+  rankMoves,
+  simulateSeason,
+  seasonMap,
+  HORIZON_KINDS,
+  TRADE_MIN_WEEKS,
+} from "./seasonmap.js";
+
+// §3.2 — usage shares and trends from ctx.stats
+export {
+  TREND_SLOPE_MIN,
+  olsSlope,
+  usageOf,
+  usageTotals,
+} from "./usage.js";
+
+// §3.6 — hidden value, roster synergy, acquire/sell lists
+export {
+  synergyScore,
+  hiddenValue,
+  acquireList,
+  sellList,
+  hiddenLists,
+  unrosteredPriced,
+} from "./hidden.js";
