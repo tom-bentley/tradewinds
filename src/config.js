@@ -184,6 +184,42 @@ export const DEFAULTS = Object.freeze({
     bands: Object.freeze({ low: 25, moderate: 50, high: 75 }),
     worst: 5, // how many players rosterFragility names
   }),
+
+  // ---------------------------------------------------------------------------------------------
+  // hidden value + usage (004 design §3.2/§3.6, R10 §4). WS-K. Appended at the END of DEFAULTS —
+  // never reordered (R13 hazard 1).
+  //
+  //   alpha 0.20   weight on the within-position usage z in `modelValue`. The usage gap is
+  //                orthogonal to the market (partial r = −0.044, R10 §1.5) so it deserves real
+  //                weight, but xFP is opportunity only and talent is real. ENGINE-CHOSEN.
+  //   beta  0.0    matchup term. R8 §5.4 ruled an opponent term OUT for skill positions (Sleeper
+  //                already prices it), so the term stays in the formula at zero rather than being
+  //                deleted — turn it on only if R8 ever reports an unpriced matchup.
+  //   gamma 0.25   weight on risk = R5 §3.4's λ (consistent rosters beat boom/bust 51.4/51.2 vs
+  //                48.5/48.9, so risk is worth ≈¼ of points).
+  //   weights      list blend, R10 §4.7: market gap · usage gap · synergy · over-reaction.
+  //                ENGINE-CHOSEN and labelled as such wherever it is rendered.
+  //   minWeeks 3   below this a regression flag is SUPPRESSED (R10 §4.8, §1.3).
+  //   provisionalWeeks 4  below this every sentence carries "Provisional — k of 4 weeks".
+  //   trendWeeks 3 window for the OLS slope on share (R10 §1.3, practitioner 3–4 games).
+  //   xfp          half-PPR points per opportunity, R10 §1.4's in-sample fit rounded. An RZ target
+  //                coefficient is ≈5.7× a plain target (2.49 vs 0.44, R10 §1.1 S5). The published
+  //                fit also carried a `rec_air_yd/10` term at +1.377 — DROPPED here because
+  //                `rec_air_yd` is not in the design §2.1 stats.json key set. ENGINE-CHOSEN.
+  //   synergy      R10 §2.2 handcuff EV 0.3–0.4 pts/wk (cap 1.0 = `waiver.js` insuranceCap) and
+  //                §2.1's measured QB–WR stack shift (+1.8 ceiling / −1.6 floor, [S2]).
+  // ---------------------------------------------------------------------------------------------
+  hidden: Object.freeze({
+    alpha: 0.2,
+    beta: 0.0,
+    gamma: 0.25,
+    weights: Object.freeze({ m: 0.35, u: 0.35, s: 0.2, t: 0.1 }),
+    minWeeks: 3,
+    provisionalWeeks: 4,
+    trendWeeks: 3,
+    xfp: Object.freeze({ tgt: 0.44, rzTgt: 2.49, carry: 0.5, rzCarry: 1.5 }),
+    synergy: Object.freeze({ handcuffPerWeek: 0.35, handcuffCap: 1.0, stackCeiling: 1.8, stackFloor: 1.6 }),
+  }),
 });
 
 export const SLEEPER = Object.freeze({
