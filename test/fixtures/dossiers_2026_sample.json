@@ -1,0 +1,311 @@
+{
+  "v": 1,
+  "rubric": "r7-v1",
+  "generated_at": "2026-09-09T12:00:00Z",
+  "note": "SYNTHETIC SAMPLE — invented codes for engine tests, not real 2026 player facts.",
+  "players": {
+    "5022": {
+      "as_of": "2026-09-06T12:00:00Z",
+      "expires_at": "2026-09-08T12:00:00Z",
+      "depth": "deep",
+      "sk": "Questionable|Ankle|Sprain",
+      "rubric": "r7-v1",
+      "codes": {
+        "injury_type": "ANKLE_LOW",
+        "severity": "GRADE_1",
+        "surgery": "NONE",
+        "team_timeline": "DAY_TO_DAY",
+        "practice_pattern": "LP_LP_FP",
+        "designation": "Q",
+        "days_since_injury": 3
+      },
+      "prog": {
+        "branches": [
+          {
+            "games": 0,
+            "p": 0.9
+          },
+          {
+            "games": 1,
+            "p": 0.051
+          },
+          {
+            "games": 2,
+            "p": 0.023
+          },
+          {
+            "games": 3,
+            "p": 0.013
+          },
+          {
+            "games": 4,
+            "p": 0.0078
+          },
+          {
+            "games": 6,
+            "p": 0.0052
+          }
+        ],
+        "ramp": "RAMP_NONE",
+        "hazard": 0.05
+      },
+      "key": "r7-v1:ANKLE_LOW.GRADE_1.NONE|Q",
+      "role": {
+        "dc": 1,
+        "snap": "flat",
+        "tgt": "flat"
+      },
+      "conf": "med",
+      "n": 3,
+      "flags": []
+    },
+    "7002": {
+      "as_of": "2026-09-09T12:00:00Z",
+      "expires_at": "2026-09-12T12:00:00Z",
+      "depth": "standard",
+      "sk": "||",
+      "rubric": "r7-v1",
+      "codes": {
+        "injury_type": "NONE",
+        "severity": "UNKNOWN",
+        "surgery": "NONE",
+        "team_timeline": "UNKNOWN",
+        "practice_pattern": "FP_FP_FP",
+        "designation": "NONE",
+        "days_since_injury": 0
+      },
+      "prog": {
+        "branches": [
+          {
+            "games": 0,
+            "p": 1
+          }
+        ],
+        "ramp": "RAMP_MODERATE",
+        "hazard": 0
+      },
+      "key": "r7-v1:status.NONE|NONE",
+      "role": {
+        "dc": 1,
+        "snap": "flat",
+        "tgt": "flat"
+      },
+      "conf": "high",
+      "n": 2,
+      "flags": []
+    },
+    "8144": {
+      "as_of": "2026-09-09T12:00:00Z",
+      "expires_at": "2026-09-11T12:00:00Z",
+      "depth": "deep",
+      "sk": "Questionable|Hamstring|Strain",
+      "rubric": "r7-v1",
+      "codes": {
+        "injury_type": "HAMSTRING",
+        "severity": "GRADE_2",
+        "surgery": "NONE",
+        "team_timeline": "WEEK_TO_WEEK",
+        "practice_pattern": "DNP_LP_LP",
+        "designation": "Q",
+        "days_since_injury": 5
+      },
+      "prog": {
+        "branches": [
+          {
+            "games": 0,
+            "p": 0.55
+          },
+          {
+            "games": 1,
+            "p": 0.1732
+          },
+          {
+            "games": 2,
+            "p": 0.135
+          },
+          {
+            "games": 3,
+            "p": 0.0675
+          },
+          {
+            "games": 4,
+            "p": 0.045
+          },
+          {
+            "games": 6,
+            "p": 0.0205
+          },
+          {
+            "games": 8,
+            "p": 0.0088
+          }
+        ],
+        "ramp": "RAMP_MODERATE",
+        "hazard": 0.27
+      },
+      "key": "r7-v1:HAMSTRING.GRADE_2.NONE|Q",
+      "role": {
+        "dc": 1,
+        "snap": "flat",
+        "tgt": "flat"
+      },
+      "conf": "med",
+      "n": 3,
+      "flags": []
+    },
+    "9484": {
+      "as_of": "2026-09-09T12:00:00Z",
+      "expires_at": "2026-09-11T12:00:00Z",
+      "depth": "deep",
+      "sk": "Questionable||",
+      "rubric": "r7-v1",
+      "codes": {
+        "injury_type": "NONE",
+        "severity": "UNKNOWN",
+        "surgery": "NONE",
+        "team_timeline": "UNKNOWN",
+        "practice_pattern": "FP_FP_FP",
+        "designation": "NONE",
+        "days_since_injury": 0
+      },
+      "prog": {
+        "branches": [
+          {
+            "games": 1,
+            "p": 0.4
+          }
+        ],
+        "ramp": "RAMP_NONE",
+        "hazard": 0
+      },
+      "key": "r7-v1:status.NONE|NONE",
+      "role": {
+        "dc": 1,
+        "snap": "flat",
+        "tgt": "flat"
+      },
+      "conf": "med",
+      "n": 3,
+      "flags": []
+    },
+    "9500": {
+      "as_of": "2026-09-09T12:00:00Z",
+      "expires_at": "2026-09-11T12:00:00Z",
+      "depth": "deep",
+      "sk": "Questionable|Ankle|Limited",
+      "rubric": "r9-v1",
+      "codes": {
+        "injury_type": "CONCUSSION",
+        "severity": "UNKNOWN",
+        "surgery": "NONE",
+        "team_timeline": "DAY_TO_DAY",
+        "practice_pattern": "DNP_LP_LP",
+        "designation": "Q",
+        "days_since_injury": 4
+      },
+      "prog": {
+        "branches": [
+          {
+            "games": 0,
+            "p": 0.55
+          },
+          {
+            "games": 1,
+            "p": 0.3611
+          },
+          {
+            "games": 2,
+            "p": 0.0743
+          },
+          {
+            "games": 3,
+            "p": 0.0146
+          }
+        ],
+        "ramp": "RAMP_MODERATE",
+        "hazard": 0.15
+      },
+      "key": "r7-v1:CONCUSSION.UNKNOWN.NONE|Q",
+      "role": {
+        "dc": 1,
+        "snap": "flat",
+        "tgt": "flat"
+      },
+      "conf": "med",
+      "n": 3,
+      "flags": []
+    },
+    "11604": {
+      "as_of": "2026-09-09T12:00:00Z",
+      "expires_at": "2026-09-11T12:00:00Z",
+      "depth": "deep",
+      "sk": "Doubtful|Knee - Meniscus|Surgery",
+      "rubric": "r7-v1",
+      "codes": {
+        "injury_type": "MENISCUS",
+        "severity": "UNKNOWN",
+        "surgery": "ARTHROSCOPIC",
+        "side": "LEFT",
+        "recurrence": "FIRST",
+        "team_timeline": "WEEK_TO_WEEK",
+        "reporter_timeline_weeks": [
+          2,
+          4
+        ],
+        "practice_pattern": "DNP_DNP_DNP",
+        "designation": "D",
+        "games_served": 0,
+        "days_since_injury": 2
+      },
+      "prog": {
+        "branches": [
+          {
+            "games": 0,
+            "p": 0.06
+          },
+          {
+            "games": 1,
+            "p": 0.148
+          },
+          {
+            "games": 2,
+            "p": 0.2158
+          },
+          {
+            "games": 3,
+            "p": 0.197
+          },
+          {
+            "games": 4,
+            "p": 0.1806
+          },
+          {
+            "games": 5,
+            "p": 0.0611
+          },
+          {
+            "games": 6,
+            "p": 0.0917
+          },
+          {
+            "games": 8,
+            "p": 0.0458
+          }
+        ],
+        "ramp": "RAMP_SURGICAL",
+        "hazard": 0.1
+      },
+      "key": "r7-v1:MENISCUS.UNKNOWN.ARTHROSCOPIC|D",
+      "role": {
+        "dc": 1,
+        "snap": "flat",
+        "tgt": "flat"
+      },
+      "conf": "med",
+      "n": 3,
+      "flags": [
+        "contradiction"
+      ]
+    }
+  }
+}

@@ -508,13 +508,21 @@ function statusBranches(inj, text) {
 // returned SEASON — a live false positive on the highest-consequence row in the table. Two shapes
 // cover the published examples: a negator that looks FORWARD over the phrase it denies, and a
 // clean-scan word that looks BACK at the part it clears.
-const NEGATE_AHEAD =
-  "\\b(?:avoided|averted|escaped|dodged|ruled\\s+out\\s+an?|no\\s+(?:torn|tear|structural|significant|ligament)|" +
-  "not\\s+(?:torn|broken|a\\s+tear|structural))\\b";
+// A negator that looks FORWARD over the phrase it denies ("avoided a torn ACL").
+const NEGATE_AHEAD = "\\b(?:avoided|averted|escaped|dodged|ruled\\s+out\\s+an?|not\\s+(?:torn|broken|a\\s+tear|structural))\\b";
+// A negated finding that spells out its own extent, so the span is the match and nothing after it
+// — "no ACL damage, but the Achilles is ruptured" must still read the Achilles.
+const NEGATE_SELF =
+  "\\bno\\s+(?:[a-z-]+\\s+){0,2}(?:damage|tear|tears|torn|rupture|ruptured|fracture|fractures|break|breaks|" +
+  "structural|involvement)(?:\\s+(?:to|of|in)\\b)?(?:\\s+the\\b)?(?:\\s+[a-z-]+)?";
+// A clean-scan word that looks BACK at the part it clears ("ACL intact").
 const NEGATE_BEHIND = "\\b(?:intact|clean|negative|unremarkable)\\b";
 /** How far a negator reaches. Long enough for "ruled out a torn ACL", short enough to stay local. */
 const NEGATE_AHEAD_CHARS = 44;
 const NEGATE_BEHIND_CHARS = 30;
+// ...and it stops dead at a contrastive conjunction or a sentence end, because that is where the
+// denial stops: "he avoided surgery BUT tore his ACL" is a torn ACL.
+const CLAUSE_BREAK = /\b(?:but|though|although|however|while)\b|[;.]/g;
 
 /**
  * Character ranges of `text` that a negation covers. Fresh regexes per call — a module-level `/g`
@@ -525,7 +533,16 @@ const NEGATE_BEHIND_CHARS = 30;
 function negatedSpans(text) {
   const spans = [];
   for (const m of text.matchAll(new RegExp(NEGATE_AHEAD, "g"))) {
-    spans.push([m.index, m.index + m[0].length + NEGATE_AHEAD_CHARS]);
+    const from = m.index + m[0].length;
+    let to = from + NEGATE_AHEAD_CHARS;
+    for (const stop of text.slice(from, to).matchAll(new RegExp(CLAUSE_BREAK.source, "g"))) {
+      to = from + stop.index;
+      break;
+    }
+    spans.push([m.index, to]);
+  }
+  for (const m of text.matchAll(new RegExp(NEGATE_SELF, "g"))) {
+    spans.push([m.index, m.index + m[0].length]);
   }
   for (const m of text.matchAll(new RegExp(NEGATE_BEHIND, "g"))) {
     spans.push([Math.max(0, m.index - NEGATE_BEHIND_CHARS), m.index]);
