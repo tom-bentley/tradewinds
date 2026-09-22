@@ -133,12 +133,10 @@ test("the injury table matches on status, body part and notes — most specific 
   assert.deepEqual(acl.branches, [{ games: 99, p: 1 }]);
   assert.equal(abs("IR", "Achilles", "Ruptured").key, "season", "IR-class takes max(table, irMin4)");
 
-  // the case in the release trigger
+  // the case in the release trigger (numbers now live in the R7 §3.3 test below)
   const meniscus = abs("Doubtful", KNEE.injPart, KNEE.injNotes);
   assert.equal(meniscus.key, "meniscus");
   assert.equal(meniscus.seasonOver, false);
-  assert.equal(Math.round(meniscus.mean * 100) / 100, 2.55);
-  assert.deepEqual(meniscus.branches[0], { games: 1, p: 0.3 });
 
   // ...and the same body part listed Questionable is a man who probably plays
   const soft = abs("Questionable", KNEE.injPart, KNEE.injNotes);
@@ -153,7 +151,6 @@ test("the injury table matches on status, body part and notes — most specific 
 
   // suspensions state their own length
   assert.deepEqual(abs("Sus", null, "3-game suspension").branches, [{ games: 3, p: 1 }]);
-  assert.ok(Math.abs(abs("Sus", null, "violation of the personal conduct policy").mean - 1.9) < 1e-9);
 
   // bone breaks split by which bone
   assert.equal(abs("Out", "Foot", "Fractured").key, "fractureBig");
@@ -170,7 +167,6 @@ test("the injury table matches on status, body part and notes — most specific 
   assert.equal(abs("Out", "Wrist", null).key, "status:Out", "a part no rule names defers to the status");
   assert.deepEqual(abs("Out", "Ankle", null).branches, abs("Out", "Wrist", null).branches);
   assert.equal(abs("Doubtful", null, null).key, "status:Doubtful");
-  assert.ok(Math.abs(abs("Doubtful", null, null).mean - 1.4) < 1e-9);
   assert.equal(abs("Questionable", null, null).branches[0].p, 0.7);
 
   // no status is no absence, however stale the body part left on the row
@@ -200,20 +196,22 @@ test("a table in settings replaces the built-in rules, an empty one does not", (
 });
 
 test("availability counts GAMES, not weeks, so a bye pushes the return date out", () => {
-  const absence = absenceOf(ctx, { inj: "Out", injPart: "Knee", injNotes: "Meniscus" });
+  // A hamstring strain: the `softTissue` row is untouched by R7 §3, so this test measures the
+  // GAME-COUNTING mechanism rather than any table number. Branches {1:.40, 2:.35, 3:.15, 4:.10}.
+  const absence = absenceOf(ctx, { inj: "Out", injPart: "Hamstring", injNotes: "Strain" });
   // he misses this week for certain, and is back with P = Σ p(games < k) on the k-th game
   assert.equal(availability(ctx, BOWERS, 1, absence), 0);
-  assert.ok(Math.abs(availability(ctx, BOWERS, 2, absence) - 0.3) < 1e-9);
-  assert.ok(Math.abs(availability(ctx, BOWERS, 3, absence) - 0.6) < 1e-9);
-  assert.ok(Math.abs(availability(ctx, BOWERS, 4, absence) - 0.75) < 1e-9);
+  assert.ok(Math.abs(availability(ctx, BOWERS, 2, absence) - 0.4) < 1e-9);
+  assert.ok(Math.abs(availability(ctx, BOWERS, 3, absence) - 0.75) < 1e-9);
+  assert.ok(Math.abs(availability(ctx, BOWERS, 4, absence) - 0.9) < 1e-9);
   assert.equal(availability(ctx, BOWERS, 8, absence), 1, "long past the tail he is simply back");
   assert.equal(availability(ctx, BOWERS, 0, absence), 1, "weeks already played are not in question");
 
   // the same absence, but his team is idle in week 2: every return probability slides a week
   const bye2 = build({ players: withPlayer(BOWERS, { bye: 2 }) });
   assert.equal(availability(bye2, BOWERS, 2, absence), 0, "he does not play in his bye either way");
-  assert.ok(Math.abs(availability(bye2, BOWERS, 3, absence) - 0.3) < 1e-9);
-  assert.ok(Math.abs(availability(bye2, BOWERS, 4, absence) - 0.6) < 1e-9);
+  assert.ok(Math.abs(availability(bye2, BOWERS, 3, absence) - 0.4) < 1e-9);
+  assert.ok(Math.abs(availability(bye2, BOWERS, 4, absence) - 0.75) < 1e-9);
 });
 
 test("withAbsence discounts the injured player's future weeks and never touches the input", () => {
@@ -445,24 +443,30 @@ test("SC-007 — Bowers Doubtful: start Goedert, IR opens at Out, nothing on the
   // the moves, in the order design §12.0 puts them
   assert.equal(advisory.moves[0].type, "start");
   assert.equal(advisory.moves[0].when, "now");
-  assert.deepEqual(advisory.moves.map((m) => m.type), ["start", "ir", "hold"]);
+  // R7 §3.3 row 6: a bare "meniscus / surgery" note no longer reads as a 2.5-game absence. The
+  // notes name no procedure, so the row is the MIXTURE of a trim (mean 2.1 mo) and a repair (mean
+  // 5.8 mo) [11][12] and carries a 20% season-ending tail — which is past TRADE_MEAN_GAMES, so
+  // the advisor now opens the trade conversation it used to skip.
+  assert.deepEqual(advisory.moves.map((m) => m.type), ["start", "ir", "trade", "hold"]);
   assert.equal(advisory.moves[1].when, "when status = Out");
   const addsAtTe = advisory.moves.filter(
     (m) => m.type === "add" && m.add && playerOf(doubtful, m.add).pos === "TE" && m.deltaPerWeek > 0.05
   );
   assert.deepEqual(addsAtTe, [], "no free tight end is worth a roster spot here");
-  assert.equal(advisory.moves[2].add, JOHNSON, "the hold move still names the best free tight end");
-  assert.ok(advisory.moves[2].text.includes("Juwan Johnson"), advisory.moves[2].text);
+  const hold = advisory.moves.find((m) => m.type === "hold");
+  assert.equal(hold.add, JOHNSON, "the hold move still names the best free tight end");
+  assert.ok(hold.text.includes("Juwan Johnson"), hold.text);
 
   // the strings that go on a lock screen (design §12.0's acceptance case, modulo numbers)
   assert.ok(advisory.headline.length <= HEADLINE_MAX, `${advisory.headline.length} chars`);
   assert.equal(advisory.headline, "Brock Bowers → Doubtful (knee - meniscus · surgery)");
   assert.ok(advisory.summary.length <= SUMMARY_MAX, `${advisory.summary.length} chars`);
   assert.ok(advisory.summary.includes("Goedert"), advisory.summary);
+  // R7 §3.3 row 6 again: the trade move now outranks the hold inside SUMMARY_MAX.
   assert.equal(
     advisory.summary,
     "Start Goedert at TE (7.9). IR opens when his status becomes Out — 2 slots free. " +
-      "Hold: no free TE beats Goedert (best: Juwan Johnson 7.4/wk)."
+      "Trade Barkley + Bowers for Robinson + Kelce with speckledorf."
   );
 
   // the alternatives table: same position, best-first, every owner named

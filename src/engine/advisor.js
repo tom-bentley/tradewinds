@@ -33,7 +33,8 @@ import {
   waiverStatus,
 } from "./waiver.js";
 import { fmt1, nameOf, sideNames, voice } from "./explain.js";
-import { absenceOf, withAbsence } from "./injuries.js";
+import { absenceOf, statusKeyOf, withAbsence } from "./injuries.js";
+import { dossierPrognosis } from "./prognosis.js";
 
 /** Push bodies are read on a lock screen: three moves, one line each, hard-capped. */
 export const SUMMARY_MAX = 170;
@@ -194,8 +195,28 @@ export function applyWeekPoints(ctx, rows) {
  * @returns {string} `${inj}|${injPart}|${injNotes}`
  */
 export function statusKey(row) {
-  const s = normStatus(row);
-  return `${s.inj || ""}|${s.injPart || ""}|${s.injNotes || ""}`;
+  // The formula itself lives in injuries.js, because the dossier freshness gate there has to ask
+  // the same question ("has the status moved since the desk wrote this?") and the two must never
+  // drift apart (004 §2.4, R11 §Q11.3).
+  return statusKeyOf(normStatus(row));
+}
+
+/**
+ * Where the "how long is he out" estimate came from, in the advisor's voice (004 §2.4).
+ *
+ * Empty string when the table answered and no dossier was involved — which is the ordinary case,
+ * and is what keeps a repo with no `data/dossiers.json` reading exactly as 0.4.x did.
+ * @param {{source?:string, stale?:boolean, reason?:string, asOf?:string|null}} prognosis
+ * @returns {string}
+ */
+export function absenceNoteOf(prognosis) {
+  if (!prognosis) return "";
+  if (prognosis.source === "dossier") {
+    const at = prognosis.asOf ? ` (as of ${String(prognosis.asOf).slice(0, 10)})` : "";
+    return `How long he is out is per dossier${at}.`;
+  }
+  if (prognosis.stale && prognosis.reason) return `Table estimate — ${prognosis.reason}.`;
+  return "";
 }
 
 /** The inverse of `statusKey` — notes may themselves contain a pipe, so only the first two split. */
@@ -563,7 +584,11 @@ export function advise(ctx, opts = {}) {
       ...(event.newsAt !== undefined ? { newsAt: event.newsAt } : {}),
     },
   ]);
-  const absence = absenceOf(applied, after);
+  // `after` is a bare status row; the dossier gate is keyed on the player, so it travels with it.
+  const afterRow = { ...after, id };
+  const absence = absenceOf(applied, afterRow);
+  const prognosis = dossierPrognosis(applied, id, afterRow);
+  const absenceNote = absenceNoteOf(prognosis);
   const scen = withAbsence(applied, id, absence);
   // The world before the news. A ctx handed to us by the app already carries the new status, so
   // "what did this cost" is only answerable against a context rewound to `event.before`.
@@ -661,7 +686,7 @@ export function advise(ctx, opts = {}) {
     if (absence.mean >= TRADE_MEAN_GAMES && hole >= TRADE_HOLE_PER_WEEK) {
       const deals = findTrades(scen, { myRosterId: rosterId, maxResults: 3 });
       const wanted = deals.find((d) => d.get.some((gid) => playerOf(scen, gid).pos === pos)) || deals[0] || null;
-      if (wanted) moves.push(tradeMove(scen, wanted));
+      if (wanted) moves.push(tradeMove(scen, wanted, absenceNote));
     }
 
     // 8 — nothing on the wire beats what is already here: say so, with the number that proves it
@@ -681,7 +706,12 @@ export function advise(ctx, opts = {}) {
           incumbent
             ? `Hold: no free ${pos} beats ${shortName(nameOf(scen, incumbent), pos)}${tail}.`
             : `Hold: nothing on the wire at ${pos} is worth a roster spot${tail}.`,
-          { why: [`Every free ${pos} grades below what ${v.aPossLower} roster already holds.`], add: bestFree }
+          {
+            why: [`Every free ${pos} grades below what ${v.aPossLower} roster already holds.`].concat(
+              absenceNote ? [absenceNote] : []
+            ),
+            add: bestFree,
+          }
         )
       );
     }
@@ -690,7 +720,7 @@ export function advise(ctx, opts = {}) {
     const lostStarter = !!(thisWeek && thisWeek.started && thisWeek.now <= 0);
     if (lostStarter && owner != null) {
       const deals = findTrades(scen, { myRosterId: rosterId, maxResults: 3 }).filter((d) => d.theirRosterId === owner);
-      if (deals[0]) moves.push(tradeMove(scen, deals[0]));
+      if (deals[0]) moves.push(tradeMove(scen, deals[0], absenceNote));
     }
     if (!moves.length) {
       const team = roster ? roster.teamName || roster.displayName : "Another team";
@@ -719,6 +749,8 @@ export function advise(ctx, opts = {}) {
     newsAt,
     severity,
     absence,
+    prognosis,
+    absenceNote,
     thisWeek,
     ir,
     moves,
@@ -730,12 +762,12 @@ export function advise(ctx, opts = {}) {
 }
 
 /** One finder candidate, phrased as a move. */
-function tradeMove(ctx, deal) {
+function tradeMove(ctx, deal, absenceNote) {
   const get = deal.get.map((gid) => shortName(nameOf(ctx, gid), playerOf(ctx, gid).pos)).join(" + ");
   const give = deal.give.map((gid) => shortName(nameOf(ctx, gid), playerOf(ctx, gid).pos)).join(" + ");
   const team = rosterById(ctx, deal.theirRosterId);
   return move("trade", `Trade ${give} for ${get} with ${team ? team.displayName || team.teamName : "a rival"}.`, {
-    why: deal.why || [],
+    why: absenceNote ? [absenceNote].concat(deal.why || []) : deal.why || [],
     deltaPerWeek: deal.myDeltaPerWeek,
     valueDelta: deal.myEdgePct,
     add: deal.get[0] || null,

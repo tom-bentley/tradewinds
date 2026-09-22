@@ -257,6 +257,18 @@ export const DEFAULTS = Object.freeze({
     xfp: Object.freeze({ tgt: 0.44, rzTgt: 2.49, carry: 0.5, rzCarry: 1.5 }),
     synergy: Object.freeze({ handcuffPerWeek: 0.35, handcuffCap: 1.0, stackCeiling: 1.8, stackFloor: 1.6 }),
   }),
+
+  // --- Research dossiers (004 §2.4, src/engine/prognosis.js) ----------------------------------
+  // `data/dossiers.json` is desk-written and optional: with no file the engine behaves exactly as
+  // 0.4.x. `rubric` is the code→number mapping the engine will honour — a slice row written under
+  // any other rubric is ignored rather than mis-read (R11 §Q11.3 "Versioning"). `ttlHours` is the
+  // defence-in-depth copy of validator rule 2: a row whose own `expires_at - as_of` exceeds its
+  // depth's TTL was written by something that did not follow the contract, so it is not trusted.
+  dossier: Object.freeze({
+    enabled: true,
+    ttlHours: Object.freeze({ deep: 48, standard: 72, quick: 168 }),
+    rubric: "r7-v1",
+  }),
 });
 
 export const SLEEPER = Object.freeze({
