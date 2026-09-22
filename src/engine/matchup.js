@@ -254,6 +254,24 @@ export function streamingFactor(ctx, id, week) {
   return { f, z: { imp: zImpK, wind: windTerm, indoor }, conf: windKnown ? "high" : "low", indoorPts };
 }
 
+/**
+ * Cross-position calibration multiplier (design §3.4, R8 §2.9/§5.3): a measured 2025 bias between
+ * Sleeper's `pts_half_ppr` projection field and points recomputed from the same stat line the way
+ * Tradewinds scores. OFF by default (`DEFAULTS.calibration.enabled = false`) — it is one season of
+ * evidence, and it matters only for CROSS-position comparisons (FLEX), never same-position ordering
+ * (R8 §5.3). Not wired into any consumer this release; a future FLEX-comparison caller multiplies a
+ * projected total by this. Returns 1 (no-op) when disabled or for a position with no measured value.
+ * @param {object} ctx
+ * @param {string} pos
+ * @returns {number}
+ */
+export function calibrationFactor(ctx, pos) {
+  const cfg = cfgBlock(ctx, "calibration");
+  if (cfg.enabled === false) return 1;
+  const v = cfg[pos];
+  return Number.isFinite(v) ? v : 1;
+}
+
 // ---------------------------------------------------------------------------------------------
 // matchupGrade / matchupFlags — display layer (R8 §5.5)
 // ---------------------------------------------------------------------------------------------
