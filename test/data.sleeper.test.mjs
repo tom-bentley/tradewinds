@@ -7,11 +7,13 @@ import {
   fantasyCalcUrl,
   getFantasyCalc,
   getLeague,
+  getMatchups,
   getRosters,
   getState,
   getTrending,
   getUser,
   getUserLeagues,
+  getWinnersBracket,
   withCacheBuster,
 } from "../src/sleeper.js";
 import { fixture, hangs, jsonResponse, makeFetchMock, networkError } from "./shims/fetch-mock.mjs";
@@ -138,4 +140,73 @@ test("user + league lookup endpoints are shaped for the Settings tab", async () 
   assert.equal(user.user_id, "1394551386997272576");
   assert.equal(leagues[0].league_id, LEAGUE);
   assert.match(fetchMock.calls[1].url, /\/v1\/user\/1394551386997272576\/leagues\/nfl\/2026\?cb=\d+$/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// 004 §2.7 — the season map's two reads (R9 §Q9.2, fixtures pulled live 2026-09-22)
+// ---------------------------------------------------------------------------------------------
+
+const MATCHUPS = fixture("matchups_2026_w3-17.json");
+const BRACKET = fixture("winners_bracket_2026.json");
+
+test("getMatchups reads one scoring period, cache-busted, and Sleeper serves FUTURE weeks", async () => {
+  const fetchMock = makeFetchMock([
+    {
+      match: "/matchups/",
+      respond: ({ url }) => MATCHUPS.weeks[String(url.match(/\/matchups\/(\d+)/)[1])],
+    },
+  ]);
+
+  const wk3 = await getMatchups(LEAGUE, 3, fast(fetchMock));
+  const wk17 = await getMatchups(LEAGUE, 17, fast(fetchMock));
+
+  assert.equal(wk3.length, 8, "one row per roster");
+  assert.equal(wk17.length, 8, "week 17 exists today — this is what makes a season map possible");
+  for (const row of [...wk3, ...wk17]) {
+    assert.ok(Number.isFinite(row.matchup_id), "every row carries the pairing key");
+    assert.ok(Number.isFinite(row.roster_id));
+  }
+  // Four distinct matchup ids = four games in an 8-team league.
+  assert.equal(new Set(wk3.map((r) => r.matchup_id)).size, 4);
+  assert.ok(fetchMock.calls[0].url.startsWith(`https://api.sleeper.app/v1/league/${LEAGUE}/matchups/3?cb=`));
+  assert.match(fetchMock.calls[0].url, /\/matchups\/3\?cb=\d+$/);
+  assert.equal(fetchMock.calls[0].cache, "no-store");
+});
+
+test("a future week's starters are the CURRENT roster echoed forward — read matchup_id only", () => {
+  // R9 §Q9.2 Finding 1: weeks 8 and 14 are byte-identical because Sleeper echoes today's lineup
+  // into every unplayed week. The pairing is real; the lineup is not.
+  const wk8 = MATCHUPS.weeks["8"].find((r) => r.roster_id === 3);
+  const wk14 = MATCHUPS.weeks["14"].find((r) => r.roster_id === 3);
+  assert.deepEqual(wk8.starters, wk14.starters, "echoed forward, so never trust it");
+  // `matchup_id` is only a within-week group index (1-4 here), so it can repeat across weeks; the
+  // OPPONENT it resolves to is what genuinely differs, and that is the whole schedule.
+  const foe = (week) =>
+    MATCHUPS.weeks[week].find((r) => r.roster_id !== 3 && r.matchup_id === MATCHUPS.weeks[week].find((x) => x.roster_id === 3).matchup_id).roster_id;
+  assert.notEqual(foe("8"), foe("14"), "week 8 and week 14 are different rivals");
+  for (const row of MATCHUPS.weeks["14"]) assert.equal(row.points, 0, "no future week is scored");
+});
+
+test("getWinnersBracket returns the provisional bracket graph", async () => {
+  const fetchMock = makeFetchMock([{ match: "/winners_bracket", respond: BRACKET.rows }]);
+
+  const rows = await getWinnersBracket(LEAGUE, fast(fetchMock));
+
+  assert.equal(rows.length, 7, "2 first-round games + 2 semis + 3 placement games");
+  for (const row of rows) {
+    assert.ok(Number.isFinite(row.m) && Number.isFinite(row.r));
+    assert.equal(row.w, null, "unplayed — which is exactly why it is provisional");
+  }
+  // Six teams qualify: four seeded into round 1, two byes named directly in round 2.
+  const entrants = new Set();
+  for (const row of rows) for (const t of [row.t1, row.t2]) if (t != null) entrants.add(t);
+  assert.equal(entrants.size, 6);
+  assert.ok(fetchMock.calls[0].url.startsWith(`https://api.sleeper.app/v1/league/${LEAGUE}/winners_bracket?cb=`));
+  assert.match(fetchMock.calls[0].url, /\/winners_bracket\?cb=\d+$/);
+  assert.equal(fetchMock.calls[0].cache, "no-store");
+});
+
+test("a league with no bracket yet answers [] rather than throwing", async () => {
+  const fetchMock = makeFetchMock([{ match: "/winners_bracket", respond: [] }]);
+  assert.deepEqual(await getWinnersBracket(LEAGUE, fast(fetchMock)), []);
 });

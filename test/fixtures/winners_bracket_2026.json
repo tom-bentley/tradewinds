@@ -1,0 +1,91 @@
+{
+  "league_id": "1394476745138147328",
+  "season": "2026",
+  "pulled_at": "2026-09-22T16:35:53.219Z",
+  "source": "sleeper:/v1/league/{id}/winners_bracket",
+  "rows": [
+    {
+      "m": 1,
+      "r": 1,
+      "l": null,
+      "w": null,
+      "t1": 4,
+      "t2": 7
+    },
+    {
+      "m": 2,
+      "r": 1,
+      "l": null,
+      "w": null,
+      "t1": 8,
+      "t2": 5
+    },
+    {
+      "m": 3,
+      "r": 2,
+      "l": null,
+      "w": null,
+      "t1": 2,
+      "t2": null,
+      "t2_from": {
+        "w": 1
+      }
+    },
+    {
+      "m": 4,
+      "r": 2,
+      "l": null,
+      "w": null,
+      "t1": 3,
+      "t2": null,
+      "t2_from": {
+        "w": 2
+      }
+    },
+    {
+      "p": 5,
+      "m": 5,
+      "r": 2,
+      "l": null,
+      "w": null,
+      "t1": null,
+      "t2": null,
+      "t2_from": {
+        "l": 2
+      },
+      "t1_from": {
+        "l": 1
+      }
+    },
+    {
+      "p": 1,
+      "m": 6,
+      "r": 3,
+      "l": null,
+      "w": null,
+      "t1": null,
+      "t2": null,
+      "t2_from": {
+        "w": 4
+      },
+      "t1_from": {
+        "w": 3
+      }
+    },
+    {
+      "p": 3,
+      "m": 7,
+      "r": 3,
+      "l": null,
+      "w": null,
+      "t1": null,
+      "t2": null,
+      "t2_from": {
+        "l": 4
+      },
+      "t1_from": {
+        "l": 3
+      }
+    }
+  ]
+}

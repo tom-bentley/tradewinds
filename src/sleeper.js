@@ -174,6 +174,39 @@ export function getTransactions(leagueId, round, options) {
 }
 
 /**
+ * One scoring period's matchup rows — the season map's opponent schedule (004 design §2.7, R9
+ * §Q9.2). Sleeper serves FUTURE weeks too: every row carries a real `matchup_id` (pairs of rows
+ * share one), while `starters`, `players`, `points` and `starters_points` are the CURRENT roster
+ * echoed forward and are worthless past `state.week`. `buildSchedule` (engine/seasonmap.js) reads
+ * `matchup_id` and nothing else for a future week; the cache-buster matters because the pairing
+ * changes the moment a commissioner edits the schedule.
+ * @param {string} leagueId
+ * @param {number} week 1-based scoring period
+ * @param {RequestOptions} [options]
+ * @returns {Promise<object[]>} one row per roster, or [] for a week the league has not scheduled
+ */
+export function getMatchups(leagueId, week, options) {
+  return requestJson(`${SLEEPER.v1}/league/${leagueId}/matchups/${week}`, options);
+}
+
+/**
+ * The league's playoff bracket (004 design §2.7, R9 §Q9.2 Finding 4). Rows are
+ * `{ m, r, t1, t2, t1_from, t2_from, w, l, p }`: `m` match id, `r` round (1 = the first playoff
+ * week), `t1`/`t2` ROSTER ids, `t1_from`/`t2_from` `{w: m}` winner-of / `{l: m}` loser-of, `p` a
+ * placement game, `w`/`l` the resolved winner/loser.
+ *
+ * Before the playoffs Sleeper fills the seeds from the standings as they stand today, so this is
+ * a PROVISIONAL projection, never a schedule — `buildSchedule` stamps it `provisional` with the
+ * week it was read in, and the season map must label weeks 15-17 accordingly.
+ * @param {string} leagueId
+ * @param {RequestOptions} [options]
+ * @returns {Promise<object[]>} raw bracket rows, or [] when the league has no bracket yet
+ */
+export function getWinnersBracket(leagueId, options) {
+  return requestJson(`${SLEEPER.v1}/league/${leagueId}/winners_bracket`, options);
+}
+
+/**
  * One player's live Sleeper row — the only endpoint that carries a FRESH injury status without
  * downloading the 15 MB player dump (design §12.1; verified live 2026-09-10: 200, ~1.2 KB,
  * carrying `injury_status`, `injury_body_part`, `injury_notes`, `news_updated` and
