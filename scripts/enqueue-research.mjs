@@ -45,10 +45,13 @@ export function parseResearchPayload(raw) {
   };
 }
 
-const request = parseResearchPayload(process.env.RESEARCH_PAYLOAD);
-if (!request) {
-  process.stdout.write("research: no usable client_payload — nothing queued\n");
-} else {
+/** Append the row RESEARCH_PAYLOAD describes. Split from the parser so tests can import it. */
+export function main() {
+  const request = parseResearchPayload(process.env.RESEARCH_PAYLOAD);
+  if (!request) {
+    process.stdout.write("research: no usable client_payload — nothing queued\n");
+    return;
+  }
   const result = enqueueAll(QUEUE_FILE, [
     {
       player_id: request.id,
@@ -67,3 +70,6 @@ if (!request) {
     process.stdout.write(`research: queued ${request.id} ${request.depth} (${result.bytes} B)\n`);
   }
 }
+
+// Importing this file (the tests do) must never write to data/.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) main();
