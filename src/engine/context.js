@@ -401,6 +401,13 @@ export function buildContext(input, settings) {
   const tradeDeadlineWeek =
     Number.isFinite(rawDeadline) && rawDeadline > 0 && rawDeadline < NO_DEADLINE ? rawDeadline : 0;
 
+  // 004 design §3.1 — usage lines, per-game context, defense-vs-position. Each builder collapses a
+  // missing or malformed file to empty collections, so a 0.4-era data set yields the same ctx as
+  // before plus empty Maps.
+  const statsBlock = buildStats(input.stats);
+  const gamesBlock = buildGames(input.games, input.schedule);
+  const dvpBlock = buildDvp(input.dvp);
+
   return {
     league: {
       id: league.league_id || merged.leagueId || null,
@@ -464,6 +471,18 @@ export function buildContext(input, settings) {
     // Last season's and this season's ACTUALS, keyed by player (§13.6 F1). Optional: a data layer
     // that could not load `history.json` passes nothing and every reader sees an empty Map.
     history: buildHistory(input.history),
+    // 004 design §3.1 — the player-intelligence inputs. All OPTIONAL: readers get empty Maps/Sets
+    // and must never throw. `dossiers` holds raw slice rows; precedence lives in prognosis.js.
+    stats: statsBlock.stats,
+    statKeys: statsBlock.keys,
+    statWeeks: statsBlock.weeks,
+    statsPartial: statsBlock.partial,
+    teamStats: statsBlock.teams,
+    games: gamesBlock.games,
+    gameOf: gamesBlock.gameOf,
+    dvp: dvpBlock.teams,
+    dvpWeeks: dvpBlock.weeks,
+    dossiers: buildDossiers(input.dossiers),
     // Injected wall clock (ms). The engine never reads the clock itself — the caller owns it, so
     // every waiver window is reproducible in a test. null = no clock, nothing is on waivers.
     now: resolveNow(merged.now, input.now),
@@ -513,6 +532,179 @@ export function buildHistory(history) {
     }
   }
   return out;
+}
+
+/**
+ * @typedef {{weeks:number[], rows:Array<number[]|null>, std:number[]|null}} StatsRow
+ *   one player's usage lines (004 design §2.1): `rows[i]` is the dense vector for `weeks[i]`,
+ *   indexed like `ctx.statKeys`, or null when he had no game; `std` = season-to-date sums.
+ */
+
+/**
+ * `data/stats.json` (004 design §2.1) → decoded usage lines. The file ships projections-v2 style
+ * `[keyIdx, value, …]` pair lists (scalar 0 = no game) and the engine wants dense vectors it can
+ * index by key. OPTIONAL input: anything missing or malformed collapses to empty collections.
+ * @param {object} [stats] the parsed file
+ * @returns {{stats:Map<string, StatsRow>, keys:string[], weeks:number[], partial:Set<number>,
+ *   teams:Map<string, {tgt:number, snp:number, att:number, rush:number}>}} `teams` key = `${team}|${week}`
+ */
+export function buildStats(stats) {
+  const empty = { stats: new Map(), keys: [], weeks: [], partial: new Set(), teams: new Map() };
+  if (!stats || typeof stats !== "object" || Number(stats.version) !== 1) return empty;
+  const keys = Array.isArray(stats.keys) ? stats.keys.map(String) : null;
+  const weeks = Array.isArray(stats.weeks)
+    ? stats.weeks.map(Number).filter((w) => Number.isInteger(w) && w > 0)
+    : null;
+  const rows = stats.players && typeof stats.players === "object" ? stats.players : null;
+  if (!keys || !weeks || !rows) return empty;
+  const decode = (entry) => {
+    if (!Array.isArray(entry)) return null;
+    const vec = new Array(keys.length).fill(0);
+    for (let i = 0; i + 1 < entry.length; i += 2) {
+      const k = entry[i];
+      if (Number.isInteger(k) && k >= 0 && k < keys.length) vec[k] = Number(entry[i + 1]) || 0;
+    }
+    return vec;
+  };
+  const out = new Map();
+  const stdRows = stats.std && typeof stats.std === "object" ? stats.std : {};
+  for (const [id, list] of Object.entries(rows)) {
+    if (!Array.isArray(list)) continue;
+    const decoded = weeks.map((_, i) => decode(list[i]));
+    if (!decoded.some(Boolean)) continue;
+    out.set(String(id), { weeks, rows: decoded, std: decode(stdRows[id]) });
+  }
+  const partial = new Set(
+    (Array.isArray(stats.partial) ? stats.partial : []).map(Number).filter((w) => Number.isInteger(w)),
+  );
+  const teams = new Map();
+  const byTeam = stats.teams && typeof stats.teams === "object" ? stats.teams : {};
+  for (const [team, byWeek] of Object.entries(byTeam)) {
+    if (!byWeek || typeof byWeek !== "object") continue;
+    for (const [w, t] of Object.entries(byWeek)) {
+      if (!t || typeof t !== "object") continue;
+      teams.set(`${String(team).toUpperCase()}|${Number(w)}`, {
+        tgt: Number(t.tgt) || 0,
+        snp: Number(t.snp) || 0,
+        att: Number(t.att) || 0,
+        rush: Number(t.rush) || 0,
+      });
+    }
+  }
+  return { stats: out, keys, weeks, partial, teams };
+}
+
+/**
+ * `data/games.json` (004 design §2.2) → per-game context, indexed by team and week. The schedule's
+ * own game list — validated by the pipeline for a year and never read by the engine — is threaded
+ * first, so `gameOf` knows the opponent and home/away even when games.json is absent; a games.json
+ * row for the same team-week merges onto it (odds, roof, wind, kickoff). OPTIONAL in every direction.
+ * @param {object} [games] parsed games.json
+ * @param {object} [schedule] parsed schedule.json
+ * @returns {{games:Map<string, object>, gameOf:Map<string, string>}} `gameOf` key = `${team}|${week}`
+ */
+export function buildGames(games, schedule) {
+  const out = new Map();
+  const gameOf = new Map();
+  const team = (v) => (v == null || v === "" ? null : String(v).toUpperCase());
+  const put = (g) => {
+    if (!g || typeof g !== "object") return;
+    const week = Number(g.week ?? g.w);
+    const home = team(g.home ?? g.home_team);
+    const away = team(g.away ?? g.away_team);
+    if (!Number.isInteger(week) || week <= 0 || !home || !away) return;
+    const key = `${home}|${week}`;
+    const existing = gameOf.get(key);
+    const id = String(g.id || g.game_id || existing || `${week}|${away}@${home}`);
+    const prev = existing ? out.get(existing) || {} : {};
+    if (existing && existing !== id) out.delete(existing);
+    out.set(id, { ...prev, ...g, id, week, home, away });
+    gameOf.set(key, id);
+    gameOf.set(`${away}|${week}`, id);
+  };
+  const sched = schedule && Array.isArray(schedule.games) ? schedule.games : [];
+  for (const g of sched) put(g);
+  const list =
+    games && typeof games === "object" && Number(games.version) === 1 && Array.isArray(games.games)
+      ? games.games
+      : [];
+  for (const g of list) put(g);
+  return { games: out, gameOf };
+}
+
+/**
+ * `data/dvp.json` (004 design §2.3) → defense-vs-position in the league's half-PPR basis, per team.
+ * OPTIONAL: missing or malformed → empty Map.
+ * @param {object} [dvp] the parsed file
+ * @returns {{teams:Map<string, {gp:number, allowed:Object<string, Array<number|null>>,
+ *   std:Object<string, number>, pprRef:Object<string, number>|null}>, weeks:number[]}}
+ */
+export function buildDvp(dvp) {
+  const out = new Map();
+  if (!dvp || typeof dvp !== "object" || Number(dvp.version) !== 1) return { teams: out, weeks: [] };
+  const weeks = Array.isArray(dvp.weeks)
+    ? dvp.weeks.map(Number).filter((w) => Number.isInteger(w) && w > 0)
+    : [];
+  const teams = dvp.teams && typeof dvp.teams === "object" ? dvp.teams : {};
+  for (const [team, row] of Object.entries(teams)) {
+    if (!row || typeof row !== "object") continue;
+    const allowed = {};
+    for (const [pos, arr] of Object.entries(row.allowed || {})) {
+      if (Array.isArray(arr)) allowed[pos] = arr.map((v) => (v == null ? null : Number(v) || 0));
+    }
+    const std = {};
+    for (const [pos, v] of Object.entries(row.std || {})) std[pos] = Number(v) || 0;
+    out.set(String(team).toUpperCase(), {
+      gp: Number(row.gp) || 0,
+      allowed,
+      std,
+      pprRef: row.ppr_ref && typeof row.ppr_ref === "object" ? row.ppr_ref : null,
+    });
+  }
+  return { teams: out, weeks };
+}
+
+/**
+ * `data/dossiers.json` (004 design §2.4) → the engine slice, raw rows keyed by player id. Whether a
+ * row may be USED (rubric known, not expired, statusKey still current) is prognosis.js's decision;
+ * this builder only guarantees shape. OPTIONAL: missing or malformed → empty Map.
+ * @param {object} [dossiers] the parsed file
+ * @returns {Map<string, object>}
+ */
+export function buildDossiers(dossiers) {
+  const out = new Map();
+  if (!dossiers || typeof dossiers !== "object" || Number(dossiers.v) !== 1) return out;
+  const rows = dossiers.players && typeof dossiers.players === "object" ? dossiers.players : {};
+  for (const [id, row] of Object.entries(rows)) {
+    if (!row || typeof row !== "object") continue;
+    out.set(String(id), { ...row, rubric: row.rubric || dossiers.rubric || null });
+  }
+  return out;
+}
+
+/**
+ * One player's decoded usage lines, or null when stats are absent or do not list him.
+ * @param {object} ctx
+ * @param {string} id
+ * @returns {StatsRow|null}
+ */
+export function statsRow(ctx, id) {
+  const stats = ctx && ctx.stats;
+  return (stats && stats.get(id)) || null;
+}
+
+/**
+ * The game `team` plays in `week`, or null (bye, unknown team, no schedule loaded).
+ * @param {object} ctx
+ * @param {string} team
+ * @param {number} week
+ * @returns {object|null}
+ */
+export function gameFor(ctx, team, week) {
+  const index = ctx && ctx.gameOf;
+  if (!index || !team) return null;
+  const id = index.get(`${String(team).toUpperCase()}|${Number(week)}`);
+  return (id && ctx.games && ctx.games.get(id)) || null;
 }
 
 /**

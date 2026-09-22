@@ -97,7 +97,15 @@ export const ADVISOR_FILE = "advisor.json";
  * malformed is the ORDINARY case, not an error: the engine simply gets `null` and does without.
  * `history.json` is only as old as the last cron run that managed to build it.
  */
-export const OPTIONAL_PIPELINE_FILES = Object.freeze(["history.json"]);
+export const OPTIONAL_PIPELINE_FILES = Object.freeze([
+  "history.json",
+  // 004 design §2.1–§2.3 — usage lines, per-game context, defense-vs-position. Pipeline-built and
+  // meta-stamped like history.json; the engine gets `null` and does without when any is missing.
+  // (`dossiers.json` is desk-written and NOT meta-stamped, so it has its own loader, like advisor.json.)
+  "stats.json",
+  "games.json",
+  "dvp.json",
+]);
 
 /**
  * The heavy four plus the optional extras. `meta.json` is fetched first and decides whether any
@@ -335,6 +343,10 @@ async function fetchDataFile(file, fetchImpl) {
 function isUsableOptionalFile(file, payload) {
   if (!isPlainObject(payload)) return false;
   if (file === "history.json") return payload.version === 1 && isPlainObject(payload.seasons);
+  // 004 design §2 — shape checks keep a cached GitHub Pages 404 page from ever reaching the engine.
+  if (file === "stats.json") return payload.version === 1 && Array.isArray(payload.keys) && isPlainObject(payload.players);
+  if (file === "games.json") return payload.version === 1 && Array.isArray(payload.games);
+  if (file === "dvp.json") return payload.version === 1 && isPlainObject(payload.teams);
   return true;
 }
 
@@ -797,6 +809,14 @@ export async function loadAll(options = {}) {
       // in every direction — `null` whenever the pipeline has not published a usable file, and
       // `buildContext` turns it into an empty `ctx.history` Map (§13.4 C1).
       history: isPlainObject(files["history.json"]) ? files["history.json"] : null,
+      // 004 design §2.1–§2.4: usage lines, game context, defense-vs-position and desk dossiers.
+      // Optional in every direction, exactly like history.json; `buildContext` collapses each to an
+      // empty Map. `dossiers` is filled by the dedicated loader once it ships (design §2.4) — until
+      // then it is null here on purpose.
+      stats: isPlainObject(files["stats.json"]) ? files["stats.json"] : null,
+      games: isPlainObject(files["games.json"]) ? files["games.json"] : null,
+      dvp: isPlainObject(files["dvp.json"]) ? files["dvp.json"] : null,
+      dossiers: null,
       // Design §11.2: the engine never calls Date.now(), so the clock is an input. Both keys are
       // optional on the engine side — nothing breaks if buildContext ignores them.
       trending,

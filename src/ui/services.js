@@ -153,6 +153,16 @@ async function loadLive() {
     optional("../engine/risk.js"),
   ]);
 
+  // 004 (design §3) — the player-intelligence modules, shipped by parallel workstreams. An absent
+  // module falls through to the `decorate()` stand-in that answers "not available" without throwing.
+  const [usage, prognosis, matchup, seasonmap, hidden] = await Promise.all([
+    optional("../engine/usage.js"),
+    optional("../engine/prognosis.js"),
+    optional("../engine/matchup.js"),
+    optional("../engine/seasonmap.js"),
+    optional("../engine/hidden.js"),
+  ]);
+
   return {
     mode: "live",
 
@@ -168,6 +178,25 @@ async function loadLive() {
     consensusGaps: (risk && risk.consensusGaps) || null,
     durabilityOf: (risk && risk.durabilityOf) || null,
     historyOf: (risk && risk.historyOf) || null,
+
+    // ---- 004 player intelligence (design §3) ----------------------------------------------
+    // usage.js shares/trends, prognosis.js dossier-first absence, matchup.js K/DEF streaming +
+    // grades, seasonmap.js week cards, hidden.js acquire/sell lists; sleeper.js gains the league
+    // schedule reads. `requestResearch` is wired at integration (push.js dispatch + queue contract).
+    usageOf: (usage && usage.usageOf) || null,
+    dossierPrognosis: (prognosis && prognosis.dossierPrognosis) || null,
+    prognose: (prognosis && prognosis.prognose) || null,
+    streamingFactor: (matchup && matchup.streamingFactor) || null,
+    matchupGrade: (matchup && matchup.matchupGrade) || null,
+    oppFactor: (matchup && matchup.oppFactor) || null,
+    seasonMap: (seasonmap && seasonmap.seasonMap) || null,
+    hiddenValue: (hidden && hidden.hiddenValue) || null,
+    acquireList: (hidden && hidden.acquireList) || null,
+    sellList: (hidden && hidden.sellList) || null,
+    synergyScore: (hidden && hidden.synergyScore) || null,
+    getMatchups: (sleeper && sleeper.getMatchups) || null,
+    getWinnersBracket: (sleeper && sleeper.getWinnersBracket) || null,
+    requestResearch: null,
 
     // ---- src/engine/waiver.js (§11.2) -------------------------------------------------
     // waiver.js `freeAgentPool` is a FLAT id array; the stand-in finder wants them grouped, so
@@ -873,6 +902,25 @@ export function decorate(api) {
   if (!has("storedToken")) api.storedToken = storedTokenLocal;
   if (!has("saveToken")) api.saveToken = saveTokenLocal;
   if (!has("maskToken")) api.maskToken = maskTokenLocal;
+
+  // 004 (design §3) — the player-intelligence seam. Every stand-in answers "not available", so a
+  // build without the new engine modules renders the 0.4 surfaces unchanged; real exports win.
+  if (!has("usageOf")) api.usageOf = () => null;
+  if (!has("dossierPrognosis")) api.dossierPrognosis = () => null;
+  if (!has("prognose")) api.prognose = () => null;
+  if (!has("streamingFactor")) api.streamingFactor = () => ({ f: 1, z: null, conf: "none" });
+  if (!has("matchupGrade")) api.matchupGrade = () => null;
+  if (!has("oppFactor")) api.oppFactor = () => null;
+  if (!has("seasonMap")) api.seasonMap = () => null;
+  if (!has("hiddenValue")) api.hiddenValue = () => null;
+  if (!has("acquireList")) api.acquireList = () => [];
+  if (!has("sellList")) api.sellList = () => [];
+  if (!has("synergyScore")) api.synergyScore = () => null;
+  if (!has("getMatchups")) api.getMatchups = async () => [];
+  if (!has("getWinnersBracket")) api.getWinnersBracket = async () => [];
+  if (!has("requestResearch")) {
+    api.requestResearch = async () => ({ ok: false, reason: "Research requests are not available in this build." });
+  }
 
   return api;
 }

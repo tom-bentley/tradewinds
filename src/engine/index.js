@@ -11,6 +11,13 @@ export {
   irEligibleStatus,
   historyRow,
   historyWeekly,
+  // 004 design §3.1 — player-intelligence inputs (optional, tolerant builders)
+  buildStats,
+  buildGames,
+  buildDvp,
+  buildDossiers,
+  statsRow,
+  gameFor,
   playerOf,
   rosterById,
   rosteredIds,

@@ -157,6 +157,10 @@ test("loadAll: happy path builds ctx, live values, and a clean freshness report"
   assert.equal(buildContext.seen.length, 1);
   const { input, settings: applied } = buildContext.seen[0];
   assert.deepEqual(Object.keys(input).sort(), [
+    // 004 design §3.1 — the optional intelligence inputs ride along (null when the repo has none)
+    "dossiers",
+    "dvp",
+    "games",
     "history",
     "league",
     "meta",
@@ -166,6 +170,7 @@ test("loadAll: happy path builds ctx, live values, and a clean freshness report"
     "rosters",
     "schedule",
     "state",
+    "stats",
     "trending",
     "users",
     "values",
